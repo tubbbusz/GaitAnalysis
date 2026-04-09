@@ -1,0 +1,25 @@
+# Build artifacts
+GaitApp/build/
+GaitApp/dist/
+GaitApp/__pycache__/
+*.pyc
+
+# Large/binary files
+*.exe
+*.pkg
+*.mp4
+*.mov
+*.MOV
+*.pdf
+
+# Client data (videos, private files)
+Clients/
+
+# Old builds
+GaitApp/oldBuilds/
+
+# Assets not needed in version control
+GaitApp/Coiny-Cyrillic.ttf
+GaitApp/novita.png
+trimedstart.mov
+.gitattributes

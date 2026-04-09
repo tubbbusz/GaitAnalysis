@@ -1,0 +1,7 @@
+*.exe
+*.pkg
+*.mp4
+*.mov
+*.MOV
+dist/
+build/

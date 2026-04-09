@@ -1,0 +1,24 @@
+Instructions:
+1  - Previous frame
+2  - Next frame
+Mouse drag on graph  - Scrub frames
+9  - Play / Pause
+q  - Quit
+g / G  - Go to frame (input dialog)
+w  - Toggle World / Pixel coordinatesc
+v  - Graph view: Video 1 → Video 2 → Both
+t  - Toggle active video (Video 1 / Video 2)
+c  - Toggle overlaid cycles / continuous
+s  - Toggle resample (100 pts) — cycle view only
+
+3–8  - Toggle joint visibility (left/right hip, left/right knee, left/right ankle)
+
+x  - Toggle manual step mode
+[  - Set manual side: LEFT
+]  - Set manual side: RIGHT
+Space  - Add manual step at current frame (manual mode)
+Backspace/Delete  - Remove nearest manual step
+
+r  - Recompute auto steps for active video
+d  - Clear all steps for active video
+ 
