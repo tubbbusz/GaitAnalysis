@@ -862,19 +862,37 @@ class GaitAnalysisDashboard(tk.Tk):
         self._legend_frame.pack(side='right', fill='y', padx=(2, 0))
         self._legend_frame.pack_propagate(False)
 
-        # v1/v2 indicator at top
+        # v1/v2 toggle buttons at top
         ind_frame = tk.Frame(self._legend_frame, bg=BG2)
         ind_frame.pack(fill='x', padx=6, pady=(8, 2))
-        # draw dashed line indicator for v1
-        c1 = tk.Canvas(ind_frame, width=30, height=10, bg=BG2, highlightthickness=0)
-        c1.pack(side='left')
-        c1.create_line(2, 5, 28, 5, fill=TEXT, dash=(4, 3), width=2)
-        tk.Label(ind_frame, text="V1", font=("Helvetica", 8), bg=BG2, fg=SUBTEXT).pack(side='left', padx=(2, 8))
-        # draw solid line indicator for v2
-        c2 = tk.Canvas(ind_frame, width=30, height=10, bg=BG2, highlightthickness=0)
-        c2.pack(side='left')
-        c2.create_line(2, 5, 28, 5, fill=TEXT, width=2)
-        tk.Label(ind_frame, text="V2", font=("Helvetica", 8), bg=BG2, fg=SUBTEXT).pack(side='left', padx=2)
+
+        # V1 button with dashed line swatch
+        v1_btn_frame = tk.Frame(ind_frame, bg=BG3, cursor='hand2', relief='flat', bd=0)
+        v1_btn_frame.pack(side='left', fill='x', expand=True, padx=(0, 3))
+        c1 = tk.Canvas(v1_btn_frame, width=24, height=14, bg=BG3, highlightthickness=0)
+        c1.pack(side='left', padx=(4, 1), pady=2)
+        c1.create_line(2, 7, 22, 7, fill=C_V1, dash=(4, 3), width=2)
+        self._v1_toggle_lbl = tk.Label(v1_btn_frame, text="V1", font=("Helvetica", 8, "bold"),
+                                        bg=BG3, fg=C_V1, anchor='w')
+        self._v1_toggle_lbl.pack(side='left', padx=(1, 4))
+        self._v1_btn_frame = v1_btn_frame
+        self._v1_swatch = c1
+        for w in (v1_btn_frame, c1, self._v1_toggle_lbl):
+            w.bind('<Button-1>', lambda e: self._toggle_video_view(0))
+
+        # V2 button with solid line swatch
+        v2_btn_frame = tk.Frame(ind_frame, bg=BG3, cursor='hand2', relief='flat', bd=0)
+        v2_btn_frame.pack(side='left', fill='x', expand=True, padx=(3, 0))
+        c2 = tk.Canvas(v2_btn_frame, width=24, height=14, bg=BG3, highlightthickness=0)
+        c2.pack(side='left', padx=(4, 1), pady=2)
+        c2.create_line(2, 7, 22, 7, fill=C_V2, width=2)
+        self._v2_toggle_lbl = tk.Label(v2_btn_frame, text="V2", font=("Helvetica", 8, "bold"),
+                                        bg=BG3, fg=C_V2, anchor='w')
+        self._v2_toggle_lbl.pack(side='left', padx=(1, 4))
+        self._v2_btn_frame = v2_btn_frame
+        self._v2_swatch = c2
+        for w in (v2_btn_frame, c2, self._v2_toggle_lbl):
+            w.bind('<Button-1>', lambda e: self._toggle_video_view(1))
 
         ttk_sep = tk.Frame(self._legend_frame, bg=SUBTEXT, height=1)
         ttk_sep.pack(fill='x', padx=6, pady=(4, 4))
@@ -1003,7 +1021,6 @@ class GaitAnalysisDashboard(tk.Tk):
             ("Show Sugg",    self._toggle_suggestions),
             ("Clr steps",    self._clear_steps),
             ("Clr Excl",     self._clear_exclusions),
-            ("Export Excel", self._export_excel),
         ]
         for txt, cmd in buttons:
             tk.Button(bar, text=txt, command=cmd, **btn_cfg).pack(side='left', padx=2, pady=3)
@@ -1277,10 +1294,12 @@ class GaitAnalysisDashboard(tk.Tk):
                     if joint not in ad.columns:
                         continue
                     vis = self.joint_visibility.get(joint, True)
+                    if not vis:
+                        continue
                     values = ad[joint].values.copy().astype(float)
 
                     if excluded:
-                        # Gray line in excluded regions
+                        # Gray line in excluded regions (only for visible joints)
                         gray_vals = values.copy()
                         gray_vals[~excl_mask] = np.nan
                         ax.plot(frames, gray_vals, color='#999999', lw=1.2,
@@ -1290,13 +1309,9 @@ class GaitAnalysisDashboard(tk.Tk):
                     clean_vals = values.copy()
                     if excluded:
                         clean_vals[excl_mask] = np.nan
-                    if vis:
-                        ax.plot(frames, clean_vals, color=col, lw=1.4,
-                                alpha=0.85, linestyle=ls, zorder=3,
-                                label=f"{joint.replace('_',' ').title()} V{si+1}")
-                    else:
-                        ax.plot(frames, clean_vals, color='#999999', lw=1.2,
-                                alpha=0.5, linestyle=ls, zorder=2)
+                    ax.plot(frames, clean_vals, color=col, lw=1.4,
+                            alpha=0.85, linestyle=ls, zorder=3,
+                            label=f"{joint.replace('_',' ').title()} V{si+1}")
                     plotted = True
 
                 nsteps  = _to_fnums(ad_filtered, sf)
@@ -1357,6 +1372,8 @@ class GaitAnalysisDashboard(tk.Tk):
 
                 for joint, col in JOINT_COLORS_MPL.items():
                     vis = self.joint_visibility.get(joint, True)
+                    if not vis:
+                        continue
                     side    = 'left' if joint.startswith('left_') else 'right'
                     strikes = [f for f, s in norm if s == side]
                     if len(strikes) < 2: continue
@@ -1381,17 +1398,14 @@ class GaitAnalysisDashboard(tk.Tk):
                     med = np.median(lengths)
                     ok  = [0.8*med <= l <= 1.2*med for l in lengths]
 
-                    for (x, y), good in zip(cycles, ok):
-                        if not self.show_data: break
-                        if self.resample_cycles:
-                            t = np.linspace(0, 1, len(y))
-                            y = interp1d(t, y)(np.linspace(0, 1, max_cycle_length))
-                            x = np.arange(max_cycle_length)
-                        if vis:
+                    if self.show_data:
+                        for (x, y), good in zip(cycles, ok):
+                            if self.resample_cycles:
+                                t = np.linspace(0, 1, len(y))
+                                y = interp1d(t, y)(np.linspace(0, 1, max_cycle_length))
+                                x = np.arange(max_cycle_length)
                             c = col if good else C_OUTLIER
-                        else:
-                            c = '#999999'
-                        ax.plot(x, y, color=c, alpha=0.25, lw=0.8, linestyle=ls)
+                            ax.plot(x, y, color=c, alpha=0.25, lw=0.8, linestyle=ls)
 
                     if self.resample_cycles and self.show_mean:
                         inliers = []
@@ -1401,10 +1415,9 @@ class GaitAnalysisDashboard(tk.Tk):
                             inliers.append(interp1d(t, y)(np.linspace(0, 1, max_cycle_length)))
                         if inliers:
                             mean_c = np.nanmean(np.vstack(inliers), axis=0)
-                            mean_col = col if vis else '#999999'
                             ax.plot(np.arange(len(mean_c)), mean_c,
-                                    color=mean_col, lw=2.2, linestyle=ls,
-                                    label=f"{joint.replace('_',' ').title()} V{si+1} mean" if vis else None)
+                                    color=col, lw=2.2, linestyle=ls,
+                                    label=f"{joint.replace('_',' ').title()} V{si+1} mean")
 
             if self.resample_cycles and self.show_normative:
                 # Create x-axis for normative data matching graph x-range
@@ -1863,6 +1876,64 @@ class GaitAnalysisDashboard(tk.Tk):
         self._status_msg.set("World landmarks" if USE_WORLD_LANDMARKS else "Pixel landmarks")
         self.redraw_graph()
 
+    def _toggle_video_view(self, which):
+        """Toggle V1 (which=0) or V2 (which=1) independently."""
+        show_v1 = self.graph_show_mode in ('v1', 'both')
+        show_v2 = self.graph_show_mode in ('v2', 'both')
+        if which == 0:
+            show_v1 = not show_v1
+        else:
+            show_v2 = not show_v2
+        # prevent both hidden
+        if not show_v1 and not show_v2:
+            show_v1 = True
+            show_v2 = True
+        if show_v1 and show_v2:
+            self.graph_show_mode = 'both'
+        elif show_v1:
+            self.graph_show_mode = 'v1'
+        else:
+            self.graph_show_mode = 'v2'
+        # Update zoom limits for this view mode
+        if self.graph_show_mode in self._ax_xlim_per_mode:
+            self._ax_xlim_full = self._ax_xlim_per_mode[self.graph_show_mode]
+        # Reset zoom when switching views
+        if self._ax_xlim_full is not None:
+            self._ax.set_xlim(self._ax_xlim_full)
+        labels = {'both': 'Both', 'v1': 'V1 only', 'v2': 'V2 only'}
+        self._status_msg.set(f"Graph: {labels[self.graph_show_mode]}")
+        self._update_video_btn_visuals()
+        self._show_video_frames()
+        self.redraw_graph()
+
+    def _update_video_btn_visuals(self):
+        show_v1 = self.graph_show_mode in ('v1', 'both')
+        show_v2 = self.graph_show_mode in ('v2', 'both')
+        if show_v1:
+            self._v1_btn_frame.config(bg=BG3)
+            self._v1_toggle_lbl.config(bg=BG3, fg=C_V1)
+            self._v1_swatch.config(bg=BG3)
+            self._v1_swatch.delete('all')
+            self._v1_swatch.create_line(2, 7, 22, 7, fill=C_V1, dash=(4, 3), width=2)
+        else:
+            self._v1_btn_frame.config(bg=BG2)
+            self._v1_toggle_lbl.config(bg=BG2, fg='#555555')
+            self._v1_swatch.config(bg=BG2)
+            self._v1_swatch.delete('all')
+            self._v1_swatch.create_line(2, 7, 22, 7, fill='#555555', dash=(4, 3), width=2)
+        if show_v2:
+            self._v2_btn_frame.config(bg=BG3)
+            self._v2_toggle_lbl.config(bg=BG3, fg=C_V2)
+            self._v2_swatch.config(bg=BG3)
+            self._v2_swatch.delete('all')
+            self._v2_swatch.create_line(2, 7, 22, 7, fill=C_V2, width=2)
+        else:
+            self._v2_btn_frame.config(bg=BG2)
+            self._v2_toggle_lbl.config(bg=BG2, fg='#555555')
+            self._v2_swatch.config(bg=BG2)
+            self._v2_swatch.delete('all')
+            self._v2_swatch.create_line(2, 7, 22, 7, fill='#555555', width=2)
+
     def _cycle_graph_view(self):
         modes  = ['both', 'v1', 'v2']
         labels = {'both': 'Both', 'v1': 'V1 only', 'v2': 'V2 only'}
@@ -1874,6 +1945,7 @@ class GaitAnalysisDashboard(tk.Tk):
         if self._ax_xlim_full is not None:
             self._ax.set_xlim(self._ax_xlim_full)
         self._status_msg.set(f"Graph: {labels[self.graph_show_mode]}")
+        self._update_video_btn_visuals()
         self._show_video_frames()
         self.redraw_graph()
 
@@ -1990,7 +2062,10 @@ class GaitAnalysisDashboard(tk.Tk):
         ds['step_frames'].sort(key=lambda x: x[0])
         self._status_msg.set(f"Added {detected_foot} step @ frame {fn}")
         self._update_metrics_panel()
+        current_xlim = self._ax.get_xlim()
         self.redraw_graph()
+        self._ax.set_xlim(current_xlim)
+        self._update_scrollbar()
 
     def _delete_nearest_step(self):
         # determine which dataset to delete step from based on graph view mode
@@ -2009,7 +2084,10 @@ class GaitAnalysisDashboard(tk.Tk):
         removed = ds['step_frames'].pop(i)
         self._status_msg.set(f"Removed step @ frame {removed[0]}")
         self._update_metrics_panel()
+        current_xlim = self._ax.get_xlim()
         self.redraw_graph()
+        self._ax.set_xlim(current_xlim)
+        self._update_scrollbar()
 
     def _recompute_steps(self):
         if not self.datasets: 
@@ -2078,170 +2156,6 @@ class GaitAnalysisDashboard(tk.Tk):
         tk.Button(win, text="Close", command=win.destroy,
                   bg=ACCENT, fg='white', relief='flat', padx=14
                   ).grid(row=len(HELP_TEXT), column=0, columnspan=2, pady=14)
-
-    # export
-    def _export_excel(self):
-        if len(self.datasets) < 2:
-            messagebox.showwarning("Export", "Please load two videos first.", parent=self)
-            return
-
-        default_name = f"gait_{self.video_names[0]}_vs_{self.video_names[1]}.xlsx"
-        # sanitize filename
-        for ch in r'\/:*?"<>|':
-            default_name = default_name.replace(ch, '_')
-
-        path = filedialog.asksaveasfilename(
-            parent=self,
-            title="Save Excel report",
-            defaultextension=".xlsx",
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
-            initialfile=default_name,
-        )
-        if not path:
-            return
-
-        try:
-            import openpyxl
-            from openpyxl.utils.dataframe import dataframe_to_rows
-            from openpyxl.drawing.image import Image as XLImage
-            from openpyxl.styles import Font, PatternFill, Alignment
-        except ImportError:
-            messagebox.showerror(
-                "Missing package",
-                "openpyxl is required for Excel export.\n\nInstall with: pip install openpyxl",
-                parent=self,
-            )
-            return
-
-        try:
-            wb = openpyxl.Workbook()
-
-            # ── Sheet 1: Summary ──────────────────────────────────────────────
-            ws_sum = wb.active
-            ws_sum.title = "Summary"
-
-            hdr_font  = Font(bold=True)
-            hdr_fill  = PatternFill("solid", fgColor="D0D0D0")
-
-            def _hdr(ws, row_data):
-                ws.append(row_data)
-                for cell in ws[ws.max_row]:
-                    cell.font  = hdr_font
-                    cell.fill  = hdr_fill
-
-            # Video names row
-            _hdr(ws_sum, ["", self.video_names[0], self.video_names[1]])
-
-            # Joint stats
-            ws_sum.append([])
-            _hdr(ws_sum, ["Joint", "V1 Mean (°)", "V1 Peak (°)", "V2 Mean (°)", "V2 Peak (°)"])
-            joint_order = [
-                'left_hip', 'right_hip', 'left_knee',
-                'right_knee', 'left_ankle', 'right_ankle',
-            ]
-            for joint in joint_order:
-                a1 = self.datasets[0]['angle_data']
-                a2 = self.datasets[1]['angle_data']
-                m1, p1 = _joint_stats(a1, joint)
-                m2, p2 = _joint_stats(a2, joint)
-                ws_sum.append([
-                    joint.replace('_', ' ').title(),
-                    round(m1, 2), round(p1, 2),
-                    round(m2, 2), round(p2, 2),
-                ])
-
-            # Gait metrics
-            ws_sum.append([])
-            _hdr(ws_sum, ["Gait Metric", "Unit", "% Change (V1 → V2)"])
-            metrics = compute_metrics(self.datasets[0], self.datasets[1])
-            for key in METRIC_ORDER:
-                label, unit = METRIC_LABELS[key]
-                ws_sum.append([label, unit, round(metrics[key], 2)])
-
-            # Step counts
-            sf1 = self.datasets[0].get('step_frames', [])
-            sf2 = self.datasets[1].get('step_frames', [])
-            ws_sum.append([])
-            _hdr(ws_sum, ["Step Events", "V1", "V2"])
-            ws_sum.append(["Total steps", len(sf1), len(sf2)])
-            ws_sum.append(["Left steps",
-                           sum(1 for _, s in sf1 if s == 'left'),
-                           sum(1 for _, s in sf2 if s == 'left')])
-            ws_sum.append(["Right steps",
-                           sum(1 for _, s in sf1 if s == 'right'),
-                           sum(1 for _, s in sf2 if s == 'right')])
-
-            # auto-size columns
-            for col in ws_sum.columns:
-                max_len = max((len(str(cell.value)) for cell in col if cell.value), default=8)
-                ws_sum.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
-
-            # ── Sheet 2: Graph ────────────────────────────────────────────────
-            ws_graph = wb.create_sheet(title="Graph", index=1)
-            ws_graph["A1"] = "Joint Angle Graph"
-            ws_graph["A1"].font = Font(bold=True, size=12)
-
-            tmp_img_path = None
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_f:
-                tmp_img_path = tmp_f.name
-            self._fig.savefig(tmp_img_path, dpi=120, bbox_inches='tight',
-                              facecolor=self._fig.get_facecolor())
-            xl_img = XLImage(tmp_img_path)
-            xl_img.anchor = "A2"
-            ws_graph.add_image(xl_img)
-
-            # ── Col rename map ────────────────────────────────────────────────
-            col_rename = {
-                'frame_num':    'Frame',
-                'time_s':       'Time (s)',
-                'left_hip':     'Left Hip (°)',
-                'right_hip':    'Right Hip (°)',
-                'left_knee':    'Left Knee (°)',
-                'right_knee':   'Right Knee (°)',
-                'left_ankle':   'Left Ankle (°)',
-                'right_ankle':  'Right Ankle (°)',
-            }
-
-            def _write_angle_sheet(ws, ds):
-                ad = ds['angle_data'].copy()
-                ad.insert(1, 'time_s', (ad['frame_num'] / SLOWMO_FPS).round(4))
-                ad.rename(columns=col_rename, inplace=True)
-                for i, row in enumerate(dataframe_to_rows(ad, index=False, header=True)):
-                    ws.append(row)
-                    if i == 0:
-                        for cell in ws[ws.max_row]:
-                            cell.font = hdr_font
-                            cell.fill = hdr_fill
-                for col in ws.columns:
-                    ws.column_dimensions[col[0].column_letter].width = 16
-
-            # ── Sheet 3 & 4: Angle data ───────────────────────────────────────
-            ws_v1 = wb.create_sheet(title=f"V1 - {self.video_names[0][:26]}")
-            _write_angle_sheet(ws_v1, self.datasets[0])
-
-            ws_v2 = wb.create_sheet(title=f"V2 - {self.video_names[1][:26]}")
-            _write_angle_sheet(ws_v2, self.datasets[1])
-
-            # ── Sheet 5: Step Events ──────────────────────────────────────────
-            ws_steps = wb.create_sheet(title="Step Events")
-            _hdr(ws_steps, ["Video", "Frame", "Time (s)", "Side"])
-            for f, s in sf1:
-                ws_steps.append([self.video_names[0], f, round(f / SLOWMO_FPS, 3), s])
-            for f, s in sf2:
-                ws_steps.append([self.video_names[1], f, round(f / SLOWMO_FPS, 3), s])
-            for col in ws_steps.columns:
-                ws_steps.column_dimensions[col[0].column_letter].width = 18
-
-            wb.save(path)
-
-            if tmp_img_path and os.path.exists(tmp_img_path):
-                os.unlink(tmp_img_path)
-
-            self._status_msg.set(f"Exported: {os.path.basename(path)}")
-            messagebox.showinfo("Export Complete", f"Report saved to:\n{path}", parent=self)
-
-        except Exception as e:
-            messagebox.showerror("Export Error", f"Export failed:\n{e}", parent=self)
 
     # close
     def _on_close(self):
