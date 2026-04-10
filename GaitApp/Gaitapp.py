@@ -207,6 +207,10 @@ GRAY_BGR = (128, 128, 128)
 # analysis functions
 def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=None):
     h, w = frame_bgr.shape[:2]
+    # Scale skeleton thickness relative to frame height so it looks the same
+    # regardless of resolution/crop differences between videos
+    line_thickness = max(1, int(h * DRAW_THICKNESS / 540))
+    circle_radius  = max(1, int(h * 4 / 540))
     default_line_col = (200, 200, 200)  # light gray for non-tracked joints
     
     def _resolve_color(landmark_idx, base_color):
@@ -233,7 +237,7 @@ def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=No
                 cv2.line(frame_bgr,
                          (int(ls.x*w), int(ls.y*h)),
                          (int(le.x*w), int(le.y*h)),
-                         line_color, DRAW_THICKNESS)
+                         line_color, line_thickness)
     
     # Draw joint circles with colors
     for idx, lm in enumerate(pixel_landmarks):
@@ -243,7 +247,7 @@ def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=No
             else:
                 joint_color = (255, 0, 255)  # magenta for non-tracked joints
             
-            cv2.circle(frame_bgr, (int(lm.x*w), int(lm.y*h)), 4, joint_color, -1)
+            cv2.circle(frame_bgr, (int(lm.x*w), int(lm.y*h)), circle_radius, joint_color, -1)
     
     return frame_bgr
 
@@ -292,6 +296,57 @@ def calculate_angle(a, b, c, d=None, direction="left", joint_type="hip"):
         angle = base
 
     return angle
+
+
+def detect_crop_region(video_path, needs_rotation, sample_count=5):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    sample_count = min(sample_count, total)
+
+    # Accumulate the union of non-black regions across samples
+    x_min, y_min = float('inf'), float('inf')
+    x_max, y_max = 0, 0
+    full_h, full_w = 0, 0
+
+    for i in range(sample_count):
+        target = int(total * (i + 1) / (sample_count + 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        if needs_rotation:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        full_h, full_w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Threshold: anything above 10 is considered content
+        _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+        coords = cv2.findNonZero(thresh)
+        if coords is None:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(coords)
+        x_min = min(x_min, bx)
+        y_min = min(y_min, by)
+        x_max = max(x_max, bx + bw)
+        y_max = max(y_max, by + bh)
+
+    cap.release()
+
+    if full_h == 0 or x_min == float('inf'):
+        return None
+
+    cw = x_max - x_min
+    ch = y_max - y_min
+
+    # Only crop if the borders are meaningful (>2% of frame on any side)
+    margin = 0.02
+    if (x_min < full_w * margin and y_min < full_h * margin and
+            cw > full_w * (1 - 2 * margin) and ch > full_h * (1 - 2 * margin)):
+        return None  # negligible borders
+
+    return (x_min, y_min, cw, ch)
 
 
 def butter_lowpass_filter(data, cutoff=4.0, fs=240.0, order=4):
@@ -459,7 +514,83 @@ def _log_direction_diagnostics(df_w, df_p, video_path, detected_rotation):
 
 
 # video processing
+def _detect_subject_orientation(video_path):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return False
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps   = cap.get(cv2.CAP_PROP_FPS) or 30
+    sample_count = min(10, total)
+
+    # Create a throwaway IMAGE-mode landmarker for probing
+    base_opts = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+    opts = PoseLandmarkerOptions(
+        base_options=base_opts, running_mode=RunningMode.IMAGE,
+        num_poses=1, min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5)
+    landmarker = PoseLandmarker.create_from_options(opts)
+
+    vertical_votes = 0
+    detections = 0
+
+    for i in range(sample_count):
+        target_frame = int(total * (i + 1) / (sample_count + 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = landmarker.detect(mp_img)
+
+        if not result.pose_landmarks or len(result.pose_landmarks) == 0:
+            continue
+
+        lm = result.pose_landmarks[0]
+        ls = lm[PoseLandmark.LEFT_SHOULDER]
+        rs = lm[PoseLandmark.RIGHT_SHOULDER]
+        lh = lm[PoseLandmark.LEFT_HIP]
+        rh = lm[PoseLandmark.RIGHT_HIP]
+
+        # shoulder midpoint to hip midpoint
+        sx = (ls.x + rs.x) / 2
+        sy = (ls.y + rs.y) / 2
+        hx = (lh.x + rh.x) / 2
+        hy = (lh.y + rh.y) / 2
+
+        dx = abs(hx - sx)
+        dy = abs(hy - sy)
+
+        detections += 1
+        if dy > dx:
+            vertical_votes += 1  # person is upright
+
+    cap.release()
+    landmarker.close()
+
+    if detections == 0:
+        return False  # can't tell — don't rotate
+
+    # majority vote
+    return vertical_votes > detections / 2
+
+
 def process_video(video_path, ann_dir, progress_cb, status_cb):
+    status_cb("Detecting subject orientation…")
+    needs_rotation = _detect_subject_orientation(video_path)
+    if needs_rotation:
+        status_cb("Subject is upright — rotating 90° CCW for analysis")
+    else:
+        status_cb("Subject is sideways — no rotation needed")
+
+    # Detect black borders to crop out
+    crop_rect = detect_crop_region(video_path, needs_rotation)
+    if crop_rect:
+        cx, cy, cw_r, ch_r = crop_rect
+        status_cb(f"Cropping black borders: {cx},{cy} {cw_r}x{ch_r}")
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         status_cb(f"ERROR opening {os.path.basename(video_path)}")
@@ -484,6 +615,15 @@ def process_video(video_path, ann_dir, progress_cb, status_cb):
         if not ret: break
         frame_count += 1
         progress_cb(frame_count / max(1, total))
+
+        # Rotate frames 90° CCW if the subject was detected as upright
+        if needs_rotation:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        # Crop out black borders
+        if crop_rect:
+            cx, cy, cw_r, ch_r = crop_rect
+            frame = frame[cy:cy+ch_r, cx:cx+cw_r]
 
         rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -600,6 +740,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb):
         'excluded_regions': [],
         'all_landmarks':  landmarks,   # list of (raw_path, pixel_landmarks) tuples
         'landmark_depths': df_depths,
+        'needs_rotation': needs_rotation,
     }
 
 
@@ -1247,7 +1388,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
         # calculate max cycle length for overlaid mode before plotting
         max_cycle_length = self.resample_length
-        if self.show_overlaid_cycles and self.resample_cycles:
+        if self.show_overlaid_cycles:
             for ds in dfg:
                 ad = ds['angle_data']
                 excluded = ds.get('excluded_regions', [])
@@ -1269,6 +1410,7 @@ class GaitAnalysisDashboard(tk.Tk):
                         seg = ad_filtered[(ad_filtered['frame_num'] >= strikes[i]) & (ad_filtered['frame_num'] <= strikes[i+1])]
                         if not seg.empty:
                             max_cycle_length = max(max_cycle_length, len(seg))
+        self._current_max_cycle_length = max_cycle_length
 
         if not self.show_overlaid_cycles:
             ax.set_xlabel('Frame', fontsize=10)
@@ -1439,11 +1581,11 @@ class GaitAnalysisDashboard(tk.Tk):
 
         # set axis limits after plotting to prevent auto-scaling
         # determine appropriate limits based on current view
-        if self.show_overlaid_cycles and self.resample_cycles:
-            # overlaid cycles with resample: x-axis scales to longest cycle
-            ax.set_xlim(0, max_cycle_length)
+        if self.show_overlaid_cycles:
+            # overlaid cycles: x-axis scales to longest actual stride
+            ax.set_xlim(0, self._current_max_cycle_length)
         elif self._ax_xlim_full is not None:
-            # continuous view or non-resampled cycles: use frame range
+            # continuous view: use frame range
             ax.set_xlim(self._ax_xlim_full)
 
         # use subplots_adjust instead of tight_layout to maintain static graph size
@@ -1483,6 +1625,10 @@ class GaitAnalysisDashboard(tk.Tk):
             if pixel_lm is not None:
                 frame = frame.copy()
                 draw_pose_landmarks_on_frame(frame, pixel_lm, self.joint_visibility)
+
+            # Analysis frames always have the person sideways — rotate 90° CW
+            # so the person appears upright in the GUI
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
             rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -1719,8 +1865,8 @@ class GaitAnalysisDashboard(tk.Tk):
         self._mpl_canvas.draw_idle()
     
     def _get_current_xlim_full(self):
-        if self.show_overlaid_cycles and self.resample_cycles:
-            return (0, self.resample_length)
+        if self.show_overlaid_cycles:
+            return (0, getattr(self, '_current_max_cycle_length', self.resample_length))
         return self._ax_xlim_full or (0, 100)
     
     def _update_scrollbar(self):
