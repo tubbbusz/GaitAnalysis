@@ -1476,6 +1476,16 @@ class GaitAnalysisDashboard(tk.Tk):
                                 font=("Helvetica", 10, "bold"), bg=BG2, fg=C_V1)
         self._v1_lbl.pack(side='right', padx=18)
 
+        strike_key = tk.Frame(hdr, bg=BG2)
+        strike_key.pack(side='right', padx=(4, 10))
+        for colour, label in ((C_RIGHT, "Right strike"), (C_LEFT, "Left strike")):
+            row = tk.Frame(strike_key, bg=BG2)
+            row.pack(side='left', padx=4)
+            tk.Canvas(row, width=10, height=10, bg=colour,
+                      highlightthickness=0).pack(side='left', pady=1)
+            tk.Label(row, text=f" {label}", font=("Helvetica", 8),
+                     bg=BG2, fg=SUBTEXT).pack(side='left')
+
 
         # main layout with graph and videos on the left
         main = tk.Frame(self, bg=BG)
@@ -1668,17 +1678,24 @@ class GaitAnalysisDashboard(tk.Tk):
             val_lbl.pack(anchor='w', pady=(2, 0))
             self._metric_value_lbls[key] = val_lbl
 
-        # color key
-        tk.Frame(right, bg=BG2, height=1).pack(fill='x', padx=8, pady=(8, 0))
-        kf = tk.Frame(right, bg=BG2)
-        kf.pack(fill='x', padx=10, pady=4)
-        for colour, label in ((C_RIGHT, "Right strike"), (C_LEFT, "Left strike")):
-            row = tk.Frame(kf, bg=BG2)
-            row.pack(anchor='w', pady=1)
-            tk.Canvas(row, width=12, height=12, bg=colour,
-                      highlightthickness=0).pack(side='left')
-            tk.Label(row, text=f"  {label}", font=("Helvetica", 8),
-                     bg=BG2, fg=SUBTEXT).pack(side='left')
+        tk.Frame(right, bg=SUBTEXT, height=1).pack(fill='x', padx=8, pady=(8, 6))
+        tk.Label(right, text="Skeleton",
+                 font=("Helvetica", 8, "bold"), bg=BG2, fg=TEXT).pack(anchor='w', padx=10)
+        self._skeleton_slider = tk.Scale(
+            right,
+            from_=0,
+            to=DRAW_THICKNESS,
+            orient='horizontal',
+            resolution=0.5,
+            length=175,
+            bg=BG2,
+            fg=TEXT,
+            highlightthickness=0,
+            troughcolor=BG3,
+            command=self._on_skeleton_thickness_change,
+        )
+        self._skeleton_slider.set(self.skeleton_thickness)
+        self._skeleton_slider.pack(fill='x', padx=10, pady=(0, 10))
 
         # toolbar and status bar
         bottom = tk.Frame(self, bg=BG2, height=36)
@@ -1712,28 +1729,6 @@ class GaitAnalysisDashboard(tk.Tk):
         tk.Label(bar, textvariable=self._status_msg,
                  font=("Helvetica", 8), bg=BG2, fg=TEXT, anchor='w'
                  ).pack(side='left', padx=8)
-
-        # always-visible skeleton control in the lower right corner
-        self._skeleton_ctl = tk.Frame(self, bg=BG2, bd=1, relief='flat')
-        tk.Label(self._skeleton_ctl, text="Skeleton",
-                 font=("Helvetica", 8, "bold"), bg=BG2, fg=TEXT).pack(anchor='w', padx=6, pady=(3, 0))
-        self._skeleton_slider = tk.Scale(
-            self._skeleton_ctl,
-            from_=0,
-            to=DRAW_THICKNESS,
-            orient='horizontal',
-            resolution=0.5,
-            length=150,
-            bg=BG2,
-            fg=TEXT,
-            highlightthickness=0,
-            troughcolor=BG3,
-            command=self._on_skeleton_thickness_change,
-        )
-        self._skeleton_slider.set(self.skeleton_thickness)
-        self._skeleton_slider.pack(fill='x', padx=4, pady=(0, 2))
-        self._skeleton_ctl.place(relx=1.0, rely=1.0, x=-8, y=-8, anchor='se')
-        self._skeleton_ctl.lift()
 
     # video selection
     def find_videos(self):
@@ -3277,8 +3272,6 @@ class GaitAnalysisDashboard(tk.Tk):
         self._main_content.pack_forget()
         self._bottom_bar.pack_forget()
         self._markup_frame.pack(fill='both', expand=True)
-        if hasattr(self, '_skeleton_ctl'):
-            self._skeleton_ctl.lift()
         self._status_msg.set(
             f"Mark every {noun} foot strike with SPACE — Video {vid_num}")
         # wait briefly so tkinter can resolve widget geometry
@@ -3290,8 +3283,6 @@ class GaitAnalysisDashboard(tk.Tk):
         self._markup_frame.pack_forget()
         self._bottom_bar.pack(fill='x', side='bottom')
         self._main_content.pack(fill='both', expand=True, padx=8, pady=(4, 0))
-        if hasattr(self, '_skeleton_ctl'):
-            self._skeleton_ctl.lift()
         self._persist_all_dataset_markup()
 
         # switch into overlaid cycles when markup is complete
