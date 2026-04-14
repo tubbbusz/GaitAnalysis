@@ -2158,6 +2158,24 @@ class GaitAnalysisDashboard(tk.Tk):
             return int(cand[-1] if len(cand) else valid[0])
         return int(valid[np.argmin(np.abs(valid - target_idx))])
 
+    def _get_data_segments_for_plotting(self, ad_filtered):
+        """split filtered data into segments at frame number discontinuities when there are exclusions"""
+        if ad_filtered is None or ad_filtered.empty:
+            return [(0, -1)]
+        
+        frame_nums = ad_filtered['frame_num'].to_numpy(dtype=int)
+        if len(frame_nums) <= 1:
+            return [(0, len(frame_nums) - 1)]
+        
+        segments = []
+        start = 0
+        for i in range(1, len(frame_nums)):
+            if frame_nums[i] - frame_nums[i-1] > 1:
+                segments.append((start, i - 1))
+                start = i
+        segments.append((start, len(frame_nums) - 1))
+        return segments
+
     def _display_frame_nums_for_ds(self, ds):
         ad = self._display_angle_data_for_ds(ds)
         if ad is None or ad.empty:
@@ -2329,12 +2347,20 @@ class GaitAnalysisDashboard(tk.Tk):
                                 alpha=0.5, linestyle=ls, zorder=2)
 
                     # draw the remaining data in the joint color
-                    clean_vals = values.copy()
-                    if excluded and not self._auto_trim_active():
+                    if self._auto_trim_active():
+                        segments = self._get_data_segments_for_plotting(ad_filtered)
+                        for start_idx, end_idx in segments:
+                            seg_x = np.arange(start_idx, end_idx + 1)
+                            seg_y = values[start_idx:end_idx + 1]
+                            ax.plot(seg_x, seg_y, color=col, lw=1.4,
+                                    alpha=0.85, linestyle=ls, zorder=3,
+                                    label=f"{joint.replace('_',' ').title()} V{si+1}" if start_idx == segments[0][0] else '')
+                    else:
+                        clean_vals = values.copy()
                         clean_vals[excl_mask] = np.nan
-                    ax.plot(frames, clean_vals, color=col, lw=1.4,
-                            alpha=0.85, linestyle=ls, zorder=3,
-                            label=f"{joint.replace('_',' ').title()} V{si+1}")
+                        ax.plot(frames, clean_vals, color=col, lw=1.4,
+                                alpha=0.85, linestyle=ls, zorder=3,
+                                label=f"{joint.replace('_',' ').title()} V{si+1}")
                     plotted = True
 
                 nsteps  = _to_fnums(ad_filtered, sf)
