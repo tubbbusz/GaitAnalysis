@@ -1783,10 +1783,8 @@ class CacheManagerDialog(tk.Toplevel):
         delete_btn.bind('<Enter>', lambda e: delete_btn.config(fg='#c0392b'))
         delete_btn.bind('<Leave>', lambda e: delete_btn.config(fg='#e74c3c'))
         
-        # Content frame (hidden by default)
-        content_frame = tk.Frame(entry_frame, bg=BG, height=0)
-        content_frame.pack(fill='x', padx=12, pady=(0, 6), expand=False)
-        content_frame.pack_propagate(False)
+        # Content frame (hidden by default, created but not packed)
+        content_frame = tk.Frame(entry_frame, bg=BG)
         
         # Store references for toggle
         data_items = []
@@ -1799,35 +1797,40 @@ class CacheManagerDialog(tk.Toplevel):
         
         # Build content
         if data_items:
+            # create a container for boxes
+            boxes_frame = tk.Frame(content_frame, bg=BG)
+            boxes_frame.pack(fill='x', padx=8, pady=6)
+            
             for item_name, item_path in data_items:
-                item_frame = tk.Frame(content_frame, bg=BG)
-                item_frame.pack(fill='x', pady=3)
+                # create box for each item
+                box_frame = tk.Frame(boxes_frame, bg=BG2, relief='solid', borderwidth=1, padx=8, pady=6)
+                box_frame.pack(side='left', fill='both', expand=True, padx=2)
                 
-                tk.Label(item_frame, text=f"  • {item_name}", font=("Helvetica", 9),
-                        bg=BG, fg=TEXT).pack(side='left', fill='x', expand=True)
+                # item name label
+                tk.Label(box_frame, text=item_name, font=("Helvetica", 9, "bold"),
+                        bg=BG2, fg=TEXT).pack(anchor='w')
                 
-                item_delete_btn = tk.Label(item_frame, text="✕", font=("Helvetica", 10),
-                                          bg=BG, fg='#e74c3c', cursor="hand2")
-                item_delete_btn.pack(side='right', padx=(4, 0))
+                # delete button
+                item_delete_btn = tk.Label(box_frame, text="✕ Delete", font=("Helvetica", 8),
+                                          bg=BG2, fg='#e74c3c', cursor="hand2")
+                item_delete_btn.pack(anchor='w', pady=(4, 0))
                 item_delete_btn.bind('<Button-1>', lambda e, ip=item_path, iname=item_name, ef=entry_frame: 
                                    self._delete_item(ip, iname, ef))
                 item_delete_btn.bind('<Enter>', lambda e: item_delete_btn.config(fg='#c0392b'))
                 item_delete_btn.bind('<Leave>', lambda e: item_delete_btn.config(fg='#e74c3c'))
         else:
-            tk.Label(content_frame, text="  (Empty cache)", font=("Helvetica", 9),
-                    bg=BG, fg=SUBTEXT).pack(anchor='w', pady=3)
+            tk.Label(content_frame, text="(Empty cache)", font=("Helvetica", 9),
+                    bg=BG, fg=SUBTEXT).pack(anchor='w', padx=8, pady=6)
         
-        # Toggle function
+        # Toggle function using pack/pack_forget
         def toggle_expand():
             self.expanded[cache_key] = not self.expanded[cache_key]
             if self.expanded[cache_key]:
                 arrow_label.config(text="▼")
-                content_frame.pack_propagate(True)
-                content_frame.pack(fill='x', padx=12, pady=(0, 6), expand=True)
+                content_frame.pack(fill='x', padx=12, pady=(0, 6), after=header_frame)
             else:
                 arrow_label.config(text="▶")
-                content_frame.pack_propagate(False)
-                content_frame.pack(fill='x', padx=12, pady=(0, 6), expand=False)
+                content_frame.pack_forget()
         
         # Bind click to expand/collapse
         for widget in [arrow_label, header_frame]:
@@ -1836,21 +1839,21 @@ class CacheManagerDialog(tk.Toplevel):
     def _delete_whole_cache(self, cache_key, cache_path, entry_frame):
         """Delete entire cache for a video."""
         if not messagebox.askyesno("Confirm Delete", 
-                                   f"Delete entire cache?\n\nThis cannot be undone."):
+                                   f"Delete entire cache?\n\nThis cannot be undone.", parent=self):
             return
         
         try:
             if os.path.exists(cache_path):
                 shutil.rmtree(cache_path)
-            messagebox.showinfo("Success", "Cache deleted")
+            messagebox.showinfo("Success", "Cache deleted", parent=self)
             entry_frame.destroy()
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to delete cache: {e}")
+            messagebox.showerror("Error", f"Failed to delete cache: {e}", parent=self)
     
     def _delete_item(self, item_path, item_name, entry_frame):
         """Delete a specific cache item."""
         if not messagebox.askyesno("Confirm Delete", 
-                                   f"Delete {item_name}?\n\nThis cannot be undone."):
+                                   f"Delete {item_name}?\n\nThis cannot be undone.", parent=self):
             return
         
         try:
@@ -1858,7 +1861,7 @@ class CacheManagerDialog(tk.Toplevel):
                 shutil.rmtree(item_path)
             else:
                 os.remove(item_path)
-            messagebox.showinfo("Success", f"{item_name} deleted")
+            messagebox.showinfo("Success", f"{item_name} deleted", parent=self)
             
             # Refresh the UI
             self.scrollable_frame.destroy()
@@ -1867,7 +1870,7 @@ class CacheManagerDialog(tk.Toplevel):
             self.expanded = {}
             self._scan_caches()
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to delete {item_name}: {e}")
+            messagebox.showerror("Error", f"Failed to delete {item_name}: {e}", parent=self)
 
 
 # settings dialog
@@ -1996,10 +1999,32 @@ class SettingsDialog(tk.Toplevel):
             pass
     
     def _open_cache_manager(self):
-        CacheManagerDialog(self, _cache_root_dir())
+        """Open the cache manager dialog (singleton pattern)."""
+        if self.dashboard._cache_manager_dialog is not None and self.dashboard._cache_manager_dialog.winfo_exists():
+            self.dashboard._cache_manager_dialog.lift()
+            self.dashboard._cache_manager_dialog.focus()
+        else:
+            dialog = CacheManagerDialog(self, _cache_root_dir())
+            self.dashboard._cache_manager_dialog = dialog
+            # when the dialog is destroyed, clear the reference
+            def on_close():
+                self.dashboard._cache_manager_dialog = None
+                dialog.destroy()
+            dialog.protocol("WM_DELETE_WINDOW", on_close)
     
     def _open_pdf_export(self):
-        PDFExportDialog(self, self.dashboard)
+        """Open the PDF export dialog (singleton pattern)."""
+        if self.dashboard._pdf_export_dialog is not None and self.dashboard._pdf_export_dialog.winfo_exists():
+            self.dashboard._pdf_export_dialog.lift()
+            self.dashboard._pdf_export_dialog.focus()
+        else:
+            dialog = PDFExportDialog(self, self.dashboard)
+            self.dashboard._pdf_export_dialog = dialog
+            # when the dialog is destroyed, clear the reference
+            def on_close():
+                self.dashboard._pdf_export_dialog = None
+                dialog.destroy()
+            dialog.protocol("WM_DELETE_WINDOW", on_close)
 
 # PDF export dialog
 class PDFExportDialog(tk.Toplevel):
@@ -2249,6 +2274,11 @@ class GaitAnalysisDashboard(tk.Tk):
         self._stop_pf   = False
         self._pf_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
         self._pf_thread.start()
+
+        # singleton window references
+        self._settings_dialog = None
+        self._cache_manager_dialog = None
+        self._pdf_export_dialog = None
 
         self._build_ui()
         self._bind_keys()
@@ -3714,8 +3744,18 @@ class GaitAnalysisDashboard(tk.Tk):
             messagebox.showwarning("No Cache", "No cached data found to clear")
 
     def _open_settings(self):
-        """Open the settings dialog."""
-        SettingsDialog(self, self)
+        """Open the settings dialog (singleton pattern)."""
+        if self._settings_dialog is not None and self._settings_dialog.winfo_exists():
+            self._settings_dialog.lift()
+            self._settings_dialog.focus()
+        else:
+            self._settings_dialog = SettingsDialog(self, self)
+            # when the dialog is destroyed, clear the reference
+            dialog = self._settings_dialog
+            def on_close():
+                self._settings_dialog = None
+                dialog.destroy()
+            self._settings_dialog.protocol("WM_DELETE_WINDOW", on_close)
 
     def _toggle_world(self):
         global USE_WORLD_LANDMARKS
