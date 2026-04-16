@@ -50,7 +50,7 @@ def resource_path(filename):
 
 # analysis settings
 SLOWMO_FPS    = 240
-FILTER_CUTOFF = 4.5    # slightly lower (gentle increase in smoothing)
+FILTER_CUTOFF = 8.0    # increased cutoff to reduce drag while maintaining smoothing
 FILTER_ORDER  = 5      # keep at 5
 
 # frame storage settings
@@ -146,16 +146,49 @@ def _fix_limb_swaps(df):
     # hip indices: left=23, right=24; similar pattern for other joints
     # left landmarks should have smaller x (left side of frame), right should have larger x
     
+    left_hip_x_col = 'landmark_23_x'
+    right_hip_x_col = 'landmark_24_x'
+    
+    if left_hip_x_col not in df.columns or right_hip_x_col not in df.columns:
+        return df
+    
+    # count how many frames have left > right (swapped)
+    swapped_count = 0
+    valid_frames = 0
     for frame_idx in range(len(df)):
-        # check hip swap (landmark 23 vs 24)
-        left_hip_x_col = 'landmark_23_x'
-        right_hip_x_col = 'landmark_24_x'
-        
-        if left_hip_x_col in df.columns and right_hip_x_col in df.columns:
+        left_x = df.iloc[frame_idx][left_hip_x_col]
+        right_x = df.iloc[frame_idx][right_hip_x_col]
+        if not pd.isna(left_x) and not pd.isna(right_x):
+            valid_frames += 1
+            if left_x > right_x:
+                swapped_count += 1
+    
+    # if more than 30% of frames are swapped, likely the whole video is mirrored
+    if valid_frames > 0 and swapped_count / valid_frames > 0.3:
+        # swap all left/right landmark pairs in this dataframe
+        landmark_pairs = [
+            (23, 24),  # hips
+            (25, 26),  # knees
+            (27, 28),  # ankles
+            (29, 30),  # feet
+            (31, 32),  # toes
+        ]
+        for left_idx, right_idx in landmark_pairs:
+            left_x = f'landmark_{left_idx}_x'
+            left_y = f'landmark_{left_idx}_y'
+            right_x = f'landmark_{right_idx}_x'
+            right_y = f'landmark_{right_idx}_y'
+            
+            if left_x in df.columns and right_x in df.columns:
+                df[[left_x, right_x]] = df[[right_x, left_x]]
+            if left_y in df.columns and right_y in df.columns:
+                df[[left_y, right_y]] = df[[right_y, left_y]]
+    else:
+        # frame-by-frame swap detection (for occasional swaps)
+        for frame_idx in range(len(df)):
             left_x = df.iloc[frame_idx][left_hip_x_col]
             right_x = df.iloc[frame_idx][right_hip_x_col]
             
-            # if they're swapped (left is further right than right), interpolate from neighbors
             if not pd.isna(left_x) and not pd.isna(right_x) and left_x > right_x:
                 if 0 < frame_idx < len(df) - 1:
                     before_lx = df.iloc[frame_idx - 1][left_hip_x_col]
@@ -1386,7 +1419,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
                 w_row[f'landmark_{i}_y'] = float(landmark.y)
                 w_row[f'landmark_{i}_z'] = float(landmark.z)
 
-            for i, landmark in enumerate(pixel_lm):
+            for i, landmark in enumerate(remapped_pixel_lm):
                 p_row[f'landmark_{i}_x'] = float(landmark.x)
                 p_row[f'landmark_{i}_y'] = float(landmark.y)
 
