@@ -50,15 +50,15 @@ def resource_path(filename):
 
 # analysis settings
 SLOWMO_FPS    = 240
-FILTER_CUTOFF = 6
-FILTER_ORDER  = 4
+FILTER_CUTOFF = 4.5    # slightly lower (gentle increase in smoothing)
+FILTER_ORDER  = 5      # keep at 5
 
 # frame storage settings
 SAVE_HEIGHT  = 540
 JPEG_QUALITY = 65
 CACHE_FRAMES = 96
 DEBUG_DIRECTION_DIAGNOSTICS = False
-DEBUG_LOG_JITTER = True 
+DEBUG_LOG_JITTER = False 
 CACHE_SCHEMA_VERSION = 1
 
 # pose model path
@@ -102,7 +102,6 @@ def _cache_dir(cache_key):
 
 
 def _butterworth_lowpass(cutoff, fs, order=4):
-    """Design a low-pass Butterworth filter."""
     nyquist = fs / 2.0
     normal_cutoff = cutoff / nyquist
     b, a = butter(order, normal_cutoff, btype='low', analog=False)
@@ -110,11 +109,66 @@ def _butterworth_lowpass(cutoff, fs, order=4):
 
 
 def _butterworth_lowpass_filter(data, cutoff=6, fs=240, order=4):
-    """Apply a low-pass Butterworth filter to smooth data."""
     if len(data) < order + 1:
         return data
     b, a = _butterworth_lowpass(cutoff, fs, order=order)
     return filtfilt(b, a, data)
+
+
+def _fix_jitter_outliers(df, max_frame_displacement=0.15, columns=None):
+    """detect frames with abnormal displacement and interpolate from neighbors."""
+    if columns is None:
+        # auto-detect coordinate columns (landmark_i_x, landmark_i_y, landmark_i_z)
+        columns = [c for c in df.columns if 'landmark_' in c and c.endswith(('_x', '_y', '_z'))]
+    
+    for col in columns:
+        if col not in df.columns:
+            continue
+        
+        # calculate frame-to-frame displacement
+        diff = df[col].diff().abs()
+        bad_frames = diff[diff > max_frame_displacement].index.tolist()
+        
+        if len(bad_frames) > 0:
+            # interpolate across bad frames from neighbors
+            for frame_idx in bad_frames:
+                if 0 < frame_idx < len(df) - 1:
+                    # estimate from surrounding frames
+                    before = df.iloc[frame_idx - 1][col]
+                    after = df.iloc[frame_idx + 1][col]
+                    df.at[frame_idx, col] = (before + after) / 2.0
+    
+    return df
+
+
+def _fix_limb_swaps(df):
+    """detect and fix left/right limb swaps by checking x-coordinates."""
+    # hip indices: left=23, right=24; similar pattern for other joints
+    # left landmarks should have smaller x (left side of frame), right should have larger x
+    
+    for frame_idx in range(len(df)):
+        # check hip swap (landmark 23 vs 24)
+        left_hip_x_col = 'landmark_23_x'
+        right_hip_x_col = 'landmark_24_x'
+        
+        if left_hip_x_col in df.columns and right_hip_x_col in df.columns:
+            left_x = df.iloc[frame_idx][left_hip_x_col]
+            right_x = df.iloc[frame_idx][right_hip_x_col]
+            
+            # if they're swapped (left is further right than right), interpolate from neighbors
+            if not pd.isna(left_x) and not pd.isna(right_x) and left_x > right_x:
+                if 0 < frame_idx < len(df) - 1:
+                    before_lx = df.iloc[frame_idx - 1][left_hip_x_col]
+                    after_lx = df.iloc[frame_idx + 1][left_hip_x_col]
+                    before_rx = df.iloc[frame_idx - 1][right_hip_x_col]
+                    after_rx = df.iloc[frame_idx + 1][right_hip_x_col]
+                    
+                    if not pd.isna(before_lx) and not pd.isna(after_lx):
+                        df.at[frame_idx, left_hip_x_col] = (before_lx + after_lx) / 2.0
+                    if not pd.isna(before_rx) and not pd.isna(after_rx):
+                        df.at[frame_idx, right_hip_x_col] = (before_rx + after_rx) / 2.0
+    
+    return df
 
 
 def _video_metadata(video_path):
@@ -428,7 +482,17 @@ def _compute_cycle_rmse(y_values, reference_y, max_cycle_length):
         
         # compute rmse
         rmse = float(np.sqrt(np.mean((y_resampled - reference_resampled) ** 2)))
-        return rmse
+        
+        # normalize by the larger range (cycle or reference) for lenient filtering
+        cycle_range = np.nanmax(y_resampled) - np.nanmin(y_resampled)
+        ref_range = np.nanmax(reference_resampled) - np.nanmin(reference_resampled)
+        max_range = max(cycle_range, ref_range)
+        
+        if max_range <= 0:
+            return 0.0
+        
+        rmse_pct = (rmse / max_range) * 100.0
+        return rmse_pct
     except Exception:
         return 0.0
 
@@ -1316,6 +1380,16 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
                 w_row[name] = calculate_angle(aw, bw, cw, dw, direction, jt)
                 p_row[name] = calculate_angle(ap, bp, cp, dp, direction, jt)
 
+            # store skeleton landmark coordinates for filtering to reduce jitter/swapping
+            for i, landmark in enumerate(world_lm):
+                w_row[f'landmark_{i}_x'] = float(landmark.x)
+                w_row[f'landmark_{i}_y'] = float(landmark.y)
+                w_row[f'landmark_{i}_z'] = float(landmark.z)
+
+            for i, landmark in enumerate(pixel_lm):
+                p_row[f'landmark_{i}_x'] = float(landmark.x)
+                p_row[f'landmark_{i}_y'] = float(landmark.y)
+
             # keep world landmark depth values for later analysis
             depth_row = {'frame_num': frame_count}
             for i, landmark in enumerate(world_lm):
@@ -1369,7 +1443,14 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
             if col not in ('frame_num', '_direction'):
                 df[col] = df[col].astype(np.float32)
     
-    # apply butterworth low-pass filter to smooth joint angles
+    # fix jitter outliers before filtering (detect and interpolate spike frames)
+    df_w = _fix_jitter_outliers(df_w, max_frame_displacement=0.20)
+    df_p = _fix_jitter_outliers(df_p, max_frame_displacement=0.15)
+    
+    # fix left/right limb swaps (happens when detection flips side assignment)
+    df_w = _fix_limb_swaps(df_w)
+    df_p = _fix_limb_swaps(df_p)
+    # apply butterworth low-pass filter to smooth joint angles AND skeleton coordinates
     joint_cols = set()
     for df in (df_w, df_p):
         for col in df.columns:
@@ -1383,6 +1464,28 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
                     df[col] = _butterworth_lowpass_filter(df[col].values, FILTER_CUTOFF, SLOWMO_FPS, FILTER_ORDER)
                 except Exception:
                     pass  # if filtering fails, keep original data
+    
+    # rebuild landmarks list from filtered pixel coordinates to apply filtering to skeleton visualization
+    filtered_landmarks = []
+    for frame_idx in range(len(df_p)):
+        if frame_idx < len(landmarks) and landmarks[frame_idx] is not None:
+            raw_path, _ = landmarks[frame_idx]  # keep original frame path
+            # rebuild landmark list from filtered df_p coordinate columns
+            filtered_lm = []
+            for i in range(33):  # mediapipe has 33 landmarks
+                x_col = f'landmark_{i}_x'
+                y_col = f'landmark_{i}_y'
+                if x_col in df_p.columns and y_col in df_p.columns:
+                    x = float(df_p.iloc[frame_idx][x_col]) if not pd.isna(df_p.iloc[frame_idx][x_col]) else 0.0
+                    y = float(df_p.iloc[frame_idx][y_col]) if not pd.isna(df_p.iloc[frame_idx][y_col]) else 0.0
+                    filtered_lm.append(SimpleLandmark(x, y, 1.0))  # use full visibility for filtered data
+                else:
+                    filtered_lm.append(SimpleLandmark(0.0, 0.0, 0.0))
+            filtered_landmarks.append((raw_path, filtered_lm))
+        elif frame_idx < len(landmarks):
+            filtered_landmarks.append(landmarks[frame_idx])  # preserve None entries
+    
+    landmarks = filtered_landmarks
     
     #apply same filtering to confidence data
     if 'avg_confidence' in df_confidence.columns:
@@ -1564,8 +1667,7 @@ class CacheManagerDialog(tk.Toplevel):
         self.title("Cache Manager")
         self.geometry("700x500")
         self.cache_root = cache_root
-        self.caches_info = []
-        self.cache_vars = {}
+        self.expanded = {}  # track which videos are expanded
         
         self._build_ui()
         self._scan_caches()
@@ -1648,78 +1750,88 @@ class CacheManagerDialog(tk.Toplevel):
         
         size_str = f"{total_size / (1024*1024):.1f} MB" if total_size > 0 else "0 KB"
         
-        # Frame for this cache entry
+        # Track expansion state
+        self.expanded[cache_key] = False
+        
+        # Container for this video entry
         entry_frame = tk.Frame(self.scrollable_frame, bg=BG2, relief='solid', borderwidth=1)
         entry_frame.pack(fill='x', pady=6)
         
-        # Title with size and delete button
-        title_frame = tk.Frame(entry_frame, bg=BG2)
-        title_frame.pack(fill='x', padx=8, pady=(6, 2))
+        # Header frame - clickable to expand/collapse
+        header_frame = tk.Frame(entry_frame, bg=BG2, cursor="hand2")
+        header_frame.pack(fill='x', padx=8, pady=6)
         
-        tk.Label(title_frame, text=f"📹 {video_name}", 
-                font=("Helvetica", 10, "bold"), bg=BG2, fg=TEXT).pack(side='left')
-        tk.Label(title_frame, text=f"({size_str})",
-                font=("Helvetica", 8), bg=BG2, fg=SUBTEXT).pack(side='left', padx=(4, 0))
+        # Expand/collapse arrow
+        arrow_label = tk.Label(header_frame, text="▶", font=("Helvetica", 10),
+                              bg=BG2, fg=TEXT)
+        arrow_label.pack(side='left', padx=(0, 6))
         
-        # Delete whole cache button
-        delete_btn = tk.Label(title_frame, text="✕", font=("Helvetica", 12, "bold"),
+        # Video name
+        tk.Label(header_frame, text=f"📹 {video_name}", 
+                font=("Helvetica", 10, "bold"), bg=BG2, fg=TEXT).pack(side='left', fill='x', expand=True)
+        
+        # Size
+        tk.Label(header_frame, text=size_str,
+                font=("Helvetica", 8), bg=BG2, fg=SUBTEXT).pack(side='left', padx=4)
+        
+        # Delete whole cache button (X)
+        delete_btn = tk.Label(header_frame, text="✕", font=("Helvetica", 12, "bold"),
                              bg=BG2, fg='#e74c3c', cursor="hand2")
-        delete_btn.pack(side='right')
-        delete_btn.bind('<Button-1>', lambda e: self._delete_whole_cache(cache_key, cache_path, entry_frame))
+        delete_btn.pack(side='right', padx=(4, 0))
+        delete_btn.bind('<Button-1>', lambda e, ck=cache_key, cp=cache_path, ef=entry_frame: 
+                       self._delete_whole_cache(ck, cp, ef))
+        delete_btn.bind('<Enter>', lambda e: delete_btn.config(fg='#c0392b'))
+        delete_btn.bind('<Leave>', lambda e: delete_btn.config(fg='#e74c3c'))
         
-        # Data info
-        data_frame = tk.Frame(entry_frame, bg=BG2)
-        data_frame.pack(fill='x', padx=20, pady=2)
+        # Content frame (hidden by default)
+        content_frame = tk.Frame(entry_frame, bg=BG, height=0)
+        content_frame.pack(fill='x', padx=12, pady=(0, 6), expand=False)
+        content_frame.pack_propagate(False)
         
-        data_text = []
+        # Store references for toggle
+        data_items = []
         if has_result:
-            data_text.append("✓ Coordinates & Angles")
+            data_items.append(('Coordinates & Angles', result_pkl))
         if has_markup:
-            data_text.append("✓ Step Marks")
+            data_items.append(('Step Marks', markup_json))
         if has_frames:
-            data_text.append("✓ Frame Cache")
+            data_items.append(('Frame Cache', frames_dir))
         
-        tk.Label(data_frame, text="  |  ".join(data_text) if data_text else "No data",
-                font=("Helvetica", 8), bg=BG2, fg=TEXT).pack(anchor='w')
+        # Build content
+        if data_items:
+            for item_name, item_path in data_items:
+                item_frame = tk.Frame(content_frame, bg=BG)
+                item_frame.pack(fill='x', pady=3)
+                
+                tk.Label(item_frame, text=f"  • {item_name}", font=("Helvetica", 9),
+                        bg=BG, fg=TEXT).pack(side='left', fill='x', expand=True)
+                
+                item_delete_btn = tk.Label(item_frame, text="✕", font=("Helvetica", 10),
+                                          bg=BG, fg='#e74c3c', cursor="hand2")
+                item_delete_btn.pack(side='right', padx=(4, 0))
+                item_delete_btn.bind('<Button-1>', lambda e, ip=item_path, iname=item_name, ef=entry_frame: 
+                                   self._delete_item(ip, iname, ef))
+                item_delete_btn.bind('<Enter>', lambda e: item_delete_btn.config(fg='#c0392b'))
+                item_delete_btn.bind('<Leave>', lambda e: item_delete_btn.config(fg='#e74c3c'))
+        else:
+            tk.Label(content_frame, text="  (Empty cache)", font=("Helvetica", 9),
+                    bg=BG, fg=SUBTEXT).pack(anchor='w', pady=3)
         
-        # Checkboxes
-        checks_frame = tk.Frame(entry_frame, bg=BG2)
-        checks_frame.pack(fill='x', padx=20, pady=(4, 6))
+        # Toggle function
+        def toggle_expand():
+            self.expanded[cache_key] = not self.expanded[cache_key]
+            if self.expanded[cache_key]:
+                arrow_label.config(text="▼")
+                content_frame.pack_propagate(True)
+                content_frame.pack(fill='x', padx=12, pady=(0, 6), expand=True)
+            else:
+                arrow_label.config(text="▶")
+                content_frame.pack_propagate(False)
+                content_frame.pack(fill='x', padx=12, pady=(0, 6), expand=False)
         
-        vars_dict = {
-            'result': tk.BooleanVar(value=False),
-            'markup': tk.BooleanVar(value=False),
-            'frames': tk.BooleanVar(value=False),
-        }
-        
-        if has_result:
-            tk.Checkbutton(checks_frame, text="Delete Coordinates & Angles",
-                          variable=vars_dict['result'], bg=BG2, fg=TEXT,
-                          activebackground=BG2, activeforeground=TEXT).pack(anchor='w', pady=2)
-        
-        if has_markup:
-            tk.Checkbutton(checks_frame, text="Delete Step Marks",
-                          variable=vars_dict['markup'], bg=BG2, fg=TEXT,
-                          activebackground=BG2, activeforeground=TEXT).pack(anchor='w', pady=2)
-        
-        if has_frames:
-            tk.Checkbutton(checks_frame, text="Delete Cached Frames",
-                          variable=vars_dict['frames'], bg=BG2, fg=TEXT,
-                          activebackground=BG2, activeforeground=TEXT).pack(anchor='w', pady=2)
-        
-        if not (has_result or has_markup or has_frames):
-            tk.Label(checks_frame, text="(Empty cache)", font=("Helvetica", 8),
-                    bg=BG2, fg=SUBTEXT).pack(anchor='w', pady=2)
-        
-        self.caches_info.append({
-            'cache_key': cache_key,
-            'cache_path': cache_path,
-            'has_result': has_result,
-            'has_markup': has_markup,
-            'has_frames': has_frames,
-            'vars': vars_dict
-        })
-        self.cache_vars[cache_key] = vars_dict
+        # Bind click to expand/collapse
+        for widget in [arrow_label, header_frame]:
+            widget.bind('<Button-1>', lambda e: toggle_expand())
     
     def _delete_whole_cache(self, cache_key, cache_path, entry_frame):
         """Delete entire cache for a video."""
@@ -1735,70 +1847,28 @@ class CacheManagerDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Error", f"Failed to delete cache: {e}")
     
-    def _delete_selected(self):
-        """Delete selected cache data."""
-        to_delete = []
-        
-        for info in self.caches_info:
-            cache_key = info['cache_key']
-            cache_path = info['cache_path']
-            vars_dict = info['vars']
-            
-            items = []
-            
-            if vars_dict['result'].get() and info['has_result']:
-                result_pkl = os.path.join(cache_path, 'result.pkl')
-                items.append(('result', result_pkl))
-            
-            if vars_dict['markup'].get() and info['has_markup']:
-                markup_json = os.path.join(cache_path, 'markup.json')
-                items.append(('markup', markup_json))
-            
-            if vars_dict['frames'].get() and info['has_frames']:
-                frames_dir = os.path.join(cache_path, 'frames')
-                items.append(('frames', frames_dir))
-            
-            if items:
-                to_delete.append((cache_key, items))
-        
-        if not to_delete:
-            messagebox.showwarning("Nothing Selected", "Please select data to delete")
-            return
-        
-        # Confirm
-        count = sum(len(items) for _, items in to_delete)
+    def _delete_item(self, item_path, item_name, entry_frame):
+        """Delete a specific cache item."""
         if not messagebox.askyesno("Confirm Delete", 
-                                   f"Delete {count} item(s) from {len(to_delete)} cache(s)?\n\nThis cannot be undone."):
+                                   f"Delete {item_name}?\n\nThis cannot be undone."):
             return
         
-        # Delete
-        deleted_count = 0
-        failed = []
-        
-        for cache_key, items in to_delete:
-            for item_type, item_path in items:
-                try:
-                    if os.path.isdir(item_path):
-                        shutil.rmtree(item_path)
-                    else:
-                        os.remove(item_path)
-                    deleted_count += 1
-                except Exception as e:
-                    failed.append(f"{item_type}: {str(e)}")
-        
-        if failed:
-            msg = "Deleted " + str(deleted_count) + " items with errors:\n" + "\n".join(failed[:5])
-            messagebox.showwarning("Partial Delete", msg)
-        else:
-            messagebox.showinfo("Success", f"Deleted {deleted_count} item(s)")
-        
-        # Refresh
-        self.scrollable_frame.destroy()
-        self.scrollable_frame = tk.Frame(self, bg=BG)
-        self.scrollable_frame.pack(fill='both', expand=True, padx=10, pady=10)
-        self.caches_info = []
-        self.cache_vars = {}
-        self._scan_caches()
+        try:
+            if os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+            else:
+                os.remove(item_path)
+            messagebox.showinfo("Success", f"{item_name} deleted")
+            
+            # Refresh the UI
+            self.scrollable_frame.destroy()
+            self.scrollable_frame = tk.Frame(self, bg=BG)
+            self.scrollable_frame.pack(fill='both', expand=True, padx=10, pady=10)
+            self.expanded = {}
+            self._scan_caches()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to delete {item_name}: {e}")
+
 
 # settings dialog
 class SettingsDialog(tk.Toplevel):
@@ -1814,7 +1884,6 @@ class SettingsDialog(tk.Toplevel):
         self._build_ui()
     
     def _build_ui(self):
-        """Build the settings UI."""
         # Title
         title_frame = tk.Frame(self, bg=BG2, height=50)
         title_frame.pack(fill='x', padx=0, pady=0)
@@ -1852,7 +1921,7 @@ class SettingsDialog(tk.Toplevel):
         rmse_frame = tk.Frame(content, bg=BG)
         rmse_frame.pack(fill='x', pady=10)
         
-        rmse_label = tk.Label(rmse_frame, text="RMSE Threshold (°)", 
+        rmse_label = tk.Label(rmse_frame, text="RMSE Threshold (%)", 
                              font=("Helvetica", 10), bg=BG, fg=TEXT)
         rmse_label.pack(side='left')
         
@@ -1864,7 +1933,7 @@ class SettingsDialog(tk.Toplevel):
         self.rmse_slider = tk.Scale(
             rmse_frame,
             from_=1.0,
-            to=50.0,
+            to=100.0,
             resolution=0.5,
             variable=self.rmse_var,
             orient='horizontal',
@@ -1920,7 +1989,7 @@ class SettingsDialog(tk.Toplevel):
     
     def _on_rmse_change(self, value):
         try:
-            self.dashboard.rmse_threshold = max(1.0, min(50.0, float(value)))
+            self.dashboard.rmse_threshold = max(1.0, min(100.0, float(value)))
             _save_ui_settings({'rmse_threshold': self.dashboard.rmse_threshold})
             self.dashboard.redraw_graph()
         except Exception:
