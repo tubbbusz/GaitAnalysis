@@ -141,31 +141,39 @@ def _fix_jitter_outliers(df, max_frame_displacement=0.15, columns=None):
 
 
 def _fix_limb_swaps(df):
-    """detect and fix left/right limb swaps by checking x-coordinates."""
     # hip indices: left=23, right=24; similar pattern for other joints
     # left landmarks should have smaller x (left side of frame), right should have larger x
+    # only fix obvious swaps (large overlap) to avoid over-correcting and creating discontinuities
+    
+    landmark_pairs = [
+        ('landmark_23_x', 'landmark_24_x'),  # left/right hip
+        ('landmark_25_x', 'landmark_26_x'),  # left/right knee
+        ('landmark_27_x', 'landmark_28_x'),  # left/right ankle
+    ]
     
     for frame_idx in range(len(df)):
-        # check hip swap (landmark 23 vs 24)
-        left_hip_x_col = 'landmark_23_x'
-        right_hip_x_col = 'landmark_24_x'
-        
-        if left_hip_x_col in df.columns and right_hip_x_col in df.columns:
-            left_x = df.iloc[frame_idx][left_hip_x_col]
-            right_x = df.iloc[frame_idx][right_hip_x_col]
+        for left_col, right_col in landmark_pairs:
+            if left_col not in df.columns or right_col not in df.columns:
+                continue
             
-            # if they're swapped (left is further right than right), interpolate from neighbors
-            if not pd.isna(left_x) and not pd.isna(right_x) and left_x > right_x:
+            left_x = df.iloc[frame_idx][left_col]
+            right_x = df.iloc[frame_idx][right_col]
+            
+            # only fix if swap is definite: left significantly overlaps right
+            # this avoids correcting borderline cases that may just be natural variance
+            if not pd.isna(left_x) and not pd.isna(right_x) and (right_x - left_x) < -0.05:
                 if 0 < frame_idx < len(df) - 1:
-                    before_lx = df.iloc[frame_idx - 1][left_hip_x_col]
-                    after_lx = df.iloc[frame_idx + 1][left_hip_x_col]
-                    before_rx = df.iloc[frame_idx - 1][right_hip_x_col]
-                    after_rx = df.iloc[frame_idx + 1][right_hip_x_col]
+                    before_lx = df.iloc[frame_idx - 1][left_col]
+                    after_lx = df.iloc[frame_idx + 1][left_col]
+                    before_rx = df.iloc[frame_idx - 1][right_col]
+                    after_rx = df.iloc[frame_idx + 1][right_col]
                     
+                    # use quadratic interpolation for smoother blending
                     if not pd.isna(before_lx) and not pd.isna(after_lx):
-                        df.at[frame_idx, left_hip_x_col] = (before_lx + after_lx) / 2.0
+                        # weighted towards neighbors, lighter correction
+                        df.at[frame_idx, left_col] = 0.25 * before_lx + 0.50 * left_x + 0.25 * after_lx
                     if not pd.isna(before_rx) and not pd.isna(after_rx):
-                        df.at[frame_idx, right_hip_x_col] = (before_rx + after_rx) / 2.0
+                        df.at[frame_idx, right_col] = 0.25 * before_rx + 0.50 * right_x + 0.25 * after_rx
     
     return df
 
@@ -1445,10 +1453,8 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     df_w = _fix_jitter_outliers(df_w, max_frame_displacement=0.20)
     df_p = _fix_jitter_outliers(df_p, max_frame_displacement=0.15)
     
-    # fix left/right limb swaps (happens when detection flips side assignment)
-    df_w = _fix_limb_swaps(df_w)
-    df_p = _fix_limb_swaps(df_p)
-    # apply butterworth low-pass filter to smooth joint angles AND skeleton coordinates
+    # apply butterworth low-pass filter first to smooth joint angles AND skeleton coordinates
+    # this reduces noise before fixing limb swaps, avoiding discontinuities that filter smoothing would amplify
     joint_cols = set()
     for df in (df_w, df_p):
         for col in df.columns:
@@ -1463,7 +1469,13 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
                 except Exception:
                     pass  # if filtering fails, keep original data
     
-    # rebuild landmarks list from filtered pixel coordinates to apply filtering to skeleton visualization
+    # fix left/right limb swaps after filtering (happens when detection flips side assignment)
+    # now works on cleaner, smoothed data
+    df_w = _fix_limb_swaps(df_w)
+    df_p = _fix_limb_swaps(df_p)
+    
+    # rebuild landmarks from filtered pixel coordinates for skeleton visualization
+    # use filtered pixel coords (already 0-1 normalized) for correct display geometry
     filtered_landmarks = []
     for frame_idx in range(len(df_p)):
         if frame_idx < len(landmarks) and landmarks[frame_idx] is not None:
@@ -1476,12 +1488,12 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
                 if x_col in df_p.columns and y_col in df_p.columns:
                     x = float(df_p.iloc[frame_idx][x_col]) if not pd.isna(df_p.iloc[frame_idx][x_col]) else 0.0
                     y = float(df_p.iloc[frame_idx][y_col]) if not pd.isna(df_p.iloc[frame_idx][y_col]) else 0.0
-                    filtered_lm.append(SimpleLandmark(x, y, 1.0))  # use full visibility for filtered data
+                    filtered_lm.append(SimpleLandmark(x, y, 1.0))
                 else:
                     filtered_lm.append(SimpleLandmark(0.0, 0.0, 0.0))
             filtered_landmarks.append((raw_path, filtered_lm))
         elif frame_idx < len(landmarks):
-            filtered_landmarks.append(landmarks[frame_idx])  # preserve None entries
+            filtered_landmarks.append(landmarks[frame_idx])
     
     landmarks = filtered_landmarks
     
