@@ -1670,23 +1670,22 @@ HELP_TEXT = [
 
 # cache manager dialog
 class CacheManagerDialog(tk.Toplevel):
-    """Dialog to view and manage all cached videos."""
     
     def __init__(self, parent, cache_root):
         super().__init__(parent)
         self.title("Cache Manager")
-        self.geometry("700x500")
+        self.geometry("380x450")
         self.cache_root = cache_root
-        self.expanded = {}  # track which videos are expanded
+        self.checkboxes = {}  # map (cache_key, item_name) to (var, path)
+        self.delete_whole_vars = {}  # map cache_key to delete-whole checkbox var
         
         self._build_ui()
         self._scan_caches()
     
     def _build_ui(self):
-        """Build the cache manager UI."""
         # Canvas with scrollbar
         canvas_frame = tk.Frame(self, bg=BG)
-        canvas_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        canvas_frame.pack(fill='both', expand=True, padx=10, pady=(10, 0))
         
         canvas = tk.Canvas(canvas_frame, bg=BG, highlightthickness=0)
         scrollbar = tk.Scrollbar(canvas_frame, orient='vertical', command=canvas.yview)
@@ -1699,6 +1698,16 @@ class CacheManagerDialog(tk.Toplevel):
         scrollbar.pack(side='right', fill='y')
         
         self.scrollable_frame = scrollable
+        self.canvas = canvas
+        
+        # Bottom button frame
+        bottom_frame = tk.Frame(self, bg=BG)
+        bottom_frame.pack(fill='x', padx=10, pady=10)
+        
+        self.delete_btn = tk.Button(bottom_frame, text="Delete Selected", 
+                                   font=("Helvetica", 10), bg='#e74c3c', fg='white',
+                                   command=self._delete_selected, state='disabled')
+        self.delete_btn.pack(side='left')
     
     def _scan_caches(self):
         """Scan cache directory and populate the list."""
@@ -1760,21 +1769,22 @@ class CacheManagerDialog(tk.Toplevel):
         
         size_str = f"{total_size / (1024*1024):.1f} MB" if total_size > 0 else "0 KB"
         
-        # Track expansion state
-        self.expanded[cache_key] = False
-        
         # Container for this video entry
         entry_frame = tk.Frame(self.scrollable_frame, bg=BG2, relief='solid', borderwidth=1)
         entry_frame.pack(fill='x', pady=6)
         
-        # Header frame - clickable to expand/collapse
-        header_frame = tk.Frame(entry_frame, bg=BG2, cursor="hand2")
+        # Header frame with delete whole cache checkbox
+        header_frame = tk.Frame(entry_frame, bg=BG2)
         header_frame.pack(fill='x', padx=8, pady=6)
         
-        # Expand/collapse arrow
-        arrow_label = tk.Label(header_frame, text="▶", font=("Helvetica", 10),
-                              bg=BG2, fg=TEXT)
-        arrow_label.pack(side='left', padx=(0, 6))
+        # Delete whole cache checkbox on the right
+        delete_whole_var = tk.BooleanVar(value=False)
+        self.delete_whole_vars[cache_key] = (delete_whole_var, cache_path)
+        
+        delete_whole_cb = tk.Checkbutton(header_frame, text="", variable=delete_whole_var,
+                                        font=("Helvetica", 9), bg=BG2, fg=TEXT,
+                                        command=self._update_delete_button)
+        delete_whole_cb.pack(side='right', padx=4)
         
         # Video name
         tk.Label(header_frame, text=f"📹 {video_name}", 
@@ -1784,19 +1794,7 @@ class CacheManagerDialog(tk.Toplevel):
         tk.Label(header_frame, text=size_str,
                 font=("Helvetica", 8), bg=BG2, fg=SUBTEXT).pack(side='left', padx=4)
         
-        # Delete whole cache button (X)
-        delete_btn = tk.Label(header_frame, text="✕", font=("Helvetica", 12, "bold"),
-                             bg=BG2, fg='#e74c3c', cursor="hand2")
-        delete_btn.pack(side='right', padx=(4, 0))
-        delete_btn.bind('<Button-1>', lambda e, ck=cache_key, cp=cache_path, ef=entry_frame: 
-                       self._delete_whole_cache(ck, cp, ef))
-        delete_btn.bind('<Enter>', lambda e: delete_btn.config(fg='#c0392b'))
-        delete_btn.bind('<Leave>', lambda e: delete_btn.config(fg='#e74c3c'))
-        
-        # Content frame (hidden by default, created but not packed)
-        content_frame = tk.Frame(entry_frame, bg=BG)
-        
-        # Store references for toggle
+        # Items frame (always visible)
         data_items = []
         if has_result:
             data_items.append(('Coordinates & Angles', result_pkl))
@@ -1805,82 +1803,79 @@ class CacheManagerDialog(tk.Toplevel):
         if has_frames:
             data_items.append(('Frame Cache', frames_dir))
         
-        # Build content
         if data_items:
-            # create a container for boxes
-            boxes_frame = tk.Frame(content_frame, bg=BG)
-            boxes_frame.pack(fill='x', padx=8, pady=6)
+            items_frame = tk.Frame(entry_frame, bg=BG)
+            items_frame.pack(fill='x', padx=8, pady=(0, 6))
             
             for item_name, item_path in data_items:
-                # create box for each item
-                box_frame = tk.Frame(boxes_frame, bg=BG2, relief='solid', borderwidth=1, padx=8, pady=6)
-                box_frame.pack(side='left', fill='both', expand=True, padx=2)
+                checkbox_var = tk.BooleanVar(value=False)
+                self.checkboxes[(cache_key, item_name)] = (checkbox_var, item_path)
                 
-                # item name label
-                tk.Label(box_frame, text=item_name, font=("Helvetica", 9, "bold"),
-                        bg=BG2, fg=TEXT).pack(anchor='w')
+                item_frame = tk.Frame(items_frame, bg=BG)
+                item_frame.pack(fill='x', pady=2)
                 
-                # delete button
-                item_delete_btn = tk.Label(box_frame, text="✕ Delete", font=("Helvetica", 8),
-                                          bg=BG2, fg='#e74c3c', cursor="hand2")
-                item_delete_btn.pack(anchor='w', pady=(4, 0))
-                item_delete_btn.bind('<Button-1>', lambda e, ip=item_path, iname=item_name, ef=entry_frame: 
-                                   self._delete_item(ip, iname, ef))
-                item_delete_btn.bind('<Enter>', lambda e: item_delete_btn.config(fg='#c0392b'))
-                item_delete_btn.bind('<Leave>', lambda e: item_delete_btn.config(fg='#e74c3c'))
+                checkbox = tk.Checkbutton(item_frame, text=item_name, variable=checkbox_var,
+                                         font=("Helvetica", 9), bg=BG, fg=TEXT,
+                                         command=self._update_delete_button)
+                checkbox.pack(anchor='w')
         else:
-            tk.Label(content_frame, text="(Empty cache)", font=("Helvetica", 9),
+            tk.Label(entry_frame, text="(Empty cache)", font=("Helvetica", 9),
                     bg=BG, fg=SUBTEXT).pack(anchor='w', padx=8, pady=6)
-        
-        # Toggle function using pack/pack_forget
-        def toggle_expand():
-            self.expanded[cache_key] = not self.expanded[cache_key]
-            if self.expanded[cache_key]:
-                arrow_label.config(text="▼")
-                content_frame.pack(fill='x', padx=12, pady=(0, 6), after=header_frame)
-            else:
-                arrow_label.config(text="▶")
-                content_frame.pack_forget()
-        
-        # Bind click to expand/collapse
-        for widget in [arrow_label, header_frame]:
-            widget.bind('<Button-1>', lambda e: toggle_expand())
     
-    def _delete_whole_cache(self, cache_key, cache_path, entry_frame):
-        """Delete entire cache for a video."""
-        if not messagebox.askyesno("Confirm Delete", 
-                                   f"Delete entire cache?\n\nThis cannot be undone.", parent=self):
+    def _update_delete_button(self):
+        """Enable/disable delete button based on checkbox state."""
+        has_items_selected = any(var.get() for var, _ in self.checkboxes.values())
+        has_whole_selected = any(var.get() for var, _ in self.delete_whole_vars.values())
+        self.delete_btn.config(state='normal' if (has_items_selected or has_whole_selected) else 'disabled')
+    
+    def _delete_selected(self):
+        """Delete all selected cache items and whole caches."""
+        selected_items = [(key, path) for key, (var, path) in self.checkboxes.items() if var.get()]
+        selected_whole = [(key, path) for key, (var, path) in self.delete_whole_vars.items() if var.get()]
+        
+        if not selected_items and not selected_whole:
+            messagebox.showwarning("No Selection", "Please select items to delete", parent=self)
             return
         
-        try:
-            if os.path.exists(cache_path):
-                shutil.rmtree(cache_path)
-            messagebox.showinfo("Success", "Cache deleted", parent=self)
-            entry_frame.destroy()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to delete cache: {e}", parent=self)
-    
-    def _delete_item(self, item_path, item_name, entry_frame):
-        """Delete a specific cache item."""
+        total_count = len(selected_items) + len(selected_whole)
         if not messagebox.askyesno("Confirm Delete", 
-                                   f"Delete {item_name}?\n\nThis cannot be undone.", parent=self):
+                                   f"Delete {total_count} selected item(s)?\n\nThis cannot be undone.", 
+                                   parent=self):
             return
         
-        try:
-            if os.path.isdir(item_path):
-                shutil.rmtree(item_path)
-            else:
-                os.remove(item_path)
-            messagebox.showinfo("Success", f"{item_name} deleted", parent=self)
-            
-            # Refresh the UI
-            self.scrollable_frame.destroy()
-            self.scrollable_frame = tk.Frame(self, bg=BG)
-            self.scrollable_frame.pack(fill='both', expand=True, padx=10, pady=10)
-            self.expanded = {}
-            self._scan_caches()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to delete {item_name}: {e}", parent=self)
+        failed = []
+        
+        # Delete individual items
+        for (cache_key, item_name), item_path in selected_items:
+            try:
+                if os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+                else:
+                    os.remove(item_path)
+            except Exception as e:
+                failed.append(f"{item_name}: {e}")
+        
+        # Delete whole caches
+        for cache_key, cache_path in selected_whole:
+            try:
+                if os.path.exists(cache_path):
+                    shutil.rmtree(cache_path)
+            except Exception as e:
+                failed.append(f"Cache {cache_key[:8]}...: {e}")
+        
+        if failed:
+            messagebox.showerror("Partial Failure", 
+                               f"Failed to delete:\n" + "\n".join(failed), parent=self)
+        else:
+            messagebox.showinfo("Success", f"{total_count} item(s) deleted", parent=self)
+        
+        # Refresh the UI by clearing and rebuilding
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        
+        self.checkboxes = {}
+        self.delete_whole_vars = {}
+        self._scan_caches()
 
 
 # settings dialog
