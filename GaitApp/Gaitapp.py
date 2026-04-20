@@ -178,6 +178,51 @@ def _fix_limb_swaps(df):
     return df
 
 
+def _detect_jittery_frames(pixel_landmarks, threshold=0.15):
+    # detect frames with excessive frame-to-frame landmark displacement (jitter)
+    # returns a set of frame indices. pixel_landmarks is list of (raw_path, landmark_list) tuples
+    # each landmark has x, y in 0-1 range. threshold is max allowed displacement between frames (default 0.15)
+    jittery_frames = set()
+    
+    if not pixel_landmarks or len(pixel_landmarks) < 2:
+        return jittery_frames
+    
+    # track previous valid frame's landmark positions
+    prev_landmarks = None
+    
+    for frame_idx, entry in enumerate(pixel_landmarks):
+        if entry is None:
+            prev_landmarks = None
+            continue
+        
+        if isinstance(entry, tuple):
+            _, current_lm = entry
+        else:
+            current_lm = entry
+        
+        if current_lm is None or len(current_lm) == 0:
+            prev_landmarks = None
+            continue
+        
+        # check displacement from previous frame
+        if prev_landmarks is not None and len(prev_landmarks) == len(current_lm):
+            max_displacement = 0.0
+            for prev_lm, curr_lm in zip(prev_landmarks, current_lm):
+                if prev_lm.visibility > 0.5 and curr_lm.visibility > 0.5:
+                    # calculate euclidean distance in normalized coords (0-1)
+                    dx = curr_lm.x - prev_lm.x
+                    dy = curr_lm.y - prev_lm.y
+                    displacement = np.sqrt(dx*dx + dy*dy)
+                    max_displacement = max(max_displacement, displacement)
+            
+            if max_displacement > threshold:
+                jittery_frames.add(frame_idx)
+        
+        prev_landmarks = current_lm
+    
+    return jittery_frames
+
+
 def _video_metadata(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -505,7 +550,7 @@ def _compute_cycle_rmse(y_values, reference_y, max_cycle_length):
 
 # drawing and analysis helpers
 def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=None, focus_side=None,
-                                 skeleton_thickness=None):
+                                 skeleton_thickness=None, draw_jitter_red=False):
     h, w = frame_bgr.shape[:2]
     if skeleton_thickness is None:
         skeleton_thickness = DRAW_THICKNESS
@@ -523,6 +568,9 @@ def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=No
         return jname.startswith(focus_side + '_')
     
     def _resolve_color(landmark_idx, base_color):
+        # if marking jitter frame, all colors become red
+        if draw_jitter_red:
+            return (0, 0, 255)  # red in BGR
         if landmark_idx not in LANDMARK_TO_JOINT_NAME:
             return GRAY_BGR if focus_side in ('left', 'right') else base_color
         jname = LANDMARK_TO_JOINT_NAME[landmark_idx]
@@ -1453,21 +1501,19 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     df_w = _fix_jitter_outliers(df_w, max_frame_displacement=0.20)
     df_p = _fix_jitter_outliers(df_p, max_frame_displacement=0.15)
     
-    # apply butterworth low-pass filter first to smooth joint angles AND skeleton coordinates
-    # this reduces noise before fixing limb swaps, avoiding discontinuities that filter smoothing would amplify
+    # apply butterworth low-pass filter to world coordinates for angle calculations in graphs only
+    # skeleton coordinates (pixel_df) are NOT filtered to preserve exact visual position
     joint_cols = set()
-    for df in (df_w, df_p):
-        for col in df.columns:
-            if col not in ('frame_num', '_direction'):
-                joint_cols.add(col)
+    for col in df_w.columns:
+        if col not in ('frame_num', '_direction'):
+            joint_cols.add(col)
     
-    for df in (df_w, df_p):
-        for col in joint_cols:
-            if col in df.columns and len(df) > FILTER_ORDER:
-                try:
-                    df[col] = _butterworth_lowpass_filter(df[col].values, FILTER_CUTOFF, SLOWMO_FPS, FILTER_ORDER)
-                except Exception:
-                    pass  # if filtering fails, keep original data
+    for col in joint_cols:
+        if col in df_w.columns and len(df_w) > FILTER_ORDER:
+            try:
+                df_w[col] = _butterworth_lowpass_filter(df_w[col].values, FILTER_CUTOFF, SLOWMO_FPS, FILTER_ORDER)
+            except Exception:
+                pass  # if filtering fails, keep original data
     
     # fix left/right limb swaps after filtering (happens when detection flips side assignment)
     # now works on cleaner, smoothed data
@@ -1497,6 +1543,29 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     
     landmarks = filtered_landmarks
     
+    # detect jittery frames (marks frames with excessive displacement for skeleton skipping)
+    # threshold 0.04 in normalized coords (~4% of frame) roughly matches 15cm jitter in world coords
+    jittery_frames = _detect_jittery_frames(landmarks, threshold=0.04)
+    
+    # fill in gaps between jittery frames if gap is 5 or fewer frames (repeat until no more gaps)
+    if jittery_frames:
+        while True:
+            frames_added = 0
+            sorted_jittery = sorted(jittery_frames)
+            for i in range(len(sorted_jittery) - 1):
+                current_frame = sorted_jittery[i]
+                next_frame = sorted_jittery[i + 1]
+                gap = next_frame - current_frame - 1
+                if gap > 0 and gap <= 5:
+                    # add all frames in the gap to jittery set
+                    for frame_to_fill in range(current_frame + 1, next_frame):
+                        if frame_to_fill not in jittery_frames:
+                            jittery_frames.add(frame_to_fill)
+                            frames_added += 1
+            # stop looping if no new frames were added
+            if frames_added == 0:
+                break
+    
     #apply same filtering to confidence data
     if 'avg_confidence' in df_confidence.columns:
         df_confidence['avg_confidence'] = df_confidence['avg_confidence'].astype(np.float32)
@@ -1521,6 +1590,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
         'excluded_regions': [],
         'all_landmarks':  landmarks,   # each item stores a raw path and pixel landmarks
         'landmark_depths': df_depths,
+        'jittery_frames': jittery_frames,  # set of frame indices with excessive displacement
         'needs_rotation': needs_rotation,
         '_cache_key':     cache_key,
         '_cache_meta':    cache_meta or {},
@@ -2257,6 +2327,8 @@ class GaitAnalysisDashboard(tk.Tk):
         self.show_data            = True
         self.show_confidence      = False  # confidence scores hidden by default
         self.show_outliers_only   = False  # toggle to show only outlier cycles
+        self.show_jitter_frames   = False  # toggle to show jitter frames in red instead of hiding them
+        self.remove_jitter_frames = True   # toggle to enable/disable jitter frame removal entirely
         self.active_dataset_idx   = 0
         ui_settings = _load_ui_settings()
         self.skeleton_thickness = float(ui_settings.get('skeleton_thickness', DRAW_THICKNESS))
@@ -2548,6 +2620,38 @@ class GaitAnalysisDashboard(tk.Tk):
         self._skeleton_slider.set(self.skeleton_thickness)
         self._skeleton_slider.pack(fill='x', padx=10, pady=(0, 10))
 
+        tk.Frame(right, bg=SUBTEXT, height=1).pack(fill='x', padx=8, pady=(4, 6))
+        tk.Label(right, text="Jitter Frames",
+                 font=("Helvetica", 8, "bold"), bg=BG2, fg=TEXT).pack(anchor='w', padx=10)
+        remove_jitter_var = tk.BooleanVar(value=self.remove_jitter_frames)
+        self._remove_jitter_check = tk.Checkbutton(
+            right,
+            text="Remove jitter frames",
+            variable=remove_jitter_var,
+            bg=BG2,
+            fg=TEXT,
+            activebackground=BG2,
+            activeforeground=TEXT,
+            highlightthickness=0,
+            selectcolor=BG3,
+            command=self._toggle_remove_jitter_frames
+        )
+        self._remove_jitter_check.pack(anchor='w', padx=10, pady=(0, 4))
+        jitter_var = tk.BooleanVar(value=self.show_jitter_frames)
+        self._jitter_check = tk.Checkbutton(
+            right,
+            text="Show jitter frames (red)",
+            variable=jitter_var,
+            bg=BG2,
+            fg=TEXT,
+            activebackground=BG2,
+            activeforeground=TEXT,
+            highlightthickness=0,
+            selectcolor=BG3,
+            command=self._toggle_jitter_frames
+        )
+        self._jitter_check.pack(anchor='w', padx=10, pady=(0, 10))
+
         # toolbar and status bar
         bottom = tk.Frame(self, bg=BG2, height=36)
         bottom.pack(fill='x', side='bottom')
@@ -2773,16 +2877,16 @@ class GaitAnalysisDashboard(tk.Tk):
         self.bind('<Key-1>',        lambda e: self._prev_frame())
         self.bind('<Key-2>',        lambda e: self._next_frame())
         self.bind('<Key-9>',        lambda e: self._toggle_play())
-        self.bind('q',              lambda e: self._on_close())
-        self.bind('w',              lambda e: self._toggle_world())
-        self.bind('c',              lambda e: self._toggle_cycles())
-        self.bind('s',              lambda e: self._toggle_resample())
-        self.bind('m',              lambda e: self._toggle_mean())
-        self.bind('v',              lambda e: self._cycle_graph_view())
-        self.bind('t',              lambda e: self._toggle_active())
-        self.bind('r',              lambda e: self._recompute_steps())
-        self.bind('g',              lambda e: self._toggle_suggestions())
-        self.bind('d',              lambda e: self._clear_steps())
+        self.bind('<q>',            lambda e: self._on_close())
+        self.bind('<w>',            lambda e: self._toggle_world())
+        self.bind('<c>',            lambda e: self._toggle_cycles())
+        self.bind('<s>',            lambda e: self._toggle_resample())
+        self.bind('<m>',            lambda e: self._toggle_mean())
+        self.bind('<v>',            lambda e: self._cycle_graph_view())
+        self.bind('<t>',            lambda e: self._toggle_active())
+        self.bind('<r>',            lambda e: self._recompute_steps())
+        self.bind('<g>',            lambda e: self._toggle_suggestions())
+        self.bind('<d>',            lambda e: self._clear_steps())
         self.bind('<space>',        lambda e: self._add_manual_step())
         self.bind('<BackSpace>',    lambda e: self._delete_nearest_step())
         self.bind('<Delete>',       lambda e: self._delete_nearest_step())
@@ -3321,14 +3425,23 @@ class GaitAnalysisDashboard(tk.Tk):
                 continue
 
             # draw the skeleton at render time using current joint visibility
+            jittery_frames = self.datasets[vi].get('jittery_frames', set()) if self.remove_jitter_frames else set()
+            is_jittery = self.current_frame_idx in jittery_frames
+            
+            # if show_jitter_frames toggle is on, draw jittery frames in red; otherwise skip them
             if pixel_lm is not None:
-                frame = frame.copy()
-                draw_pose_landmarks_on_frame(
-                    frame,
-                    pixel_lm,
-                    self.joint_visibility,
-                    skeleton_thickness=self.skeleton_thickness,
-                )
+                if is_jittery and not self.show_jitter_frames:
+                    # skip drawing skeleton for jittery frame
+                    pass
+                else:
+                    frame = frame.copy()
+                    draw_pose_landmarks_on_frame(
+                        frame,
+                        pixel_lm,
+                        self.joint_visibility,
+                        skeleton_thickness=self.skeleton_thickness,
+                        draw_jitter_red=is_jittery and self.show_jitter_frames,
+                    )
 
             # rotate the analysis frame so the person appears upright in the gui
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
@@ -3923,6 +4036,22 @@ class GaitAnalysisDashboard(tk.Tk):
         else:
             self._show_video_frames()
 
+    def _toggle_jitter_frames(self):
+        # toggle showing jittery frames in red instead of hiding them
+        self.show_jitter_frames = not self.show_jitter_frames
+        if self._marking_phase:
+            self._markup_show_frames()
+        else:
+            self._show_video_frames()
+
+    def _toggle_remove_jitter_frames(self):
+        # toggle enabling/disabling jitter frame removal entirely
+        self.remove_jitter_frames = not self.remove_jitter_frames
+        if self._marking_phase:
+            self._markup_show_frames()
+        else:
+            self._show_video_frames()
+
     def _toggle_display_option(self, key):
         if key == 'mean':
             if not self.show_overlaid_cycles:
@@ -4317,10 +4446,19 @@ class GaitAnalysisDashboard(tk.Tk):
             return
 
         if pixel_lm is not None:
-            frame = frame.copy()
-            draw_pose_landmarks_on_frame(frame, pixel_lm, self.joint_visibility,
-                                         focus_side=self._marking_phase,
-                                         skeleton_thickness=self.skeleton_thickness)
+            jittery_frames = self.datasets[vi].get('jittery_frames', set()) if self.remove_jitter_frames else set()
+            is_jittery = self.current_frame_idx in jittery_frames
+            
+            # if show_jitter_frames toggle is on, draw jittery frames in red; otherwise skip them
+            if is_jittery and not self.show_jitter_frames:
+                # skip drawing skeleton for jittery frame
+                pass
+            else:
+                frame = frame.copy()
+                draw_pose_landmarks_on_frame(frame, pixel_lm, self.joint_visibility,
+                                             focus_side=self._marking_phase,
+                                             skeleton_thickness=self.skeleton_thickness,
+                                             draw_jitter_red=is_jittery and self.show_jitter_frames)
 
         frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
