@@ -505,10 +505,14 @@ NORMATIVE_GAIT = {
 NORMATIVE_GAIT['hip']['mean']   = NORMATIVE_GAIT['hip']['mean'][:100]
 NORMATIVE_GAIT['ankle']['mean'] = NORMATIVE_GAIT['ankle']['mean'][:100]
 for jt in NORMATIVE_GAIT:
-    m  = NORMATIVE_GAIT[jt]["mean"]
-    sd = np.std(m) * 0.15
-    NORMATIVE_GAIT[jt]["lower"] = m - sd
-    NORMATIVE_GAIT[jt]["upper"] = m + sd
+    m  = np.array(NORMATIVE_GAIT[jt]["mean"])
+    # replace any NaN with nearest valid value
+    m = np.nan_to_num(m, nan=np.nanmean(m))
+    sd = np.std(m)
+    se = sd / np.sqrt(len(m))  # standard error of the mean
+    NORMATIVE_GAIT[jt]["mean"] = m
+    NORMATIVE_GAIT[jt]["lower"] = np.asarray(m - se)
+    NORMATIVE_GAIT[jt]["upper"] = np.asarray(m + se)
 NORMATIVE_X = np.linspace(0, 100, 100)
 
 
@@ -1955,7 +1959,7 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, dashboard):
         super().__init__(parent)
         self.title("Settings")
-        self.geometry("550x450")
+        self.geometry("550x700")
         self.dashboard = dashboard
         self.configure(bg=BG)
         
@@ -2053,6 +2057,52 @@ class SettingsDialog(tk.Toplevel):
                  bg='#27ae60', fg=TEXT, relief='flat', padx=8,
                  command=self._open_pdf_export).pack(side='right')
         
+        # Separator
+        sep3 = tk.Frame(content, bg=BG2, height=1)
+        sep3.pack(fill='x', pady=10)
+        
+        # Jitter Frames options
+        jitter_frame = tk.Frame(content, bg=BG)
+        jitter_frame.pack(fill='x', pady=10)
+        
+        jitter_label = tk.Label(jitter_frame, text="Jitter Frames", 
+                               font=("Helvetica", 10, "bold"), bg=BG, fg=TEXT)
+        jitter_label.pack(side='left')
+        
+        self.remove_jitter_var = tk.BooleanVar(value=self.dashboard.remove_jitter_frames)
+        remove_jitter_check = tk.Checkbutton(
+            content, text="Remove jitter frames",
+            variable=self.remove_jitter_var, bg=BG, fg=TEXT,
+            activebackground=BG, activeforeground=TEXT,
+            command=self._toggle_remove_jitter_frames)
+        remove_jitter_check.pack(anchor='w', pady=2)
+        
+        self.show_jitter_var = tk.BooleanVar(value=self.dashboard.show_jitter_frames)
+        show_jitter_check = tk.Checkbutton(
+            content, text="Show jitter frames in red",
+            variable=self.show_jitter_var, bg=BG, fg=TEXT,
+            activebackground=BG, activeforeground=TEXT,
+            command=self._toggle_show_jitter_frames)
+        show_jitter_check.pack(anchor='w', pady=(2, 10))
+        
+        # Separator
+        sep4 = tk.Frame(content, bg=BG2, height=1)
+        sep4.pack(fill='x', pady=10)
+        
+        # Graph viewer option
+        graph_frame = tk.Frame(content, bg=BG)
+        graph_frame.pack(fill='x', pady=10)
+        
+        graph_label = tk.Label(graph_frame, text="Graph Display", 
+                              font=("Helvetica", 10), bg=BG, fg=TEXT)
+        graph_label.pack(side='left')
+        
+        self._graph_display_btn = tk.Button(graph_frame, font=("Helvetica", 9),
+                 bg=BG3, fg=TEXT, relief='flat', padx=8,
+                 command=self._toggle_graph_display_mode)
+        self._graph_display_btn.pack(side='right')
+        self._update_graph_display_btn()
+        
         # Bottom buttons
         btn_frame = tk.Frame(self, bg=BG)
         btn_frame.pack(fill='x', padx=20, pady=15)
@@ -2065,6 +2115,20 @@ class SettingsDialog(tk.Toplevel):
         self.dashboard.show_confidence = self.conf_var.get()
         self.dashboard.redraw_graph()
     
+    def _toggle_remove_jitter_frames(self):
+        self.dashboard.remove_jitter_frames = self.remove_jitter_var.get()
+        if self.dashboard._marking_phase:
+            self.dashboard._markup_show_frames()
+        else:
+            self.dashboard._show_video_frames()
+    
+    def _toggle_show_jitter_frames(self):
+        self.dashboard.show_jitter_frames = self.show_jitter_var.get()
+        if self.dashboard._marking_phase:
+            self.dashboard._markup_show_frames()
+        else:
+            self.dashboard._show_video_frames()
+    
     def _on_rmse_change(self, value):
         try:
             self.dashboard.rmse_threshold = max(1.0, min(100.0, float(value)))
@@ -2072,6 +2136,22 @@ class SettingsDialog(tk.Toplevel):
             self.dashboard.redraw_graph()
         except Exception:
             pass
+    
+    def _update_graph_display_btn(self):
+        # update button text to show current mode
+        mode_text = "SE Shading" if self.dashboard.graph_display_mode == 'se_shading' else "Lines"
+        self._graph_display_btn.config(text=mode_text)
+    
+    def _toggle_graph_display_mode(self):
+        # toggle between se_shading and lines_only modes
+        if self.dashboard.graph_display_mode == 'se_shading':
+            self.dashboard.graph_display_mode = 'lines_only'
+            self.dashboard.show_data = True
+        else:
+            self.dashboard.graph_display_mode = 'se_shading'
+            self.dashboard.show_data = False
+        self._update_graph_display_btn()
+        self.dashboard.redraw_graph()
     
     def _open_cache_manager(self):
         if self.dashboard._cache_manager_dialog is not None and self.dashboard._cache_manager_dialog.winfo_exists():
@@ -2324,7 +2404,8 @@ class GaitAnalysisDashboard(tk.Tk):
         self.show_mean            = True
         self.mean_only            = False
         self.show_normative       = True
-        self.show_data            = True
+        self.show_data            = False
+        self.graph_display_mode   = 'se_shading'  # 'se_shading' or 'lines_only'
         self.show_confidence      = False  # confidence scores hidden by default
         self.show_outliers_only   = False  # toggle to show only outlier cycles
         self.show_jitter_frames   = False  # toggle to show jitter frames in red instead of hiding them
@@ -2619,38 +2700,6 @@ class GaitAnalysisDashboard(tk.Tk):
         )
         self._skeleton_slider.set(self.skeleton_thickness)
         self._skeleton_slider.pack(fill='x', padx=10, pady=(0, 10))
-
-        tk.Frame(right, bg=SUBTEXT, height=1).pack(fill='x', padx=8, pady=(4, 6))
-        tk.Label(right, text="Jitter Frames",
-                 font=("Helvetica", 8, "bold"), bg=BG2, fg=TEXT).pack(anchor='w', padx=10)
-        remove_jitter_var = tk.BooleanVar(value=self.remove_jitter_frames)
-        self._remove_jitter_check = tk.Checkbutton(
-            right,
-            text="Remove jitter frames",
-            variable=remove_jitter_var,
-            bg=BG2,
-            fg=TEXT,
-            activebackground=BG2,
-            activeforeground=TEXT,
-            highlightthickness=0,
-            selectcolor=BG3,
-            command=self._toggle_remove_jitter_frames
-        )
-        self._remove_jitter_check.pack(anchor='w', padx=10, pady=(0, 4))
-        jitter_var = tk.BooleanVar(value=self.show_jitter_frames)
-        self._jitter_check = tk.Checkbutton(
-            right,
-            text="Show jitter frames (red)",
-            variable=jitter_var,
-            bg=BG2,
-            fg=TEXT,
-            activebackground=BG2,
-            activeforeground=TEXT,
-            highlightthickness=0,
-            selectcolor=BG3,
-            command=self._toggle_jitter_frames
-        )
-        self._jitter_check.pack(anchor='w', padx=10, pady=(0, 10))
 
         # toolbar and status bar
         bottom = tk.Frame(self, bg=BG2, height=36)
@@ -3366,9 +3415,19 @@ class GaitAnalysisDashboard(tk.Tk):
                             t = np.linspace(0, 1, len(y))
                             inliers.append(interp1d(t, y)(np.linspace(0, 1, max_cycle_length)))
                         if inliers:
-                            mean_c = np.nanmean(np.vstack(inliers), axis=0)
-                            ax.plot(np.arange(len(mean_c)), mean_c,
-                                    color=col, lw=2.2, linestyle=ls,
+                            inliers_array = np.vstack(inliers)
+                            mean_c = np.nanmean(inliers_array, axis=0)
+                            # calculate standard error band
+                            se_c = np.nanstd(inliers_array, axis=0) / np.sqrt(len(inliers))
+                            lower_c = mean_c - se_c
+                            upper_c = mean_c + se_c
+                            x_plot = np.arange(len(mean_c))
+                            # plot error band first (behind) - only in se_shading mode
+                            if self.graph_display_mode == 'se_shading':
+                                ax.fill_between(x_plot, lower_c, upper_c, color=col, alpha=0.15, zorder=2)
+                            # plot mean line on top
+                            ax.plot(x_plot, mean_c,
+                                    color=col, lw=2.2, linestyle=ls, zorder=3,
                                     label=f"{joint.replace('_',' ').title()} V{si+1} mean")
 
             if self.resample_cycles and self.show_normative and not self.show_outliers_only:
@@ -3380,9 +3439,9 @@ class GaitAnalysisDashboard(tk.Tk):
                     vr = self.joint_visibility.get(f'right_{jt_key}', False)
                     if vl or vr:
                         d = NORMATIVE_GAIT[jt_key]
-                        ax.fill_between(norm_x_resampled, d['lower'], d['upper'],
-                                        color=C_NORM, alpha=0.12,
-                                        label=f'{jt_key.title()} norm.')
+                        # plot normative mean line only
+                        ax.plot(norm_x_resampled, d['mean'], color=C_NORM, lw=1.5, linestyle='-', alpha=0.8, zorder=2,
+                                label=f'{jt_key.title()} norm.')
         # set x limits after plotting to avoid autoscaling drift
         if self.show_overlaid_cycles:
             # overlaid cycles use the longest actual stride
@@ -4031,22 +4090,6 @@ class GaitAnalysisDashboard(tk.Tk):
         except Exception:
             return
         _save_ui_settings({'skeleton_thickness': self.skeleton_thickness})
-        if self._marking_phase:
-            self._markup_show_frames()
-        else:
-            self._show_video_frames()
-
-    def _toggle_jitter_frames(self):
-        # toggle showing jittery frames in red instead of hiding them
-        self.show_jitter_frames = not self.show_jitter_frames
-        if self._marking_phase:
-            self._markup_show_frames()
-        else:
-            self._show_video_frames()
-
-    def _toggle_remove_jitter_frames(self):
-        # toggle enabling/disabling jitter frame removal entirely
-        self.remove_jitter_frames = not self.remove_jitter_frames
         if self._marking_phase:
             self._markup_show_frames()
         else:
