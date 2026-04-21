@@ -1501,21 +1501,52 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
             if col not in ('frame_num', '_direction'):
                 df[col] = df[col].astype(np.float32)
     
-    # fix jitter outliers before filtering (detect and interpolate spike frames)
+    # detect jittery frames FIRST from raw landmarks before any filtering (so we can detect real jitter)
+    # threshold 0.04 in normalized coords (~4% of frame) roughly matches 15cm jitter in world coords
+    jittery_frames = _detect_jittery_frames(landmarks, threshold=0.04)
+    
+    # interpolate across jittery frames in both world and pixel data
+    landmark_cols_w = [c for c in df_w.columns if c.startswith('landmark_') and c.endswith(('_x', '_y', '_z'))]
+    landmark_cols_p = [c for c in df_p.columns if c.startswith('landmark_') and c.endswith(('_x', '_y'))]
+    
+    for frame_idx in sorted(jittery_frames):
+        if 0 < frame_idx < len(df_w) - 1:
+            for col in landmark_cols_w:
+                before = df_w.iloc[frame_idx - 1][col]
+                after = df_w.iloc[frame_idx + 1][col]
+                if not pd.isna(before) and not pd.isna(after):
+                    df_w.at[frame_idx, col] = (before + after) / 2.0
+        if 0 < frame_idx < len(df_p) - 1:
+            for col in landmark_cols_p:
+                before = df_p.iloc[frame_idx - 1][col]
+                after = df_p.iloc[frame_idx + 1][col]
+                if not pd.isna(before) and not pd.isna(after):
+                    df_p.at[frame_idx, col] = (before + after) / 2.0
+    
+    # fix other jitter outliers (detect and interpolate spike frames)
     df_w = _fix_jitter_outliers(df_w, max_frame_displacement=0.20)
     df_p = _fix_jitter_outliers(df_p, max_frame_displacement=0.15)
     
-    # apply butterworth low-pass filter to world coordinates for angle calculations in graphs only
+    # apply butterworth low-pass filter to world coordinates only (for angle calculations in graphs)
     # skeleton coordinates (pixel_df) are NOT filtered to preserve exact visual position
-    joint_cols = set()
-    for col in df_w.columns:
-        if col not in ('frame_num', '_direction'):
-            joint_cols.add(col)
+    joint_cols_w = set(c for c in df_w.columns if c not in ('frame_num', '_direction'))
     
-    for col in joint_cols:
+    for col in joint_cols_w:
         if col in df_w.columns and len(df_w) > FILTER_ORDER:
             try:
                 df_w[col] = _butterworth_lowpass_filter(df_w[col].values, FILTER_CUTOFF, SLOWMO_FPS, FILTER_ORDER)
+            except Exception:
+                pass  # if filtering fails, keep original data
+    
+    # also create a filtered copy of pixel angles for graphs while keeping landmark coords unfiltered
+    df_p_filtered = df_p.copy()
+    pixel_angle_cols = set(c for c in df_p_filtered.columns 
+                           if c not in ('frame_num', '_direction') and not c.startswith('landmark_'))
+    
+    for col in pixel_angle_cols:
+        if col in df_p_filtered.columns and len(df_p_filtered) > FILTER_ORDER:
+            try:
+                df_p_filtered[col] = _butterworth_lowpass_filter(df_p_filtered[col].values, FILTER_CUTOFF, SLOWMO_FPS, FILTER_ORDER)
             except Exception:
                 pass  # if filtering fails, keep original data
     
@@ -1547,10 +1578,6 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     
     landmarks = filtered_landmarks
     
-    # detect jittery frames (marks frames with excessive displacement for skeleton skipping)
-    # threshold 0.04 in normalized coords (~4% of frame) roughly matches 15cm jitter in world coords
-    jittery_frames = _detect_jittery_frames(landmarks, threshold=0.04)
-    
     # fill in gaps between jittery frames if gap is 5 or fewer frames (repeat until no more gaps)
     if jittery_frames:
         while True:
@@ -1575,30 +1602,31 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
         df_confidence['avg_confidence'] = df_confidence['avg_confidence'].astype(np.float32)
 
     # drop the helper direction column before returning data
-    for df in (df_w, df_p):
+    for df in (df_w, df_p, df_p_filtered):
         if '_direction' in df.columns:
             df.drop('_direction', axis=1, inplace=True)
 
-    ad    = df_w if USE_WORLD_LANDMARKS else df_p
+    ad    = df_w if USE_WORLD_LANDMARKS else df_p_filtered
     # suggested_steps = detect_steps(ad, fps=SLOWMO_FPS)
     del world_rows, pixel_rows
     gc.collect()
 
     result = {
-        'df_world':       df_w,
-        'df_pixel':       df_p,
-        'angle_data':     ad,
-        'confidence_data': df_confidence,
-        'step_frames':    [],
+        'df_world':           df_w,
+        'df_pixel':           df_p,
+        'df_pixel_filtered':  df_p_filtered,
+        'angle_data':         ad,
+        'confidence_data':    df_confidence,
+        'step_frames':        [],
         # 'suggested_step_frames': suggested_steps,
-        'excluded_regions': [],
-        'all_landmarks':  landmarks,   # each item stores a raw path and pixel landmarks
-        'landmark_depths': df_depths,
-        'jittery_frames': jittery_frames,  # set of frame indices with excessive displacement
-        'needs_rotation': needs_rotation,
-        '_cache_key':     cache_key,
-        '_cache_meta':    cache_meta or {},
-        '_cached_markup': cached_markup,
+        'excluded_regions':   [],
+        'all_landmarks':      landmarks,   # each item stores a raw path and pixel landmarks
+        'landmark_depths':    df_depths,
+        'jittery_frames':     jittery_frames,  # set of frame indices with excessive displacement
+        'needs_rotation':     needs_rotation,
+        '_cache_key':         cache_key,
+        '_cache_meta':        cache_meta or {},
+        '_cached_markup':     cached_markup,
     }
 
     if cache_key:
@@ -2390,9 +2418,10 @@ class GaitAnalysisDashboard(tk.Tk):
         self.progress           = 0.0
         self._status_msg        = tk.StringVar(value="Loading…")
 
-        self.df_world   = pd.DataFrame()
-        self.df_pixel   = pd.DataFrame()
-        self.angle_data = pd.DataFrame()
+        self.df_world           = pd.DataFrame()
+        self.df_pixel           = pd.DataFrame()
+        self.df_pixel_filtered  = pd.DataFrame()
+        self.angle_data         = pd.DataFrame()
 
         self.joint_visibility = {k: True for k in
             ('left_hip','right_hip','left_knee','right_knee','left_ankle','right_ankle')}
@@ -2877,10 +2906,11 @@ class GaitAnalysisDashboard(tk.Tk):
                 return
             for i, lbl in enumerate(self._vid_labels):
                 lbl.config(text=f"VIDEO {i+1}  —  {self.video_names[i]}")
-            self.datasets     = results
-            self.df_world     = results[0]['df_world']
-            self.df_pixel     = results[0]['df_pixel']
-            self.angle_data   = results[0]['angle_data']
+            self.datasets           = results
+            self.df_world           = results[0]['df_world']
+            self.df_pixel           = results[0]['df_pixel']
+            self.df_pixel_filtered  = results[0].get('df_pixel_filtered', results[0]['df_pixel'])
+            self.angle_data         = results[0]['angle_data']
             self.total_frames = max(len(results[0]['all_landmarks']),
                                     len(results[1]['all_landmarks']))
             # initialize zoom limits from the shorter video
@@ -3957,10 +3987,10 @@ class GaitAnalysisDashboard(tk.Tk):
     def _toggle_world(self):
         global USE_WORLD_LANDMARKS
         USE_WORLD_LANDMARKS = not USE_WORLD_LANDMARKS
-        key = 'df_world' if USE_WORLD_LANDMARKS else 'df_pixel'
+        key = 'df_world' if USE_WORLD_LANDMARKS else 'df_pixel_filtered'
         for ds in self.datasets:
             if key in ds: ds['angle_data'] = ds[key]
-        self.angle_data = self.df_world if USE_WORLD_LANDMARKS else self.df_pixel
+        self.angle_data = self.df_world if USE_WORLD_LANDMARKS else self.df_pixel_filtered
         self._status_msg.set("World landmarks" if USE_WORLD_LANDMARKS else "Pixel landmarks")
         self._update_display_btn_visuals()
         self.redraw_graph()
