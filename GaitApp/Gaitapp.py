@@ -2443,7 +2443,7 @@ class GaitAnalysisDashboard(tk.Tk):
         ui_settings = _load_ui_settings()
         self.skeleton_thickness = float(ui_settings.get('skeleton_thickness', DRAW_THICKNESS))
         self.skeleton_thickness = max(0.0, min(float(DRAW_THICKNESS), self.skeleton_thickness))
-        self.rmse_threshold = float(ui_settings.get('rmse_threshold', 25.0))
+        self.rmse_threshold = float(ui_settings.get('rmse_threshold', 35.0))
         self.rmse_threshold = max(0.0, min(100.0, self.rmse_threshold))
         self.manual_step_mode     = True  # always active
         self.manual_side          = 'right'  # kept for older paths
@@ -3180,6 +3180,11 @@ class GaitAnalysisDashboard(tk.Tk):
                 return right
             return []
 
+        def _get_side_strikes(norm_steps, side):
+            """extract step frames for a specific side (left or right)."""
+            strikes = [f for f, s in norm_steps if s == side]
+            return strikes if len(strikes) >= 2 else []
+
         # find the longest usable cycle for overlaid mode
         max_cycle_length = self.resample_length
         if self.show_overlaid_cycles:
@@ -3190,17 +3195,19 @@ class GaitAnalysisDashboard(tk.Tk):
                 
                 sf = ds.get('step_frames', [])
                 norm = _to_fnums(ad_filtered, sf)
-                strikes = _shared_cycle_strikes(norm)
-                if len(strikes) < 2:
-                    continue
-                
-                for i in range(len(strikes)-1):
-                    # skip step pairs that cross excluded regions
-                    if self._region_crosses_exclusion(strikes[i], strikes[i+1], excluded):
+                # find max cycle length for both left and right strikes
+                for side in ('left', 'right'):
+                    strikes = _get_side_strikes(norm, side)
+                    if len(strikes) < 2:
                         continue
-                    seg = ad_filtered[(ad_filtered['frame_num'] >= strikes[i]) & (ad_filtered['frame_num'] <= strikes[i+1])]
-                    if not seg.empty:
-                        max_cycle_length = max(max_cycle_length, len(seg))
+                    
+                    for i in range(len(strikes)-1):
+                        # skip step pairs that cross excluded regions
+                        if self._region_crosses_exclusion(strikes[i], strikes[i+1], excluded):
+                            continue
+                        seg = ad_filtered[(ad_filtered['frame_num'] >= strikes[i]) & (ad_filtered['frame_num'] <= strikes[i+1])]
+                        if not seg.empty:
+                            max_cycle_length = max(max_cycle_length, len(seg))
         self._current_max_cycle_length = max_cycle_length
 
         if not self.show_overlaid_cycles:
@@ -3319,13 +3326,22 @@ class GaitAnalysisDashboard(tk.Tk):
                 si   = _src_idx(ds)
                 ls   = linestyles[si % 2]
                 norm = _to_fnums(ad_filtered, sf)
-                strikes = _shared_cycle_strikes(norm)
-                if len(strikes) < 2:
+                
+                # check if we have any usable strikes (left or right)
+                left_strikes = _get_side_strikes(norm, 'left')
+                right_strikes = _get_side_strikes(norm, 'right')
+                if not left_strikes and not right_strikes:
                     continue
 
                 for joint, col in JOINT_COLORS_MPL.items():
                     vis = self.joint_visibility.get(joint, True)
                     if not vis:
+                        continue
+
+                    # use strikes for the correct side: left joints use left strikes, right joints use right
+                    joint_side = 'left' if joint.startswith('left_') else 'right'
+                    strikes = _get_side_strikes(norm, joint_side)
+                    if len(strikes) < 2:
                         continue
 
                     cycles, lengths = [], []
