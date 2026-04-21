@@ -25,7 +25,7 @@ python -m pip install --upgrade pip
 
 echo.
 echo Installing required libraries
-pip install mediapipe opencv-python numpy pandas scipy matplotlib pillow pyinstaller
+pip install mediapipe opencv-python numpy pandas scipy matplotlib pillow pyinstaller reportlab pyglet
 if errorlevel 1 (
     echo Library installation failed.
     pause

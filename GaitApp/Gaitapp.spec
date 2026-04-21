@@ -6,6 +6,7 @@ from PyInstaller.utils.hooks import collect_all
 datas = [
     ('novita.png',                '.'),
     ('pose_landmarker_full.task', '.'),
+    ('Coiny-Cyrillic.ttf',        '.'),
 ]
 binaries = []
 hiddenimports = []
@@ -49,6 +50,13 @@ hiddenimports += [
     'tkinter',
     'tkinter.filedialog',
     'tkinter.simpledialog',
+    'reportlab',
+    'reportlab.lib.pagesizes',
+    'reportlab.lib.colors',
+    'reportlab.lib.styles',
+    'reportlab.lib.units',
+    'reportlab.platypus',
+    'pyglet',
 ]
 
 a = Analysis(

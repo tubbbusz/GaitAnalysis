@@ -41,12 +41,11 @@ try:
 except ImportError:
     HAS_REPORTLAB = False
 
-pyglet.font.add_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Coiny-Cyrillic.ttf'))
-
-
 def resource_path(filename):
     base = sys._MEIPASS if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, filename)
+
+pyglet.font.add_file(resource_path('Coiny-Cyrillic.ttf'))
 
 # analysis settings
 SLOWMO_FPS    = 240
