@@ -1334,8 +1334,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
         ret, frame = cap.read()
         if not ret: break
         frame_count += 1
-        # frame detection is 0.0-0.7 of total progress
-        progress_cb(0.0 + (frame_count / max(1, total)) * 0.7)
+        progress_cb(frame_count / max(1, total))
 
         # rotate upright captures into the expected analysis orientation
         if needs_rotation:
@@ -1475,9 +1474,6 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     cap.release()
     landmarker.close()
 
-    # post-processing phase starts at 0.7, ends at 1.0
-    progress_cb(0.70)
-
     df_w = pd.DataFrame(world_rows)
     df_p = pd.DataFrame(pixel_rows)
     df_depths = pd.DataFrame([d for d in landmark_depths if d is not None])
@@ -1508,7 +1504,6 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     # detect jittery frames FIRST from raw landmarks before any filtering (so we can detect real jitter)
     # threshold 0.04 in normalized coords (~4% of frame) roughly matches 15cm jitter in world coords
     jittery_frames = _detect_jittery_frames(landmarks, threshold=0.04)
-    progress_cb(0.72)
     
     # interpolate across jittery frames in both world and pixel data
     landmark_cols_w = [c for c in df_w.columns if c.startswith('landmark_') and c.endswith(('_x', '_y', '_z'))]
@@ -1527,12 +1522,10 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
                 after = df_p.iloc[frame_idx + 1][col]
                 if not pd.isna(before) and not pd.isna(after):
                     df_p.at[frame_idx, col] = (before + after) / 2.0
-    progress_cb(0.74)
     
     # fix other jitter outliers (detect and interpolate spike frames)
     df_w = _fix_jitter_outliers(df_w, max_frame_displacement=0.20)
     df_p = _fix_jitter_outliers(df_p, max_frame_displacement=0.15)
-    progress_cb(0.76)
     
     # apply butterworth low-pass filter to world coordinates only (for angle calculations in graphs)
     # skeleton coordinates (pixel_df) are NOT filtered to preserve exact visual position
@@ -1556,13 +1549,11 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
                 df_p_filtered[col] = _butterworth_lowpass_filter(df_p_filtered[col].values, FILTER_CUTOFF, SLOWMO_FPS, FILTER_ORDER)
             except Exception:
                 pass  # if filtering fails, keep original data
-    progress_cb(0.80)
     
     # fix left/right limb swaps after filtering (happens when detection flips side assignment)
     # now works on cleaner, smoothed data
     df_w = _fix_limb_swaps(df_w)
     df_p = _fix_limb_swaps(df_p)
-    progress_cb(0.84)
     
     # rebuild landmarks from filtered pixel coordinates for skeleton visualization
     # use filtered pixel coords (already 0-1 normalized) for correct display geometry
@@ -1586,7 +1577,6 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
             filtered_landmarks.append(landmarks[frame_idx])
     
     landmarks = filtered_landmarks
-    progress_cb(0.88)
     
     # fill in gaps between jittery frames if gap is 5 or fewer frames (repeat until no more gaps)
     if jittery_frames:
@@ -1606,13 +1596,10 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
             # stop looping if no new frames were added
             if frames_added == 0:
                 break
-    progress_cb(0.92)
     
-    # apply same filtering to confidence data
+    #apply same filtering to confidence data
     if 'avg_confidence' in df_confidence.columns:
         df_confidence['avg_confidence'] = df_confidence['avg_confidence'].astype(np.float32)
-
-    progress_cb(0.95)
 
     # drop the helper direction column before returning data
     for df in (df_w, df_p, df_p_filtered):
@@ -1645,7 +1632,6 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     if cache_key:
         _save_cached_video_result(cache_key, cache_meta or {}, result)
 
-    progress_cb(1.0)
     return result
 
 
@@ -3183,21 +3169,15 @@ class GaitAnalysisDashboard(tk.Tk):
             mapped.sort(key=lambda x: x[0])
             return mapped
 
-        def _shared_cycle_strikes(norm_steps):
+        def _get_cycle_strikes(norm_steps):
+            # return separate left and right strikes instead of choosing one
             left = [f for f, s in norm_steps if s == 'left']
             right = [f for f, s in norm_steps if s == 'right']
-            if len(right) >= 2 and len(right) >= len(left):
-                return right
-            if len(left) >= 2:
-                return left
-            if len(right) >= 2:
-                return right
-            return []
-
-        def _get_side_strikes(norm_steps, side):
-            """extract step frames for a specific side (left or right)."""
-            strikes = [f for f, s in norm_steps if s == side]
-            return strikes if len(strikes) >= 2 else []
+            return left, right
+        
+        def _get_limb_side(joint_name):
+            # determine if joint belongs to left or right limb
+            return 'left' if joint_name.startswith('left_') else 'right'
 
         # find the longest usable cycle for overlaid mode
         max_cycle_length = self.resample_length
@@ -3209,9 +3189,10 @@ class GaitAnalysisDashboard(tk.Tk):
                 
                 sf = ds.get('step_frames', [])
                 norm = _to_fnums(ad_filtered, sf)
-                # find max cycle length for both left and right strikes
-                for side in ('left', 'right'):
-                    strikes = _get_side_strikes(norm, side)
+                left_strikes, right_strikes = _get_cycle_strikes(norm)
+                
+                # check both left and right limbs for max cycle length
+                for strikes in [left_strikes, right_strikes]:
                     if len(strikes) < 2:
                         continue
                     
@@ -3340,21 +3321,16 @@ class GaitAnalysisDashboard(tk.Tk):
                 si   = _src_idx(ds)
                 ls   = linestyles[si % 2]
                 norm = _to_fnums(ad_filtered, sf)
-                
-                # check if we have any usable strikes (left or right)
-                left_strikes = _get_side_strikes(norm, 'left')
-                right_strikes = _get_side_strikes(norm, 'right')
-                if not left_strikes and not right_strikes:
-                    continue
+                left_strikes, right_strikes = _get_cycle_strikes(norm)
 
                 for joint, col in JOINT_COLORS_MPL.items():
                     vis = self.joint_visibility.get(joint, True)
                     if not vis:
                         continue
 
-                    # use strikes for the correct side: left joints use left strikes, right joints use right
-                    joint_side = 'left' if joint.startswith('left_') else 'right'
-                    strikes = _get_side_strikes(norm, joint_side)
+                    # use appropriate strikes based on limb side
+                    limb_side = _get_limb_side(joint)
+                    strikes = left_strikes if limb_side == 'left' else right_strikes
                     if len(strikes) < 2:
                         continue
 
