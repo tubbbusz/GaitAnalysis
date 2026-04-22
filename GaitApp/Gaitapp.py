@@ -1009,6 +1009,23 @@ def select_video_paths():
     return list(paths)
 
 
+def _apply_dynamic_window_size(window, preferred_width=None, preferred_height=None):
+    window.update_idletasks()
+    req_w = max(1, int(window.winfo_reqwidth()))
+    req_h = max(1, int(window.winfo_reqheight()))
+
+    width = req_w if preferred_width is None else max(req_w, int(preferred_width))
+    height = req_h if preferred_height is None else max(req_h, int(preferred_height))
+
+    screen_w = window.winfo_screenwidth()
+    screen_h = window.winfo_screenheight()
+    width = min(width, screen_w)
+    height = min(height, screen_h)
+
+    window.geometry(f"{width}x{height}")
+    window.minsize(req_w, req_h)
+
+
 # joint angle definitions
 JOINT_DEFS = {
     'left_hip':    (None,                        PoseLandmark.LEFT_HIP,    PoseLandmark.LEFT_KNEE),
@@ -1775,13 +1792,13 @@ class CacheManagerDialog(tk.Toplevel):
     def __init__(self, parent, cache_root):
         super().__init__(parent)
         self.title("Cache Manager")
-        self.geometry("380x450")
         self.cache_root = cache_root
         self.checkboxes = {}  # map (cache_key, item_name) to (var, path)
         self.delete_whole_vars = {}  # map cache_key to delete-whole checkbox var
         
         self._build_ui()
         self._scan_caches()
+        _apply_dynamic_window_size(self, preferred_width=570, preferred_height=450)
     
     def _build_ui(self):
         # Canvas with scrollbar
@@ -1792,7 +1809,8 @@ class CacheManagerDialog(tk.Toplevel):
         scrollbar = tk.Scrollbar(canvas_frame, orient='vertical', command=canvas.yview)
         scrollable = tk.Frame(canvas, bg=BG)
         scrollable.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.create_window((0, 0), window=scrollable, anchor='nw')
+        scroll_window = canvas.create_window((0, 0), window=scrollable, anchor='nw')
+        canvas.bind('<Configure>', lambda e: canvas.itemconfigure(scroll_window, width=e.width))
         canvas.configure(yscrollcommand=scrollbar.set)
         
         canvas.pack(side='left', fill='both', expand=True)
@@ -1800,6 +1818,9 @@ class CacheManagerDialog(tk.Toplevel):
         
         self.scrollable_frame = scrollable
         self.canvas = canvas
+        self.bind('<Enter>', self._bind_mousewheel_global)
+        self.bind('<Leave>', self._unbind_mousewheel_global)
+        self.bind('<Destroy>', self._on_destroy)
         
         # Bottom button frame
         bottom_frame = tk.Frame(self, bg=BG)
@@ -1809,6 +1830,36 @@ class CacheManagerDialog(tk.Toplevel):
                                    font=("Helvetica", 10), bg='#e74c3c', fg='white',
                                    command=self._delete_selected, state='disabled')
         self.delete_btn.pack(side='left')
+
+    def _on_mousewheel(self, event):
+        widget_under_mouse = self.winfo_containing(self.winfo_pointerx(), self.winfo_pointery())
+        if not widget_under_mouse or widget_under_mouse.winfo_toplevel() != self:
+            return
+
+        if getattr(event, 'delta', 0):
+            steps = int(-1 * (event.delta / 120))
+            if steps == 0:
+                steps = -1 if event.delta > 0 else 1
+            self.canvas.yview_scroll(steps, 'units')
+        elif event.num == 4:
+            self.canvas.yview_scroll(-1, 'units')
+        elif event.num == 5:
+            self.canvas.yview_scroll(1, 'units')
+        return 'break'
+
+    def _bind_mousewheel_global(self, event=None):
+        self.bind_all('<MouseWheel>', self._on_mousewheel)
+        self.bind_all('<Button-4>', self._on_mousewheel)
+        self.bind_all('<Button-5>', self._on_mousewheel)
+
+    def _unbind_mousewheel_global(self, event=None):
+        self.unbind_all('<MouseWheel>')
+        self.unbind_all('<Button-4>')
+        self.unbind_all('<Button-5>')
+
+    def _on_destroy(self, event=None):
+        if event is None or event.widget == self:
+            self._unbind_mousewheel_global()
     
     def _scan_caches(self):
         """Scan cache directory and populate the list."""
@@ -1986,11 +2037,11 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, dashboard):
         super().__init__(parent)
         self.title("Settings")
-        self.geometry("550x700")
         self.dashboard = dashboard
         self.configure(bg=BG)
         
         self._build_ui()
+        _apply_dynamic_window_size(self, preferred_width=550, preferred_height=700)
     
     def _build_ui(self):
         # Title
@@ -2223,11 +2274,11 @@ class PDFExportDialog(tk.Toplevel):
     def __init__(self, parent, dashboard):
         super().__init__(parent)
         self.title("Export to PDF")
-        self.geometry("550x900")
         self.dashboard = dashboard
         self.configure(bg=BG)
         
         self._build_ui()
+        _apply_dynamic_window_size(self, preferred_width=550, preferred_height=900)
     
     def _build_ui(self):
         # Title
@@ -2407,7 +2458,6 @@ class GaitAnalysisDashboard(tk.Tk):
         super().__init__()
         self.configure(bg=BG)
         self.title("Gait Analysis")
-        self.geometry("1400x860")
 
         # ui state
         self.datasets           = []
@@ -2467,8 +2517,25 @@ class GaitAnalysisDashboard(tk.Tk):
         self._pdf_export_dialog = None
 
         self._build_ui()
+        _apply_dynamic_window_size(self, preferred_width=1400, preferred_height=860)
+        self._center_on_screen()
         self._bind_keys()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _center_on_screen(self):
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        if width <= 1 or height <= 1:
+            geom = self.geometry().split('+')[0]
+            if 'x' in geom:
+                width, height = map(int, geom.split('x'))
+
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        x = max((screen_w - width) // 2, 0)
+        y = max((screen_h - height) // 2, 0)
+        self.geometry(f"{width}x{height}+{x}+{y}")
 
     # ui
     def _build_ui(self):
