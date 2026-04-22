@@ -502,7 +502,20 @@ NORMATIVE_GAIT = {
     ]), "lower": None, "upper": None},
 }
 NORMATIVE_GAIT['hip']['mean']   = NORMATIVE_GAIT['hip']['mean'][:100]
-NORMATIVE_GAIT['ankle']['mean'] = NORMATIVE_GAIT['ankle']['mean'][:100]
+NORMATIVE_GAIT['ankle']['mean_base'] = NORMATIVE_GAIT['ankle']['mean'][:100].copy()
+NORMATIVE_GAIT['ankle']['offset'] = 120.0
+
+def _apply_ankle_normative_offset(offset_deg):
+    NORMATIVE_GAIT['ankle']['offset'] = offset_deg
+    m = np.array(NORMATIVE_GAIT['ankle']['mean_base'] + offset_deg)
+    m = np.nan_to_num(m, nan=np.nanmean(m))
+    sd = np.std(m)
+    se = sd / np.sqrt(len(m))
+    NORMATIVE_GAIT['ankle']['mean'] = m
+    NORMATIVE_GAIT['ankle']['lower'] = np.asarray(m - se)
+    NORMATIVE_GAIT['ankle']['upper'] = np.asarray(m + se)
+
+_apply_ankle_normative_offset(NORMATIVE_GAIT['ankle']['offset'])
 for jt in NORMATIVE_GAIT:
     m  = np.array(NORMATIVE_GAIT[jt]["mean"])
     # replace any NaN with nearest valid value
@@ -1771,6 +1784,7 @@ HELP_TEXT = [
     ("c",             "Toggle overlaid cycles / continuous"),
     ("s",             "Toggle resample (cycle view)"),
     ("m",             "Mean curve: off → +data → only"),
+    ("F3",            "Toggle ankle norm offset"),
     ("3–8",           "Toggle joint visibility (hip / knee / ankle L & R)"),
     ("",              None),
     ("Step Editing",  None),
@@ -3037,6 +3051,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self.bind('<Delete>',       lambda e: self._delete_nearest_step())
         self.bind('z',              lambda e: self._reset_zoom())
         self.bind('<Alt-c>',        lambda e: self._toggle_confidence())
+        self.bind('<F3>',           lambda e: self._toggle_ankle_norm_offset())
         for k, jt in [('3','left_hip'),('4','right_hip'),('5','left_knee'),
                        ('6','right_knee'),('7','left_ankle'),('8','right_ankle')]:
             self.bind(k, lambda e, j=jt: self._toggle_joint(j))
@@ -4217,6 +4232,12 @@ class GaitAnalysisDashboard(tk.Tk):
                 return
             self.show_outliers_only = not self.show_outliers_only
         self._update_display_btn_visuals()
+        self.redraw_graph()
+
+    def _toggle_ankle_norm_offset(self):
+        current = NORMATIVE_GAIT['ankle'].get('offset', 120.0)
+        new_offset = 0.0 if current > 0.0 else 120.0
+        _apply_ankle_normative_offset(new_offset)
         self.redraw_graph()
 
     def _update_display_btn_visuals(self):
