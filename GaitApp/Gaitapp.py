@@ -1782,6 +1782,8 @@ HELP_TEXT = [
     ("v",             "Graph: V1 → V2 → Both"),
     ("t",             "Toggle active video"),
     ("c",             "Toggle overlaid cycles / continuous"),
+    ("x",             "Toggle cycle angle mode (native / aligned)"),
+    ("b",             "Toggle stacked cycle lanes"),
     ("s",             "Toggle resample (cycle view)"),
     ("m",             "Mean curve: off → +data → only"),
     ("F3",            "Toggle ankle norm offset"),
@@ -2497,6 +2499,8 @@ class GaitAnalysisDashboard(tk.Tk):
         self.mean_only            = False
         self.show_normative       = True
         self.show_data            = False
+        self.align_cycle_angles   = False  # show cycle angles as delta from cycle start
+        self.stack_cycle_lanes    = False  # vertically separate visible limb curves in cycle view
         self.graph_display_mode   = 'se_shading'  # 'se_shading' or 'lines_only'
         self.show_confidence      = False  # confidence scores hidden by default
         self.show_outliers_only   = False  # toggle to show only outlier cycles
@@ -2712,7 +2716,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
         # display toggles for cycle view
         self._display_btns = {}
-        for label, key in [("Mean", "mean"), ("Data", "data"), ("Normal", "normal"), ("Outliers", "outliers")]:
+        for label, key in [("Mean", "mean"), ("Data", "data"), ("Normal", "normal"), ("Outliers", "outliers"), ("Aligned", "aligned"), ("Stacked", "stacked")]:
             btn = tk.Button(self._legend_frame, text=label,
                         font=("Helvetica", 7, "bold"), bg=BG3, fg=TEXT,
                         relief='flat', cursor='hand2',
@@ -3039,6 +3043,8 @@ class GaitAnalysisDashboard(tk.Tk):
         self.bind('<q>',            lambda e: self._on_close())
         self.bind('<w>',            lambda e: self._toggle_world())
         self.bind('<c>',            lambda e: self._toggle_cycles())
+        self.bind('<x>',            lambda e: self._toggle_cycle_alignment())
+        self.bind('<b>',            lambda e: self._toggle_cycle_stacked())
         self.bind('<s>',            lambda e: self._toggle_resample())
         self.bind('<m>',            lambda e: self._toggle_mean())
         self.bind('<v>',            lambda e: self._cycle_graph_view())
@@ -3260,6 +3266,58 @@ class GaitAnalysisDashboard(tk.Tk):
             # determine if joint belongs to left or right limb
             return 'left' if joint_name.startswith('left_') else 'right'
 
+        def _cycle_plot_transform(values):
+            if not self.align_cycle_angles:
+                return values
+            y = np.asarray(values, dtype=float)
+            if y.size == 0:
+                return y
+            finite = np.isfinite(y)
+            if not np.any(finite):
+                return y
+            start = y[np.argmax(finite)]
+            return y - start
+
+        visible_joints = [j for j in JOINT_COLORS_MPL if self.joint_visibility.get(j, True)]
+        cycle_joint_offsets = {j: 0.0 for j in visible_joints}
+        if self.show_overlaid_cycles and self.stack_cycle_lanes and visible_joints:
+            joint_bounds = {}
+            for joint in visible_joints:
+                vals = []
+                for ds in dfg:
+                    ad = ds['angle_data']
+                    excluded = ds.get('excluded_regions', [])
+                    ad_filtered = self._get_filtered_angle_data(ad, excluded)
+                    if joint not in ad_filtered.columns:
+                        continue
+                    y_vals = _cycle_plot_transform(ad_filtered[joint].values)
+                    y_vals = np.asarray(y_vals, dtype=float)
+                    finite = y_vals[np.isfinite(y_vals)]
+                    if finite.size:
+                        vals.append(finite)
+                if vals:
+                    merged = np.concatenate(vals)
+                    joint_bounds[joint] = (float(np.nanmin(merged)), float(np.nanmax(merged)))
+                else:
+                    joint_bounds[joint] = (0.0, 0.0)
+
+            prev_joint = None
+            for joint in visible_joints:
+                if prev_joint is None:
+                    cycle_joint_offsets[joint] = 0.0
+                else:
+                    prev_min = joint_bounds[prev_joint][0] + cycle_joint_offsets[prev_joint]
+                    curr_max = joint_bounds[joint][1]
+                    # no added gap: make lower joint touch upper joint boundary
+                    cycle_joint_offsets[joint] = prev_min - curr_max
+                prev_joint = joint
+
+        def _offset_cycle_joint(joint, values):
+            y = np.asarray(values, dtype=float)
+            if not (self.show_overlaid_cycles and self.stack_cycle_lanes):
+                return y
+            return y + cycle_joint_offsets.get(joint, 0.0)
+
         # find the longest usable cycle for overlaid mode
         max_cycle_length = self.resample_length
         if self.show_overlaid_cycles:
@@ -3390,7 +3448,10 @@ class GaitAnalysisDashboard(tk.Tk):
 
         else:
             ax.set_xlabel('Frames Since Strike', fontsize=8)
-            ax.set_ylabel('Angle (°)', fontsize=8)
+            if self.stack_cycle_lanes:
+                ax.set_ylabel('Stacked Angle Change (°)' if self.align_cycle_angles else 'Stacked Angle (°)', fontsize=8)
+            else:
+                ax.set_ylabel('Angle Change (°)' if self.align_cycle_angles else 'Angle (°)', fontsize=8)
 
             for ds in dfg:
                 ad   = ds['angle_data']
@@ -3480,6 +3541,8 @@ class GaitAnalysisDashboard(tk.Tk):
                                     # show outlier in bright color, high alpha
                                     t = np.linspace(0, 1, len(y))
                                     y_plot = interp1d(t, y)(np.linspace(0, 1, max_cycle_length))
+                                    y_plot = _cycle_plot_transform(y_plot)
+                                    y_plot = _offset_cycle_joint(joint, y_plot)
                                     x_plot = np.arange(max_cycle_length)
                                     ax.plot(x_plot, y_plot, color=col, alpha=0.7, lw=1.2, linestyle=ls)
                             else:
@@ -3487,7 +3550,8 @@ class GaitAnalysisDashboard(tk.Tk):
                                     if length_good:
                                         continue
                                     # show length-bad cycle in bright color
-                                    ax.plot(x, y, color=col, alpha=0.7, lw=1.2, linestyle=ls)
+                                    y_plot = _offset_cycle_joint(joint, _cycle_plot_transform(y))
+                                    ax.plot(x, y_plot, color=col, alpha=0.7, lw=1.2, linestyle=ls)
                         else:
                             # normal mode: show all with filtering
                             if self.resample_cycles:
@@ -3503,6 +3567,8 @@ class GaitAnalysisDashboard(tk.Tk):
                                     
                                     t = np.linspace(0, 1, len(y))
                                     y_plot = interp1d(t, y)(np.linspace(0, 1, max_cycle_length))
+                                    y_plot = _cycle_plot_transform(y_plot)
+                                    y_plot = _offset_cycle_joint(joint, y_plot)
                                     x_plot = np.arange(max_cycle_length)
                                     ax.plot(x_plot, y_plot, color=plot_col, alpha=plot_alpha, lw=0.6, linestyle=ls)
                             else:
@@ -3511,16 +3577,17 @@ class GaitAnalysisDashboard(tk.Tk):
                                 good_y_vals = []
                                 for (x, y), good in zip(cycles, length_ok):
                                     if good:
-                                        good_y_vals.extend(y)
+                                        good_y_vals.extend(_offset_cycle_joint(joint, _cycle_plot_transform(y)))
                                 
                                 for (x, y), length_good in zip(cycles, length_ok):
                                     is_length_bad = not length_good
                                     plot_col = C_OUTLIER if is_length_bad else col
                                     plot_alpha = 0.12 if is_length_bad else 0.25
-                                    ax.plot(x, y, color=plot_col, alpha=plot_alpha, lw=0.8, linestyle=ls)
+                                    y_plot = _offset_cycle_joint(joint, _cycle_plot_transform(y))
+                                    ax.plot(x, y_plot, color=plot_col, alpha=plot_alpha, lw=0.8, linestyle=ls)
                                 
                                 # Set y-limits based on good cycles only
-                                if good_y_vals:
+                                if good_y_vals and not self.stack_cycle_lanes:
                                     y_min, y_max = np.nanmin(good_y_vals), np.nanmax(good_y_vals)
                                     y_margin = (y_max - y_min) * 0.1  # 10% margin
                                     ax.set_ylim(y_min - y_margin, y_max + y_margin)
@@ -3538,6 +3605,14 @@ class GaitAnalysisDashboard(tk.Tk):
                             se_c = np.nanstd(inliers_array, axis=0) / np.sqrt(len(inliers))
                             lower_c = mean_c - se_c
                             upper_c = mean_c + se_c
+                            if self.align_cycle_angles:
+                                start = mean_c[0] if len(mean_c) else 0.0
+                                mean_c = mean_c - start
+                                lower_c = lower_c - start
+                                upper_c = upper_c - start
+                            mean_c = _offset_cycle_joint(joint, mean_c)
+                            lower_c = _offset_cycle_joint(joint, lower_c)
+                            upper_c = _offset_cycle_joint(joint, upper_c)
                             x_plot = np.arange(len(mean_c))
                             # plot error band first (behind) - only in se_shading mode
                             if self.graph_display_mode == 'se_shading':
@@ -3554,10 +3629,25 @@ class GaitAnalysisDashboard(tk.Tk):
                 for jt_key in ('hip', 'knee', 'ankle'):
                     vl = self.joint_visibility.get(f'left_{jt_key}', False)
                     vr = self.joint_visibility.get(f'right_{jt_key}', False)
-                    if vl or vr:
-                        d = NORMATIVE_GAIT[jt_key]
+                    if not (vl or vr):
+                        continue
+                    d = NORMATIVE_GAIT[jt_key]
+                    norm_mean_base = np.asarray(d['mean'])
+                    if self.align_cycle_angles and len(norm_mean_base):
+                        norm_mean_base = norm_mean_base - norm_mean_base[0]
+
+                    if self.stack_cycle_lanes:
+                        if vl:
+                            norm_left = _offset_cycle_joint(f'left_{jt_key}', norm_mean_base)
+                            ax.plot(norm_x_resampled, norm_left, color=C_NORM, lw=1.2, linestyle='-', alpha=0.65, zorder=2,
+                                    label=f'{jt_key.title()} norm. L')
+                        if vr:
+                            norm_right = _offset_cycle_joint(f'right_{jt_key}', norm_mean_base)
+                            ax.plot(norm_x_resampled, norm_right, color=C_NORM, lw=1.2, linestyle='-', alpha=0.65, zorder=2,
+                                    label=f'{jt_key.title()} norm. R')
+                    else:
                         # plot normative mean line only
-                        ax.plot(norm_x_resampled, d['mean'], color=C_NORM, lw=1.5, linestyle='-', alpha=0.8, zorder=2,
+                        ax.plot(norm_x_resampled, norm_mean_base, color=C_NORM, lw=1.5, linestyle='-', alpha=0.8, zorder=2,
                                 label=f'{jt_key.title()} norm.')
         # set x limits after plotting to avoid autoscaling drift
         if self.show_overlaid_cycles:
@@ -4019,6 +4109,24 @@ class GaitAnalysisDashboard(tk.Tk):
         self._status_msg.set(f"Resample {'on' if self.resample_cycles else 'off'}")
         self.redraw_graph()
 
+    def _toggle_cycle_alignment(self):
+        if not self.show_overlaid_cycles:
+            return
+        self.align_cycle_angles = not self.align_cycle_angles
+        mode = "aligned" if self.align_cycle_angles else "native"
+        self._status_msg.set(f"Cycle angle mode: {mode}")
+        self._update_display_btn_visuals()
+        self.redraw_graph()
+
+    def _toggle_cycle_stacked(self):
+        if not self.show_overlaid_cycles:
+            return
+        self.stack_cycle_lanes = not self.stack_cycle_lanes
+        mode = "stacked" if self.stack_cycle_lanes else "overlaid"
+        self._status_msg.set(f"Cycle layout: {mode}")
+        self._update_display_btn_visuals()
+        self.redraw_graph()
+
     def _toggle_mean(self):
         if not self.show_overlaid_cycles: return
         self.show_mean = not self.show_mean
@@ -4231,6 +4339,14 @@ class GaitAnalysisDashboard(tk.Tk):
             if not self.show_overlaid_cycles:
                 return
             self.show_outliers_only = not self.show_outliers_only
+        elif key == 'aligned':
+            if not self.show_overlaid_cycles:
+                return
+            self.align_cycle_angles = not self.align_cycle_angles
+        elif key == 'stacked':
+            if not self.show_overlaid_cycles:
+                return
+            self.stack_cycle_lanes = not self.stack_cycle_lanes
         self._update_display_btn_visuals()
         self.redraw_graph()
 
@@ -4246,6 +4362,8 @@ class GaitAnalysisDashboard(tk.Tk):
             'data': self.show_data,
             'normal': self.show_normative,
             'outliers': self.show_outliers_only,
+            'aligned': self.align_cycle_angles,
+            'stacked': self.stack_cycle_lanes,
         }
         for key, btn in self._display_btns.items():
             if not self.show_overlaid_cycles:
