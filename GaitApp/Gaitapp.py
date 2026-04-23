@@ -58,6 +58,8 @@ JPEG_QUALITY = 65
 CACHE_FRAMES = 96
 DEBUG_DIRECTION_DIAGNOSTICS = False
 DEBUG_LOG_JITTER = False 
+DEBUG_SKELETON_WIDTH = True
+DEBUG_SKELETON_BASE_THICKNESS = 8.0
 CACHE_SCHEMA_VERSION = 1
 
 # pose model path
@@ -402,6 +404,7 @@ POSE_CONNECTIONS = [
 
 # skeleton display settings
 DRAW_THICKNESS      = 8
+DEFAULT_SKELETON_THICKNESS = 4.5
 USE_WORLD_LANDMARKS = True
 SKELETON_LINE_COL   = (0, 0, 255)   # cyan line
 
@@ -573,9 +576,24 @@ def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=No
     if skeleton_thickness <= 0:
         return frame_bgr
 
-    # keep skeleton thickness consistent across crop sizes
-    line_thickness = max(1, int(h * skeleton_thickness / 540))
-    circle_radius  = max(1, int(h * (skeleton_thickness * 0.5) / 540))
+    # scale thickness from the person's visible size in pixels
+    visible_pts = []
+    for lm in pixel_landmarks:
+        if lm.visibility > 0.5:
+            visible_pts.append((lm.x * w, lm.y * h))
+    if visible_pts:
+        xs = [p[0] for p in visible_pts]
+        ys = [p[1] for p in visible_pts]
+        subject_width_px = max(xs) - min(xs)
+        subject_height_px = max(ys) - min(ys)
+        subject_span_px = max(subject_width_px, subject_height_px)
+        subject_scale = max(0.45, min(2.75, subject_span_px / 260.0))
+    else:
+        subject_width_px = 0.0
+        subject_height_px = 0.0
+        subject_scale = 1.0
+    line_thickness = max(1, int(round(skeleton_thickness * subject_scale)))
+    circle_radius  = max(1, int(round(skeleton_thickness * 0.5 * subject_scale)))
     default_line_col = GRAY_BGR if focus_side in ('left', 'right') else (200, 200, 200)
 
     def _side_matches(jname):
@@ -1289,6 +1307,24 @@ def _save_jitter_log(world_landmarks_list, video_path):
     return None
 
 
+def _subject_bounds_from_landmarks(pixel_landmarks, frame_w, frame_h):
+    visible = [(lm.x, lm.y) for lm in pixel_landmarks if lm.visibility > 0.5]
+    if not visible:
+        return None
+
+    xs = np.asarray([p[0] * frame_w for p in visible], dtype=float)
+    ys = np.asarray([p[1] * frame_h for p in visible], dtype=float)
+    return {
+        'min_x': float(np.min(xs)),
+        'max_x': float(np.max(xs)),
+        'min_y': float(np.min(ys)),
+        'max_y': float(np.max(ys)),
+        'width': float(np.max(xs) - np.min(xs)),
+        'height': float(np.max(ys) - np.min(ys)),
+        'visible_count': int(len(visible)),
+    }
+
+
 def process_video(video_path, ann_dir, progress_cb, status_cb,
                   target_output_size=None, needs_rotation=None,
                   crop_rect=None, cache_key=None, cache_meta=None):
@@ -1352,6 +1388,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
 
     world_rows, pixel_rows, landmarks, landmark_depths, confidence_rows = [], [], [], [], []
     world_landmarks_list = []  # for jitter debugging
+    skeleton_width_rows = []
     frame_count = 0
 
     frame_output_dir = ann_dir
@@ -1422,6 +1459,25 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
                 return SimpleLandmark(nx, ny, lm.visibility)
             remapped_pixel_lm = [_remap_lm(lm) for lm in pixel_lm]
             landmarks.append((raw_path, remapped_pixel_lm))
+
+            if DEBUG_SKELETON_WIDTH:
+                bounds = _subject_bounds_from_landmarks(remapped_pixel_lm, view_w, view_h)
+                if bounds is not None:
+                    span = max(bounds['width'], bounds['height'])
+                    subject_scale = max(0.45, min(2.75, span / 260.0))
+                    skeleton_width_rows.append({
+                        'frame_num': frame_count,
+                        'frame_width': int(view_w),
+                        'frame_height': int(view_h),
+                        'visible_landmarks': bounds['visible_count'],
+                        'subject_width_px': bounds['width'],
+                        'subject_height_px': bounds['height'],
+                        'subject_span_px': span,
+                        'subject_width_ratio': bounds['width'] / max(1, view_w),
+                        'subject_height_ratio': bounds['height'] / max(1, view_h),
+                        'subject_scale': subject_scale,
+                        'estimated_line_thickness_8px': DEBUG_SKELETON_BASE_THICKNESS * subject_scale,
+                    })
 
             direction = determine_walking_direction(pixel_lm)
             w_row = {'frame_num': frame_count, '_direction': direction}
@@ -1524,6 +1580,28 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
                 status_cb(f"Jitter log saved: {os.path.basename(jitter_log_path)}")
         except Exception as e:
             status_cb(f"Jitter logging failed: {e}")
+
+    if DEBUG_SKELETON_WIDTH and skeleton_width_rows:
+        try:
+            import csv
+            output_dir = os.path.expanduser('~/Desktop/Gait_Analysis')
+            os.makedirs(output_dir, exist_ok=True)
+            vid_name = os.path.splitext(os.path.basename(video_path))[0]
+            timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            output_path = os.path.join(output_dir, f'skeleton_width_debug_{vid_name}_{timestamp}.csv')
+            fieldnames = [
+                'frame_num', 'frame_width', 'frame_height', 'visible_landmarks',
+                'subject_width_px', 'subject_height_px', 'subject_span_px',
+                'subject_width_ratio', 'subject_height_ratio', 'subject_scale',
+                'estimated_line_thickness_8px',
+            ]
+            with open(output_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(skeleton_width_rows)
+            print(f"skeleton width debug saved: {output_path}")
+        except Exception as e:
+            print(f"skeleton width debug failed: {e}")
 
     for df in (df_w, df_p):
         for col in df.columns:
@@ -2508,7 +2586,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self.remove_jitter_frames = True   # toggle to enable/disable jitter frame removal entirely
         self.active_dataset_idx   = 0
         ui_settings = _load_ui_settings()
-        self.skeleton_thickness = float(ui_settings.get('skeleton_thickness', DRAW_THICKNESS))
+        self.skeleton_thickness = float(ui_settings.get('skeleton_thickness', DEFAULT_SKELETON_THICKNESS))
         self.skeleton_thickness = max(0.0, min(float(DRAW_THICKNESS), self.skeleton_thickness))
         self.rmse_threshold = float(ui_settings.get('rmse_threshold', 35.0))
         self.rmse_threshold = max(0.0, min(100.0, self.rmse_threshold))
