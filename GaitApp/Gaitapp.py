@@ -351,7 +351,7 @@ POSE_CONNECTIONS = [
 
 DRAW_THICKNESS      = 8
 DEFAULT_SKELETON_THICKNESS = 4.5
-USE_WORLD_LANDMARKS = True
+USE_WORLD_LANDMARKS = False
 SKELETON_LINE_COL   = (0, 0, 255)
 
 JOINT_NAME_TO_LANDMARK = {
@@ -1294,26 +1294,6 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     df_w = _fix_limb_swaps(df_w)
     df_p = _fix_limb_swaps(df_p)
 
-    filtered_landmarks = []
-    for frame_idx in range(len(df_p)):
-        if frame_idx < len(landmarks) and landmarks[frame_idx] is not None:
-            raw_path, _ = landmarks[frame_idx]
-            filtered_lm = []
-            for i in range(33):
-                x_col = f'landmark_{i}_x'
-                y_col = f'landmark_{i}_y'
-                if x_col in df_p.columns and y_col in df_p.columns:
-                    x = float(df_p.iloc[frame_idx][x_col]) if not pd.isna(df_p.iloc[frame_idx][x_col]) else 0.0
-                    y = float(df_p.iloc[frame_idx][y_col]) if not pd.isna(df_p.iloc[frame_idx][y_col]) else 0.0
-                    filtered_lm.append(SimpleLandmark(x, y, 1.0))
-                else:
-                    filtered_lm.append(SimpleLandmark(0.0, 0.0, 0.0))
-            filtered_landmarks.append((raw_path, filtered_lm))
-        elif frame_idx < len(landmarks):
-            filtered_landmarks.append(landmarks[frame_idx])
-
-    landmarks = filtered_landmarks
-
     if jittery_frames:
         while True:
             frames_added = 0
@@ -2049,6 +2029,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._center_on_screen()
         self._bind_keys()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after_idle(self.redraw_graphs)
 
     def _center_on_screen(self):
         self.update_idletasks()
@@ -2104,50 +2085,16 @@ class GaitAnalysisDashboard(tk.Tk):
         # Layout: equal 2x2 content grid + separate right sidebar.
         # Content panels are equal-sized: Ankle, Hip, Knee, Videos.
         # ─────────────────────────────────────────────────────────────────
-        main.grid_rowconfigure(0, weight=0)
-        main.grid_rowconfigure(1, weight=1)
+        main.grid_rowconfigure(0, weight=1)
+        main.grid_rowconfigure(1, weight=0)
         main.grid_columnconfigure(0, weight=1)
-        main.grid_columnconfigure(1, weight=0, minsize=160)
-
-        # Unified legend toolbar above all charts
-        toolbar = tk.Frame(main, bg=BG2)
-        toolbar.grid(row=0, column=0, sticky='ew', pady=(0, 4))
-
-        badge_styles = {
-            'Ankle': {'bg': '#dbeeff', 'fg': '#1f4f7a'},
-            'Hip':   {'bg': '#ffe7cc', 'fg': '#8a4b08'},
-            'Knee':  {'bg': '#dff3df', 'fg': '#1f6b2f'},
-        }
-
-        for group_joints, group_label in [
-            (['left_ankle', 'right_ankle'], 'Ankle'),
-            (['left_hip',   'right_hip'],   'Hip'),
-            (['left_knee',  'right_knee'],  'Knee'),
-        ]:
-            if group_label in ('Hip', 'Knee'):
-                tk.Frame(toolbar, bg=BG2, width=12).pack(side='left')
-            sep = tk.Frame(toolbar, bg=BG3, width=1)
-            sep.pack(side='left', fill='y', padx=(8, 4), pady=4)
-            style = badge_styles.get(group_label, {'bg': BG2, 'fg': SUBTEXT})
-            badge = tk.Label(toolbar, text=group_label, font=("Helvetica", 8, "bold"),
-                             bg=style['bg'], fg=style['fg'], padx=4, pady=2)
-            badge.pack(side='left', padx=(0, 4))
-            for joint in group_joints:
-                btn = self._create_graph_limb_toggle(
-                    toolbar,
-                    joint,
-                    ('Left' if 'left' in joint else 'Right'),
-                )
-                if 'left' in joint:
-                    btn['frame'].pack(side='left', padx=(2, 8), pady=3)
-                else:
-                    btn['frame'].pack(side='left', padx=(2, 2), pady=3)
+        main.grid_columnconfigure(1, weight=0, minsize=250)
 
         content = tk.Frame(main, bg=BG)
-        content.grid(row=1, column=0, sticky='nsew')
+        content.grid(row=0, column=0, sticky='nsew')
 
-        sidebar = tk.Frame(main, bg=BG, width=160)
-        sidebar.grid(row=0, column=1, rowspan=2, sticky='nsew', padx=(4, 0))
+        sidebar = tk.Frame(main, bg=BG, width=250)
+        sidebar.grid(row=0, column=1, sticky='nsew', padx=(4, 0))
         sidebar.grid_propagate(False)
         sidebar.grid_rowconfigure(0, weight=0)
         sidebar.grid_rowconfigure(1, weight=1)
@@ -2155,27 +2102,13 @@ class GaitAnalysisDashboard(tk.Tk):
 
         content.grid_rowconfigure(0, weight=1, uniform='row')
         content.grid_rowconfigure(1, weight=1, uniform='row')
-        content.grid_columnconfigure(0, weight=1, uniform='col')
-        content.grid_columnconfigure(1, weight=1, uniform='col')
+        content.grid_rowconfigure(2, weight=1, uniform='row')
+        content.grid_columnconfigure(0, weight=2)
+        content.grid_columnconfigure(1, weight=1)
 
-        # Ankle graph (row 0, col 0)
-        ankle_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
-        ankle_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 4), pady=(0, 3))
-        self._build_graph_limb_header(ankle_frame, 'left_ankle', 'right_ankle')
-        self._fig_ankle, self._ax_ankle = plt.subplots(figsize=(5.5, 2.6), dpi=100)
-        self._style_ax(self._ax_ankle, self._fig_ankle)
-        self._canvas_ankle = FigureCanvasTkAgg(self._fig_ankle, master=ankle_frame)
-        self._canvas_ankle.get_tk_widget().pack(fill='both', expand=True)
-        self._canvas_ankle.mpl_connect('button_press_event',   lambda e: self._on_graph_click(e, 0))
-        self._canvas_ankle.mpl_connect('motion_notify_event',  lambda e: self._on_graph_drag(e, 0))
-        self._canvas_ankle.mpl_connect('button_release_event', lambda e: self._on_graph_release(e, 0))
-        self._canvas_ankle.get_tk_widget().bind('<MouseWheel>', lambda e: self._on_canvas_scroll(e, 0))
-        self._canvas_ankle.get_tk_widget().bind('<Button-4>',   lambda e: self._on_canvas_scroll(e, 0))
-        self._canvas_ankle.get_tk_widget().bind('<Button-5>',   lambda e: self._on_canvas_scroll(e, 0))
-
-        # Hip graph (row 0, col 1)
+        # Hip graph (row 0, col 0)
         hip_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
-        hip_frame.grid(row=0, column=1, sticky='nsew', padx=(4, 0), pady=(0, 3))
+        hip_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 4), pady=(0, 3))
         self._build_graph_limb_header(hip_frame, 'left_hip', 'right_hip')
         self._fig_hip, self._ax_hip = plt.subplots(figsize=(5.5, 2.6), dpi=100)
         self._style_ax(self._ax_hip, self._fig_hip)
@@ -2188,14 +2121,14 @@ class GaitAnalysisDashboard(tk.Tk):
         self._canvas_hip.get_tk_widget().bind('<Button-4>',   lambda e: self._on_canvas_scroll(e, 1))
         self._canvas_hip.get_tk_widget().bind('<Button-5>',   lambda e: self._on_canvas_scroll(e, 1))
 
-        # Buttons panel (sidebar top)
+        # display controls
         btn_panel = tk.Frame(sidebar, bg=BG2)
         btn_panel.grid(row=0, column=0, sticky='new', pady=(0, 3))
         self._build_buttons_panel(btn_panel)
 
         # Knee graph (row 1, col 0)
         knee_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
-        knee_frame.grid(row=1, column=0, sticky='nsew', padx=(0, 4), pady=(3, 0))
+        knee_frame.grid(row=1, column=0, sticky='nsew', padx=(0, 4), pady=(3, 3))
         self._build_graph_limb_header(knee_frame, 'left_knee', 'right_knee')
         self._fig_knee, self._ax_knee = plt.subplots(figsize=(5.5, 2.6), dpi=100)
         self._style_ax(self._ax_knee, self._fig_knee)
@@ -2208,15 +2141,30 @@ class GaitAnalysisDashboard(tk.Tk):
         self._canvas_knee.get_tk_widget().bind('<Button-4>',   lambda e: self._on_canvas_scroll(e, 2))
         self._canvas_knee.get_tk_widget().bind('<Button-5>',   lambda e: self._on_canvas_scroll(e, 2))
 
-        # Videos panel (row 1, col 1), split evenly for Video 1 and Video 2
+        # Ankle graph (row 2, col 0)
+        ankle_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
+        ankle_frame.grid(row=2, column=0, sticky='nsew', padx=(0, 4), pady=(3, 0))
+        self._build_graph_limb_header(ankle_frame, 'left_ankle', 'right_ankle')
+        self._fig_ankle, self._ax_ankle = plt.subplots(figsize=(5.5, 2.6), dpi=100)
+        self._style_ax(self._ax_ankle, self._fig_ankle)
+        self._canvas_ankle = FigureCanvasTkAgg(self._fig_ankle, master=ankle_frame)
+        self._canvas_ankle.get_tk_widget().pack(fill='both', expand=True)
+        self._canvas_ankle.mpl_connect('button_press_event',   lambda e: self._on_graph_click(e, 0))
+        self._canvas_ankle.mpl_connect('motion_notify_event',  lambda e: self._on_graph_drag(e, 0))
+        self._canvas_ankle.mpl_connect('button_release_event', lambda e: self._on_graph_release(e, 0))
+        self._canvas_ankle.get_tk_widget().bind('<MouseWheel>', lambda e: self._on_canvas_scroll(e, 0))
+        self._canvas_ankle.get_tk_widget().bind('<Button-4>',   lambda e: self._on_canvas_scroll(e, 0))
+        self._canvas_ankle.get_tk_widget().bind('<Button-5>',   lambda e: self._on_canvas_scroll(e, 0))
+
+        # Videos panel (row 0, col 1), spanning all graph rows
         videos_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
-        videos_frame.grid(row=1, column=1, sticky='nsew', padx=(4, 0), pady=(3, 0))
-        videos_frame.grid_columnconfigure(0, weight=1, uniform='video')
-        videos_frame.grid_columnconfigure(1, weight=1, uniform='video')
-        videos_frame.grid_rowconfigure(0, weight=1)
+        videos_frame.grid(row=0, column=1, rowspan=3, sticky='nsew', padx=(4, 0), pady=(0, 0))
+        videos_frame.grid_columnconfigure(0, weight=1)
+        videos_frame.grid_rowconfigure(0, weight=1, uniform='video')
+        videos_frame.grid_rowconfigure(1, weight=1, uniform='video')
 
         vid1_outer = tk.Frame(videos_frame, bg=BG2)
-        vid1_outer.grid(row=0, column=0, sticky='nsew', padx=(0, 2))
+        vid1_outer.grid(row=0, column=0, sticky='nsew', padx=0, pady=(0, 2))
         self._vid1_lbl = tk.Label(vid1_outer, text="VIDEO 1",
                       font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V1, anchor='w')
         self._vid1_lbl.pack(fill='x', padx=4, pady=(2, 0))
@@ -2224,7 +2172,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._vid_canvas1.pack(fill='both', expand=True)
 
         vid2_outer = tk.Frame(videos_frame, bg=BG2)
-        vid2_outer.grid(row=0, column=1, sticky='nsew', padx=(2, 0))
+        vid2_outer.grid(row=1, column=0, sticky='nsew', padx=0, pady=(2, 0))
         self._vid2_lbl = tk.Label(vid2_outer, text="VIDEO 2",
                       font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
         self._vid2_lbl.pack(fill='x', padx=4, pady=(2, 0))
@@ -2242,7 +2190,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._update_graph_limb_btn_visuals()
         self.after_idle(self._sync_graph_canvas_sizes)
 
-        # Metrics panel (sidebar bottom)
+        # metrics panel
         right = tk.Frame(sidebar, bg=BG2)
         right.grid(row=1, column=0, sticky='nsew', pady=(3, 0))
         right.pack_propagate(False)
@@ -2282,12 +2230,13 @@ class GaitAnalysisDashboard(tk.Tk):
         """Apply common graph styling."""
         fig.patch.set_facecolor(BG2)
         ax.set_facecolor(BG_PLOT)
+        ax.grid(False)
         for spine in ax.spines.values():
             spine.set_color(BG2)
-        ax.tick_params(colors=SUBTEXT, labelsize=7)
+        ax.tick_params(colors=SUBTEXT, labelsize=7, length=0)
         ax.xaxis.label.set_color(SUBTEXT)
         ax.yaxis.label.set_color(SUBTEXT)
-        fig.subplots_adjust(left=0.08, right=0.98, top=0.94, bottom=0.14)
+        fig.subplots_adjust(left=0.04, right=0.995, top=0.97, bottom=0.08)
 
     def _build_graph_limb_header(self, parent, left_joint, right_joint):
         pass
@@ -2381,7 +2330,7 @@ class GaitAnalysisDashboard(tk.Tk):
         tk.Label(parent, text="DISPLAY", font=("Helvetica", 8, "bold"),
                  bg=BG2, fg=ACCENT).pack(pady=(10, 4), padx=6)
 
-        btn_cfg = dict(bg=BG3, fg=TEXT, relief='flat', font=("Helvetica", 8),
+        btn_cfg = dict(bg=BG3, fg=TEXT, relief='flat', font=("Helvetica", 8, "bold"),
                    padx=5, pady=1, cursor='hand2', width=10,
                        activebackground=ACCENT, activeforeground='white')
 
@@ -2417,9 +2366,54 @@ class GaitAnalysisDashboard(tk.Tk):
 
         tk.Frame(parent, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
 
-        # Display toggles
+        badge_styles = {
+            'Ankle': {'bg': '#dbeeff', 'fg': '#1f4f7a'},
+            'Hip':   {'bg': '#ffe7cc', 'fg': '#8a4b08'},
+            'Knee':  {'bg': '#dff3df', 'fg': '#1f6b2f'},
+        }
+        for group_joints, group_label in [
+            (['left_hip',   'right_hip'],   'Hip'),
+            (['left_knee',  'right_knee'],  'Knee'),
+            (['left_ankle', 'right_ankle'], 'Ankle'),
+        ]:
+            row = tk.Frame(parent, bg=BG2)
+            row.pack(fill='x', padx=6, pady=1)
+            style = badge_styles.get(group_label, {'bg': BG2, 'fg': SUBTEXT})
+            badge = tk.Label(row, text=group_label, font=("Helvetica", 8, "bold"),
+                             bg=style['bg'], fg=style['fg'], padx=4, pady=2, width=5)
+            badge.pack(side='left', padx=(0, 4))
+            for joint in group_joints:
+                btn = self._create_graph_limb_toggle(
+                    row,
+                    joint,
+                    ('Left' if 'left' in joint else 'Right'),
+                )
+                if 'left' in joint:
+                    btn['frame'].pack(side='left', padx=(0, 4), pady=1)
+                else:
+                    btn['frame'].pack(side='left', padx=(0, 0), pady=1)
+
+        tk.Frame(parent, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
+
+        # Section 1: Cycles and World
         self._display_btns = {}
-        for label, key in [("Cycles", "cycles"), ("Mean", "mean"), ("Data", "data"),
+        
+        # Cycles button (text changes based on state)
+        self._cycles_btn = tk.Button(parent, text="Cycles", **btn_cfg,
+                           command=lambda: self._panel_btn_dispatch('Cycles'))
+        self._cycles_btn.pack(fill='x', padx=6, pady=1)
+        self._display_btns['cycles'] = self._cycles_btn
+        
+        # World button (text changes based on state)
+        self._world_btn = tk.Button(parent, text="World", **btn_cfg,
+                          command=lambda: self._panel_btn_dispatch('World'))
+        self._world_btn.pack(fill='x', padx=6, pady=1)
+        self._display_btns['world_px'] = self._world_btn
+
+        tk.Frame(parent, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
+
+        # Section 2: Mean, Data, Normal, Outliers
+        for label, key in [("Mean", "mean"), ("Data", "data"),
                    ("Normal", "normal"), ("Outliers", "outliers")]:
             btn = tk.Button(parent, text=label, **btn_cfg,
                            command=lambda k=label: self._panel_btn_dispatch(k))
@@ -2428,12 +2422,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
         tk.Frame(parent, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
 
-        # lower display controls
-        world_btn = tk.Button(parent, text="World", **btn_cfg,
-                      command=lambda: self._panel_btn_dispatch("World"))
-        world_btn.pack(fill='x', padx=6, pady=1)
-        self._display_btns['world_px'] = world_btn
-
+        # Section 3: Clear Steps and Exclusion Zones
         tk.Button(parent, text="Clear Steps", **btn_cfg,
               command=self._clear_steps).pack(fill='x', padx=6, pady=1)
         tk.Button(parent, text="Clear Excl. Zone", **btn_cfg,
@@ -2626,9 +2615,14 @@ class GaitAnalysisDashboard(tk.Tk):
             self.df_world           = results[0]['df_world']
             self.df_pixel           = results[0]['df_pixel']
             self.df_pixel_filtered  = results[0].get('df_pixel_filtered', results[0]['df_pixel'])
-            self.angle_data         = results[0]['angle_data']
+            key = 'df_world' if USE_WORLD_LANDMARKS else 'df_pixel_filtered'
+            for ds in self.datasets:
+                if key in ds:
+                    ds['angle_data'] = ds[key]
+            self.angle_data         = self.datasets[0].get(key, self.datasets[0]['angle_data'])
             self.total_frames = max(len(results[0]['all_landmarks']), len(results[1]['all_landmarks']))
             min_video_frames = min(len(results[0]['all_landmarks']), len(results[1]['all_landmarks']))
+            self.current_frame_idx = 0
             if not self.angle_data.empty:
                 data_min = self.angle_data['frame_num'].min()
                 full = (data_min, data_min + min_video_frames)
@@ -2649,6 +2643,9 @@ class GaitAnalysisDashboard(tk.Tk):
             self.resample_cycles = True
             self._update_display_btn_visuals()
             self.refresh()
+            # force a second pass once tk has finalized widget sizes
+            self.after_idle(self._show_video_frames)
+            self.after(60, self._show_video_frames)
             if cached_loaded:
                 self._status_msg.set("Loaded cached steps")
             elif auto_excl_count:
@@ -2667,26 +2664,38 @@ class GaitAnalysisDashboard(tk.Tk):
                        self._canvas_hip.get_tk_widget(),
                        self._canvas_knee.get_tk_widget()]:
             canvas.bind('<MouseWheel>', lambda e, gi=0: self._on_canvas_scroll(e, gi))
-        self.bind('<Key-1>',     lambda e: self._prev_frame())
-        self.bind('<Key-2>',     lambda e: self._next_frame())
-        self.bind('<Key-9>',     lambda e: self._toggle_play())
-        self.bind('<q>',         lambda e: self._on_close())
-        self.bind('<w>',         lambda e: self._toggle_world())
-        self.bind('<c>',         lambda e: self._toggle_cycles())
-        self.bind('<x>',         lambda e: self._toggle_cycle_alignment())
-        self.bind('<b>',         lambda e: self._toggle_cycle_stacked())
-        self.bind('<s>',         lambda e: self._toggle_resample())
-        self.bind('<m>',         lambda e: self._toggle_mean())
-        self.bind('<v>',         lambda e: self._cycle_graph_view())
-        self.bind('<t>',         lambda e: self._toggle_active())
-        self.bind('<g>',         lambda e: self._toggle_suggestions())
-        self.bind('<d>',         lambda e: self._clear_steps())
-        self.bind('<space>',     lambda e: self._add_manual_step())
-        self.bind('<BackSpace>', lambda e: self._delete_nearest_step())
-        self.bind('<Delete>',    lambda e: self._delete_nearest_step())
-        self.bind('z',           lambda e: self._reset_zoom())
-        self.bind('<Alt-c>',     lambda e: self._toggle_confidence())
-        self.bind('<F3>',        lambda e: self._toggle_ankle_norm_offset())
+
+        shortcuts = {
+            '<Key-1>': self._prev_frame,
+            '<Key-2>': self._next_frame,
+            '<Key-9>': self._toggle_play,
+            '<q>': self._on_close,
+            '<w>': self._toggle_world,
+            '<c>': self._toggle_cycles,
+            '<x>': self._toggle_cycle_alignment,
+            '<b>': self._toggle_cycle_stacked,
+            '<s>': self._toggle_resample,
+            '<m>': self._toggle_mean,
+            '<v>': self._cycle_graph_view,
+            '<t>': self._toggle_active,
+            '<g>': self._toggle_suggestions,
+            '<d>': self._clear_steps,
+            '<space>': self._add_manual_step,
+            '<BackSpace>': self._delete_nearest_step,
+            '<Delete>': self._delete_nearest_step,
+            'z': self._reset_zoom,
+            '<Alt-c>': self._toggle_confidence,
+            '<F3>': self._toggle_ankle_norm_offset,
+        }
+
+        for seq, fn in shortcuts.items():
+            self.bind_all(seq, lambda e, _fn=fn: _fn())
+
+        # support caps-lock/shifted letters for single-key shortcuts
+        for seq, fn in shortcuts.items():
+            if len(seq) == 3 and seq.startswith('<') and seq.endswith('>') and seq[1].isalpha():
+                upper_seq = f"<{seq[1].upper()}>"
+                self.bind_all(upper_seq, lambda e, _fn=fn: _fn())
 
     # ── prefetch ───────────────────────────────────────────────────────────
 
@@ -2849,9 +2858,11 @@ class GaitAnalysisDashboard(tk.Tk):
         """Draw one of the three joint graphs (gi=0 ankle, 1 hip, 2 knee)."""
         ax.cla()
         ax.set_facecolor(BG_PLOT)
+        ax.grid(False)
         for spine in ax.spines.values():
             spine.set_color(BG2)
-        ax.tick_params(colors=SUBTEXT, labelsize=7)
+        ax.tick_params(colors=SUBTEXT, labelsize=7, length=0)
+        ax.tick_params(axis='y', labelleft=False)
         ax.xaxis.label.set_color(SUBTEXT)
         ax.set_ylabel('')
 
@@ -2859,6 +2870,9 @@ class GaitAnalysisDashboard(tk.Tk):
         norm_key    = self._GRAPH_NORM_KEY[gi]
 
         if self.angle_data is None or self.angle_data.empty:
+            ax.set_xlabel('')
+            ax.tick_params(axis='x', labelbottom=False)
+            ax.tick_params(axis='y', labelleft=False)
             mpl_canvas.draw_idle()
             return
 
@@ -2921,6 +2935,7 @@ class GaitAnalysisDashboard(tk.Tk):
         if not self.show_overlaid_cycles:
             # ── Continuous mode ──
             ax.set_xlabel('Frame', fontsize=7)
+            ax.tick_params(axis='x', labelbottom=True)
             ax.set_ylabel('')
             continuous_y_vals = []
 
@@ -2986,6 +3001,7 @@ class GaitAnalysisDashboard(tk.Tk):
         else:
             # ── Overlaid cycles mode ──
             ax.set_xlabel('Frames Since Strike', fontsize=7)
+            ax.tick_params(axis='x', labelbottom=True)
             ax.set_ylabel('')
 
             for ds in dfg:
@@ -3084,7 +3100,9 @@ class GaitAnalysisDashboard(tk.Tk):
             ax.set_xlim(0, max_cycle_length)
 
         fig = [self._fig_ankle, self._fig_hip, self._fig_knee][gi]
-        fig.subplots_adjust(left=0.10, right=0.98, top=0.94, bottom=0.16)
+        # tighter margins so plots fill their containers
+        bottom_pad = 0.11
+        fig.subplots_adjust(left=0.04, right=0.995, top=0.97, bottom=bottom_pad)
         mpl_canvas.draw_idle()
 
     # convenience alias kept for markup screen
@@ -3485,7 +3503,27 @@ class GaitAnalysisDashboard(tk.Tk):
             'world_px': USE_WORLD_LANDMARKS,
         }
         disabled_in_continuous = {'mean', 'data', 'normal', 'outliers'}
+        
+        # update cycles button text and state
+        cycles_text = "Cycles" if self.show_overlaid_cycles else "Continuous"
+        self._cycles_btn.config(text=cycles_text)
+        if active_map['cycles']:
+            self._cycles_btn.config(bg=ACCENT, fg='white')
+        else:
+            self._cycles_btn.config(bg=BG3, fg=TEXT)
+        
+        # update world button text and state
+        world_text = "World" if USE_WORLD_LANDMARKS else "Pixel"
+        self._world_btn.config(text=world_text)
+        if active_map['world_px']:
+            self._world_btn.config(bg=ACCENT, fg='white')
+        else:
+            self._world_btn.config(bg=BG3, fg=TEXT)
+        
+        # handle other buttons (mean, data, normal, outliers)
         for key, btn in self._display_btns.items():
+            if key in ('cycles', 'world_px'):
+                continue  # already handled above
             is_disabled = (not self.show_overlaid_cycles) and (key in disabled_in_continuous)
             if is_disabled:
                 btn.config(
