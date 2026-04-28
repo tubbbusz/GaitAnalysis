@@ -320,6 +320,142 @@ def _save_ui_settings(data):
     except Exception:
         pass
 
+# ── auto-crop helpers ──────────────────────────────────────────────────────
+
+_CROP_VIS_THRESH = 0.40
+_CROP_TOP_IDX    = [0, 7, 8, 11, 12]   # head, ears, shoulders
+_CROP_FOOT_IDX   = [27, 28, 29, 30, 31, 32]  # ankles, heels, toes
+_CROP_TARGET_AR  = 4.0 / 3.0
+
+
+def _crop_skeleton_stats(pixel_landmarks_list):
+    """Compute tight skeleton bbox stats over all frames.
+    pixel_landmarks_list is a list of (thumb, [SimpleLandmark...]) | (thumb, None)
+    or just [SimpleLandmark...] | None entries.
+    """
+    heights = []; all_xs = []; all_ys = []; tight_xs = []; tight_ys = []
+    per_frame_bbox = []
+
+    for entry in pixel_landmarks_list:
+        lms = entry[1] if isinstance(entry, tuple) else entry
+        if lms is None:
+            per_frame_bbox.append(None)
+            continue
+        vis = [lm for lm in lms if lm.visibility > _CROP_VIS_THRESH]
+        if not vis:
+            per_frame_bbox.append(None)
+            continue
+        fxs = [lm.x for lm in vis]; fys = [lm.y for lm in vis]
+        per_frame_bbox.append((min(fxs), max(fxs), min(fys), max(fys)))
+        tight_xs.extend(fxs); tight_ys.extend(fys)
+        all_xs.extend(fxs);   all_ys.extend(fys)
+        top_ys  = [lms[i].y for i in _CROP_TOP_IDX  if i < len(lms) and lms[i].visibility > _CROP_VIS_THRESH]
+        foot_ys = [lms[i].y for i in _CROP_FOOT_IDX if i < len(lms) and lms[i].visibility > _CROP_VIS_THRESH]
+        if top_ys and foot_ys:
+            h = float(np.median(foot_ys) - np.median(top_ys))
+            if h > 0.03:
+                heights.append(h)
+
+    if not heights or not all_xs:
+        return None
+    return dict(
+        median_h=float(np.median(heights)),
+        p95_h=float(np.percentile(heights, 95)),
+        cx=float((np.min(all_xs) + np.max(all_xs)) / 2),
+        cy=float((np.min(all_ys) + np.max(all_ys)) / 2),
+        x_min=float(np.min(all_xs)), x_max=float(np.max(all_xs)),
+        y_min=float(np.min(all_ys)), y_max=float(np.max(all_ys)),
+        tight_x_min=float(np.min(tight_xs)), tight_x_max=float(np.max(tight_xs)),
+        tight_y_min=float(np.min(tight_ys)), tight_y_max=float(np.max(tight_ys)),
+        per_frame_bbox=per_frame_bbox,
+    )
+
+def _debug_crop_stats(landmarks, stats, video_path):
+    """Print per-frame y_min to find what's pulling the crop up."""
+    print(f"\n{'='*60}")
+    print(f"CROP DEBUG: {os.path.basename(video_path)}")
+    print(f"  tight_y_min={stats['tight_y_min']:.4f}  tight_y_max={stats['tight_y_max']:.4f}")
+    print(f"  tight_x_min={stats['tight_x_min']:.4f}  tight_x_max={stats['tight_x_max']:.4f}")
+    print(f"  Total frames: {len(landmarks)}")
+    
+    suspicious = []
+    for fi, entry in enumerate(landmarks):
+        if entry is None:
+            continue
+        lms = entry[1] if isinstance(entry, tuple) else entry
+        if lms is None:
+            continue
+        vis = [lm for lm in lms if lm.visibility > _CROP_VIS_THRESH]
+        if not vis:
+            continue
+        fys = [lm.y for lm in vis]
+        frame_y_min = min(fys)
+        if frame_y_min < stats['tight_y_min'] + 0.05:  # frames near the top
+            suspicious.append((fi, frame_y_min, 
+                               [(i, lm.y, lm.visibility) for i, lm in enumerate(lms) 
+                                if lm.visibility > _CROP_VIS_THRESH and lm.y < 0.15]))
+    
+    print(f"  Frames with landmarks near top (y < {stats['tight_y_min']+0.05:.3f}):")
+    for fi, y_min, top_lms in suspicious[:20]:  # cap at 20
+        print(f"    frame {fi:4d}: y_min={y_min:.4f}  top landmarks: {top_lms}")
+    print(f"{'='*60}\n")
+
+def _compute_auto_crop(stats, fw, fh, pad=0.05):
+    if stats is None:
+        return None
+    x0 = max(0.0, stats['tight_x_min'] - pad)
+    y0 = max(0.0, stats['tight_y_min'] - pad)
+    x1 = min(1.0, stats['tight_x_max'] + pad)
+    y1 = min(1.0, stats['tight_y_max'] + pad)
+    w  = max(0.01, x1 - x0)
+    h  = max(0.01, y1 - y0)
+    print(f"  _compute_auto_crop → x0={x0:.4f} y0={y0:.4f} w={w:.4f} h={h:.4f}  (fw={fw} fh={fh})")
+    return x0, y0, w, h
+
+_CROP_TARGET_FILL = 0.70  # skeleton occupies this fraction of crop height
+
+def _apply_target_fill(stats, x0, y0, w, h):
+    skel_h = stats.get('p95_h', 0)
+    if skel_h <= 0:
+        return x0, y0, w, h
+    target_h = max(0.01, min(1.0, skel_h / _CROP_TARGET_FILL))
+    cy = stats['cy']
+    new_y0 = cy - target_h / 2.0
+    new_y1 = cy + target_h / 2.0
+    if new_y0 < 0.0:
+        new_y1 -= new_y0; new_y0 = 0.0
+    if new_y1 > 1.0:
+        new_y0 -= (new_y1 - 1.0); new_y1 = 1.0; new_y0 = max(0.0, new_y0)
+    return x0, new_y0, w, max(0.01, new_y1 - new_y0)
+
+
+def _compute_auto_crops_pair(stats_a, stats_b, fw_a, fh_a, fw_b, fh_b, pad=0.05):
+    def _tight(stats):
+        x0 = max(0.0, stats['tight_x_min'] - pad)
+        y0 = max(0.0, stats['tight_y_min'] - pad)
+        x1 = min(1.0, stats['tight_x_max'] + pad)
+        y1 = min(1.0, stats['tight_y_max'] + pad)
+        return x0, y0, max(0.01, x1 - x0), max(0.01, y1 - y0)
+
+    if stats_a is None and stats_b is None:
+        return None, None
+    if stats_a is None:
+        return None, _tight(stats_b)
+    if stats_b is None:
+        return _tight(stats_a), None
+
+    return _tight(stats_a), _tight(stats_b)
+
+def _apply_crop_rect(frame_bgr, crop):
+    """Crop a BGR frame given (x0, y0, w, h) in normalised [0,1] coords."""
+    if crop is None:
+        return frame_bgr
+    fh, fw = frame_bgr.shape[:2]
+    x0, y0, cw, ch = crop
+    px = int(x0 * fw);  py = int(y0 * fh)
+    pw = max(1, int(cw * fw)); ph = max(1, int(ch * fh))
+    px = min(px, max(0, fw - pw)); py = min(py, max(0, fh - ph))
+    return frame_bgr[py:py + ph, px:px + pw]
 
 class PoseLandmark:
     NOSE = 0
@@ -1004,6 +1140,7 @@ def _detect_subject_orientation(video_path):
     landmarker.close()
     if detections == 0:
         return False
+    print(f"  [{os.path.basename(video_path)}] vertical_votes={vertical_votes}/{detections} → needs_rotation={vertical_votes <= detections / 2}")
     return vertical_votes > detections / 2
 
 
@@ -1080,6 +1217,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     landmarker = PoseLandmarker.create_from_options(opts)
 
     world_rows, pixel_rows, landmarks, landmark_depths, confidence_rows = [], [], [], [], []
+    landmarks_for_crop = []
     world_landmarks_list = []
     skeleton_width_rows = []
     frame_count = 0
@@ -1103,6 +1241,8 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
             frame = frame[cy:cy+ch_r, cx:cx+cw_r]
 
         view_frame = frame
+        _last_view_w = frame.shape[1]   
+        _last_view_h = frame.shape[0]   
 
         pad_left, pad_top = 0, 0
         pad_fw, pad_fh = frame.shape[1], frame.shape[0]
@@ -1144,6 +1284,8 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
                 return SimpleLandmark(nx, ny, lm.visibility)
             remapped_pixel_lm = [_remap_lm(lm) for lm in pixel_lm]
             landmarks.append((raw_path, remapped_pixel_lm))
+            
+            landmarks_for_crop.append((None, remapped_pixel_lm))
 
             if DEBUG_SKELETON_WIDTH:
                 bounds = _subject_bounds_from_landmarks(remapped_pixel_lm, view_w, view_h)
@@ -1234,10 +1376,14 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
             pixel_rows.append(p_row)
         else:
             landmarks.append(None)
+            landmarks_for_crop.append(None)
             world_landmarks_list.append(None)
             landmark_depths.append(None)
             confidence_rows.append({'frame_num': frame_count, 'avg_confidence': 0.0})
 
+
+    _fw_for_crop = _last_view_w if '_last_view_w' in locals() else int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    _fh_for_crop = _last_view_h if '_last_view_h' in locals() else int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
     landmarker.close()
 
@@ -1336,11 +1482,35 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
         '_cache_key':         cache_key,
         '_cache_meta':        cache_meta or {},
         '_cached_markup':     cached_markup,
+        '_fw_for_crop':       _fw_for_crop,
+        '_fh_for_crop':       _fh_for_crop,
     }
 
-    if cache_key:
-        _save_cached_video_result(cache_key, cache_meta or {}, result)
+    _crop_sk = _crop_skeleton_stats(landmarks_for_crop)
 
+    if _crop_sk and needs_rotation:
+        _crop_sk_upright = dict(_crop_sk)
+        _crop_sk_upright['tight_x_min'] = 1.0 - _crop_sk['tight_y_max']
+        _crop_sk_upright['tight_x_max'] = 1.0 - _crop_sk['tight_y_min']
+        _crop_sk_upright['tight_y_min'] = _crop_sk['tight_x_min']
+        _crop_sk_upright['tight_y_max'] = _crop_sk['tight_x_max']
+        _crop_sk_upright['cx'] = 1.0 - _crop_sk['cy']
+        _crop_sk_upright['cy'] = _crop_sk['cx']
+        _fw_upright = _fh_for_crop
+        _fh_upright = _fw_for_crop
+        print(f"  UPRIGHT STATS: tight_x=[{_crop_sk_upright['tight_x_min']:.4f}-{_crop_sk_upright['tight_x_max']:.4f}] tight_y=[{_crop_sk_upright['tight_y_min']:.4f}-{_crop_sk_upright['tight_y_max']:.4f}]")
+    else:
+        _crop_sk_upright = _crop_sk
+        _fw_upright = _fw_for_crop
+        _fh_upright = _fh_for_crop
+
+    if _crop_sk:
+        _debug_crop_stats(landmarks_for_crop, _crop_sk, video_path)
+
+    result['crop_stats']  = _crop_sk_upright
+    result['_fw_upright'] = _fw_upright
+    result['_fh_upright'] = _fh_upright
+    result['crop_rect']   = None
     return result
 
 
@@ -2078,7 +2248,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
         # ── Main content area ──
         main = tk.Frame(self, bg=BG)
-        main.pack(fill='both', expand=True, padx=6, pady=(4, 0))
+        main.pack(fill='both', expand=True, padx=8, pady=(8, 8))
         self._main_content = main
 
         # ─────────────────────────────────────────────────────────────────
@@ -2103,12 +2273,12 @@ class GaitAnalysisDashboard(tk.Tk):
         content.grid_rowconfigure(0, weight=1, uniform='row')
         content.grid_rowconfigure(1, weight=1, uniform='row')
         content.grid_rowconfigure(2, weight=1, uniform='row')
-        content.grid_columnconfigure(0, weight=2)
-        content.grid_columnconfigure(1, weight=1)
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=2)
 
-        # Hip graph (row 0, col 0)
+        # Hip graph (row 0, col 1)
         hip_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
-        hip_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 4), pady=(0, 3))
+        hip_frame.grid(row=0, column=1, sticky='nsew', padx=(0, 2), pady=(2, 3))
         self._build_graph_limb_header(hip_frame, 'left_hip', 'right_hip')
         self._fig_hip, self._ax_hip = plt.subplots(figsize=(5.5, 2.6), dpi=100)
         self._style_ax(self._ax_hip, self._fig_hip)
@@ -2126,9 +2296,9 @@ class GaitAnalysisDashboard(tk.Tk):
         btn_panel.grid(row=0, column=0, sticky='new', pady=(0, 3))
         self._build_buttons_panel(btn_panel)
 
-        # Knee graph (row 1, col 0)
+        # Knee graph (row 1, col 1)
         knee_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
-        knee_frame.grid(row=1, column=0, sticky='nsew', padx=(0, 4), pady=(3, 3))
+        knee_frame.grid(row=1, column=1, sticky='nsew', padx=(0, 2), pady=(3, 3))
         self._build_graph_limb_header(knee_frame, 'left_knee', 'right_knee')
         self._fig_knee, self._ax_knee = plt.subplots(figsize=(5.5, 2.6), dpi=100)
         self._style_ax(self._ax_knee, self._fig_knee)
@@ -2141,9 +2311,9 @@ class GaitAnalysisDashboard(tk.Tk):
         self._canvas_knee.get_tk_widget().bind('<Button-4>',   lambda e: self._on_canvas_scroll(e, 2))
         self._canvas_knee.get_tk_widget().bind('<Button-5>',   lambda e: self._on_canvas_scroll(e, 2))
 
-        # Ankle graph (row 2, col 0)
+        # Ankle graph (row 2, col 1)
         ankle_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
-        ankle_frame.grid(row=2, column=0, sticky='nsew', padx=(0, 4), pady=(3, 0))
+        ankle_frame.grid(row=2, column=1, sticky='nsew', padx=(0, 2), pady=(3, 2))
         self._build_graph_limb_header(ankle_frame, 'left_ankle', 'right_ankle')
         self._fig_ankle, self._ax_ankle = plt.subplots(figsize=(5.5, 2.6), dpi=100)
         self._style_ax(self._ax_ankle, self._fig_ankle)
@@ -2156,9 +2326,9 @@ class GaitAnalysisDashboard(tk.Tk):
         self._canvas_ankle.get_tk_widget().bind('<Button-4>',   lambda e: self._on_canvas_scroll(e, 0))
         self._canvas_ankle.get_tk_widget().bind('<Button-5>',   lambda e: self._on_canvas_scroll(e, 0))
 
-        # Videos panel (row 0, col 1), spanning all graph rows
+        # Videos panel (row 0, col 0), spanning all graph rows
         videos_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
-        videos_frame.grid(row=0, column=1, rowspan=3, sticky='nsew', padx=(4, 0), pady=(0, 0))
+        videos_frame.grid(row=0, column=0, rowspan=3, sticky='nsew', padx=(0, 4), pady=(2, 2))
         videos_frame.grid_columnconfigure(0, weight=1)
         videos_frame.grid_rowconfigure(0, weight=1, uniform='video')
         videos_frame.grid_rowconfigure(1, weight=1, uniform='video')
@@ -2236,7 +2406,7 @@ class GaitAnalysisDashboard(tk.Tk):
         ax.tick_params(colors=SUBTEXT, labelsize=7, length=0)
         ax.xaxis.label.set_color(SUBTEXT)
         ax.yaxis.label.set_color(SUBTEXT)
-        fig.subplots_adjust(left=0.04, right=0.995, top=0.97, bottom=0.08)
+        fig.subplots_adjust(left=0.02, right=0.98, top=0.97, bottom=0.08)
 
     def _build_graph_limb_header(self, parent, left_joint, right_joint):
         pass
@@ -2611,7 +2781,23 @@ class GaitAnalysisDashboard(tk.Tk):
             if results[0] is None or results[1] is None:
                 messagebox.showerror("Error", "Failed to process one or both videos.")
                 return
+            
+            # Save results to cache if cache_key is present
+            for i in range(2):
+                if results[i] is not None:
+                    cache_key = results[i].get('_cache_key')
+                    cache_meta = results[i].get('_cache_meta')
+                    if cache_key and cache_meta:
+                        _save_cached_video_result(cache_key, cache_meta, results[i])
+            
             self.datasets           = results
+            _ca, _cb = _compute_auto_crops_pair(
+               results[0].get('crop_stats'), results[1].get('crop_stats'),
+                results[0].get('_fw_upright', 1), results[0].get('_fh_upright', 1),
+                results[1].get('_fw_upright', 1), results[1].get('_fh_upright', 1),
+                pad=0.05)
+            results[0]['crop_rect'] = _ca
+            results[1]['crop_rect'] = _cb
             self.df_world           = results[0]['df_world']
             self.df_pixel           = results[0]['df_pixel']
             self.df_pixel_filtered  = results[0].get('df_pixel_filtered', results[0]['df_pixel'])
@@ -3102,7 +3288,7 @@ class GaitAnalysisDashboard(tk.Tk):
         fig = [self._fig_ankle, self._fig_hip, self._fig_knee][gi]
         # tighter margins so plots fill their containers
         bottom_pad = 0.11
-        fig.subplots_adjust(left=0.04, right=0.995, top=0.97, bottom=bottom_pad)
+        fig.subplots_adjust(left=0.02, right=0.98, top=0.97, bottom=bottom_pad)
         mpl_canvas.draw_idle()
 
     # convenience alias kept for markup screen
@@ -3112,6 +3298,7 @@ class GaitAnalysisDashboard(tk.Tk):
     # ── video display ──────────────────────────────────────────────────────
 
     def _show_video_frames(self):
+            
         for vi, canvas in enumerate(self._vid_canvases):
             cw = canvas.winfo_width()
             ch = canvas.winfo_height()
@@ -3134,6 +3321,31 @@ class GaitAnalysisDashboard(tk.Tk):
             if frame is None:
                 canvas.create_text(cw//2, ch//2, text="No frame", fill=SUBTEXT, font=("Helvetica", 10))
                 continue
+
+            # ── apply skeleton-based auto-crop ─────────────────────────────
+            crop = self.datasets[vi].get('crop_rect') if vi < len(self.datasets) else None
+            if crop is not None and self.datasets[vi].get('needs_rotation'):
+                # crop is in upright space, frame is sideways — convert back
+                # inverse of 90° CW: x_side = y_up, y_side = 1 - x_up - w_up
+                x0, y0, cw_n, ch_n = crop
+                crop_sideways = (y0, 1.0 - x0 - cw_n, ch_n, cw_n)
+                frame = _apply_crop_rect(frame.copy(), crop_sideways)
+                if pixel_lm is not None:
+                    sx0, sy0, scw, sch = crop_sideways
+                    pixel_lm = [SimpleLandmark(
+                                    (lm.x - sx0) / scw if scw > 0 else lm.x,
+                                    (lm.y - sy0) / sch if sch > 0 else lm.y,
+                                    lm.visibility)
+                                for lm in pixel_lm]
+            elif crop is not None:
+                frame = _apply_crop_rect(frame.copy(), crop)
+                if pixel_lm is not None:
+                    x0, y0, cw_n, ch_n = crop
+                    pixel_lm = [SimpleLandmark(
+                                    (lm.x - x0) / cw_n if cw_n > 0 else lm.x,
+                                    (lm.y - y0) / ch_n if ch_n > 0 else lm.y,
+                                    lm.visibility)
+                                for lm in pixel_lm]
 
             jittery_frames = self.datasets[vi].get('jittery_frames', set()) if self.remove_jitter_frames else set()
             is_jittery = self.current_frame_idx in jittery_frames
