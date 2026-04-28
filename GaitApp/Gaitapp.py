@@ -320,7 +320,7 @@ def _save_ui_settings(data):
     except Exception:
         pass
 
-# ── auto-crop helpers ──────────────────────────────────────────────────────
+# auto-crop helpers
 
 _CROP_VIS_THRESH = 0.40
 _CROP_TOP_IDX    = [0, 7, 8, 11, 12]   # head, ears, shoulders
@@ -390,7 +390,7 @@ def _debug_crop_stats(landmarks, stats, video_path):
             continue
         fys = [lm.y for lm in vis]
         frame_y_min = min(fys)
-        if frame_y_min < stats['tight_y_min'] + 0.05:  # frames near the top
+        if frame_y_min < stats['tight_y_min'] + 0.05:  # frames near top
             suspicious.append((fi, frame_y_min, 
                                [(i, lm.y, lm.visibility) for i, lm in enumerate(lms) 
                                 if lm.visibility > _CROP_VIS_THRESH and lm.y < 0.15]))
@@ -2122,7 +2122,7 @@ class PDFExportDialog(tk.Toplevel):
             messagebox.showerror("Error", f"Failed to generate PDF:\n{str(e)}")
 
 
-# ── MAIN DASHBOARD ──────────────────────────────────────────────────────────
+# main dashboard
 
 class GaitAnalysisDashboard(tk.Tk):
 
@@ -2181,7 +2181,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._exclusion_start     = [None, None, None]
         self._graph_limb_btns     = {}
 
-        # Per-graph zoom state  (ankle=0, hip=1, knee=2)
+        # per-graph zoom state (ankle=0, hip=1, knee=2)
         self._ax_xlim_full        = [None, None, None]
         self._ax_xlim_per_mode    = [{}, {}, {}]
 
@@ -2215,10 +2215,10 @@ class GaitAnalysisDashboard(tk.Tk):
         y = max((screen_h - height) // 2, 0)
         self.geometry(f"{width}x{height}+{x}+{y}")
 
-    # ── UI BUILD ──────────────────────────────────────────────────────────
+    # ui build
 
     def _build_ui(self):
-        # ── Header ──
+        # header
         hdr = tk.Frame(self, bg=BG2, height=44)
         hdr.pack(fill='x', side='top')
         hdr.pack_propagate(False)
@@ -2246,15 +2246,13 @@ class GaitAnalysisDashboard(tk.Tk):
                   command=self.find_videos
                   ).pack(side='right', padx=10, pady=8)
 
-        # ── Main content area ──
+        # main content area
         main = tk.Frame(self, bg=BG)
         main.pack(fill='both', expand=True, padx=8, pady=(8, 8))
         self._main_content = main
 
-        # ─────────────────────────────────────────────────────────────────
-        # Layout: equal 2x2 content grid + separate right sidebar.
-        # Content panels are equal-sized: Ankle, Hip, Knee, Videos.
-        # ─────────────────────────────────────────────────────────────────
+        # layout: videos left, graphs right with 2x2 grid
+        # content panels: ankle, hip, knee, videos
         main.grid_rowconfigure(0, weight=1)
         main.grid_rowconfigure(1, weight=0)
         main.grid_columnconfigure(0, weight=1)
@@ -2276,7 +2274,7 @@ class GaitAnalysisDashboard(tk.Tk):
         content.grid_columnconfigure(0, weight=1)
         content.grid_columnconfigure(1, weight=2)
 
-        # Hip graph (row 0, col 1)
+        # hip graph (row 0, col 1)
         hip_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
         hip_frame.grid(row=0, column=1, sticky='nsew', padx=(0, 2), pady=(2, 3))
         self._build_graph_limb_header(hip_frame, 'left_hip', 'right_hip')
@@ -2296,7 +2294,7 @@ class GaitAnalysisDashboard(tk.Tk):
         btn_panel.grid(row=0, column=0, sticky='new', pady=(0, 3))
         self._build_buttons_panel(btn_panel)
 
-        # Knee graph (row 1, col 1)
+        # knee graph (row 1, col 1)
         knee_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
         knee_frame.grid(row=1, column=1, sticky='nsew', padx=(0, 2), pady=(3, 3))
         self._build_graph_limb_header(knee_frame, 'left_knee', 'right_knee')
@@ -2311,7 +2309,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._canvas_knee.get_tk_widget().bind('<Button-4>',   lambda e: self._on_canvas_scroll(e, 2))
         self._canvas_knee.get_tk_widget().bind('<Button-5>',   lambda e: self._on_canvas_scroll(e, 2))
 
-        # Ankle graph (row 2, col 1)
+        # ankle graph (row 2, col 1)
         ankle_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
         ankle_frame.grid(row=2, column=1, sticky='nsew', padx=(0, 2), pady=(3, 2))
         self._build_graph_limb_header(ankle_frame, 'left_ankle', 'right_ankle')
@@ -2326,7 +2324,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._canvas_ankle.get_tk_widget().bind('<Button-4>',   lambda e: self._on_canvas_scroll(e, 0))
         self._canvas_ankle.get_tk_widget().bind('<Button-5>',   lambda e: self._on_canvas_scroll(e, 0))
 
-        # Videos panel (row 0, col 0), spanning all graph rows
+        # videos panel (row 0, col 0), spanning all graph rows
         videos_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
         videos_frame.grid(row=0, column=0, rowspan=3, sticky='nsew', padx=(0, 4), pady=(2, 2))
         videos_frame.grid_columnconfigure(0, weight=1)
@@ -2366,7 +2364,7 @@ class GaitAnalysisDashboard(tk.Tk):
         right.pack_propagate(False)
         self._build_metrics_panel(right)
 
-        # ── Status bar ──
+        # status bar
         bottom = tk.Frame(self, bg=BG2, height=36)
         bottom.pack(fill='x', side='bottom')
         bottom.pack_propagate(False)
@@ -2504,7 +2502,7 @@ class GaitAnalysisDashboard(tk.Tk):
                    padx=5, pady=1, cursor='hand2', width=10,
                        activebackground=ACCENT, activeforeground='white')
 
-        # V1 / V2 toggles
+        # v1 / v2 toggles
         ind_frame = tk.Frame(parent, bg=BG2)
         ind_frame.pack(fill='x', padx=6, pady=(2, 4))
 
@@ -2565,16 +2563,16 @@ class GaitAnalysisDashboard(tk.Tk):
 
         tk.Frame(parent, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
 
-        # Section 1: Cycles and World
+        # section 1: cycles and world
         self._display_btns = {}
         
-        # Cycles button (text changes based on state)
+        # cycles button (text changes based on state)
         self._cycles_btn = tk.Button(parent, text="Cycles", **btn_cfg,
                            command=lambda: self._panel_btn_dispatch('Cycles'))
         self._cycles_btn.pack(fill='x', padx=6, pady=1)
         self._display_btns['cycles'] = self._cycles_btn
         
-        # World button (text changes based on state)
+        # world button (text changes based on state)
         self._world_btn = tk.Button(parent, text="World", **btn_cfg,
                           command=lambda: self._panel_btn_dispatch('World'))
         self._world_btn.pack(fill='x', padx=6, pady=1)
@@ -2582,7 +2580,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
         tk.Frame(parent, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
 
-        # Section 2: Mean, Data, Normal, Outliers
+        # section 2: mean, data, normal, outliers
         for label, key in [("Mean", "mean"), ("Data", "data"),
                    ("Normal", "normal"), ("Outliers", "outliers")]:
             btn = tk.Button(parent, text=label, **btn_cfg,
@@ -2592,7 +2590,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
         tk.Frame(parent, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
 
-        # Section 3: Clear Steps and Exclusion Zones
+        # section 3: clear steps and exclusion zones
         tk.Button(parent, text="Clear Steps", **btn_cfg,
               command=self._clear_steps).pack(fill='x', padx=6, pady=1)
         tk.Button(parent, text="Clear Excl. Zone", **btn_cfg,
@@ -2667,7 +2665,7 @@ class GaitAnalysisDashboard(tk.Tk):
         if fn:
             fn()
 
-    # ── video selection ────────────────────────────────────────────────────
+    # video selection
 
     def find_videos(self):
         video_paths = list(select_video_paths())
@@ -2782,7 +2780,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 messagebox.showerror("Error", "Failed to process one or both videos.")
                 return
             
-            # Save results to cache if cache_key is present
+            # save results to cache if cache_key is present
             for i in range(2):
                 if results[i] is not None:
                     cache_key = results[i].get('_cache_key')
@@ -2843,7 +2841,7 @@ class GaitAnalysisDashboard(tk.Tk):
             t.start()
         self.after(200, _poll_pre_scan)
 
-    # ── key bindings ───────────────────────────────────────────────────────
+    # key bindings
 
     def _bind_keys(self):
         for canvas in [self._canvas_ankle.get_tk_widget(),
@@ -2883,7 +2881,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 upper_seq = f"<{seq[1].upper()}>"
                 self.bind_all(upper_seq, lambda e, _fn=fn: _fn())
 
-    # ── prefetch ───────────────────────────────────────────────────────────
+    # prefetch worker for frame caching
 
     def _prefetch_worker(self):
         last = -1
@@ -2897,7 +2895,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 last = idx
             time.sleep(0.02)
 
-    # ── dataset helpers ────────────────────────────────────────────────────
+    # dataset helpers
 
     def _active_ds(self):
         if not self.datasets: return None
@@ -3015,9 +3013,9 @@ class GaitAnalysisDashboard(tk.Tk):
                 merged.append((s, e))
         return merged
 
-    # ── graph drawing ──────────────────────────────────────────────────────
+    # graph drawing and display logic
 
-    # Map graph index → joint names
+    # map graph index to joint names
     _GRAPH_JOINTS = [
         ['left_ankle', 'right_ankle'],   # 0 = ankle
         ['left_hip',   'right_hip'],     # 1 = hip
@@ -3033,7 +3031,7 @@ class GaitAnalysisDashboard(tk.Tk):
         return [self._canvas_ankle, self._canvas_hip, self._canvas_knee]
 
     def redraw_graphs(self):
-        """Redraw all three joint graphs."""
+        """redraw all three joint graphs."""
         axes    = self._get_graph_axes()
         canvases = self._get_graph_canvases()
         for gi in range(3):
@@ -3041,7 +3039,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._update_graph_limb_btn_visuals()
 
     def _redraw_single_graph(self, gi, ax, mpl_canvas):
-        """Draw one of the three joint graphs (gi=0 ankle, 1 hip, 2 knee)."""
+        """draw one of the three joint graphs (gi=0 ankle, 1 hip, 2 knee)."""
         ax.cla()
         ax.set_facecolor(BG_PLOT)
         ax.grid(False)
@@ -3119,7 +3117,7 @@ class GaitAnalysisDashboard(tk.Tk):
                             max_cycle_length = max(max_cycle_length, len(seg))
 
         if not self.show_overlaid_cycles:
-            # ── Continuous mode ──
+            # continuous mode
             ax.set_xlabel('Frame', fontsize=7)
             ax.tick_params(axis='x', labelbottom=True)
             ax.set_ylabel('')
@@ -3185,7 +3183,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 ax.set_xlim(self._ax_xlim_full[gi])
 
         else:
-            # ── Overlaid cycles mode ──
+            # overlaid cycles mode
             ax.set_xlabel('Frames Since Strike', fontsize=7)
             ax.tick_params(axis='x', labelbottom=True)
             ax.set_ylabel('')
@@ -3295,7 +3293,7 @@ class GaitAnalysisDashboard(tk.Tk):
     def redraw_graph(self):
         self.redraw_graphs()
 
-    # ── video display ──────────────────────────────────────────────────────
+    # video frame display and overlay drawing
 
     def _show_video_frames(self):
             
@@ -3322,11 +3320,11 @@ class GaitAnalysisDashboard(tk.Tk):
                 canvas.create_text(cw//2, ch//2, text="No frame", fill=SUBTEXT, font=("Helvetica", 10))
                 continue
 
-            # ── apply skeleton-based auto-crop ─────────────────────────────
+            # apply skeleton-based auto-crop
             crop = self.datasets[vi].get('crop_rect') if vi < len(self.datasets) else None
             if crop is not None and self.datasets[vi].get('needs_rotation'):
-                # crop is in upright space, frame is sideways — convert back
-                # inverse of 90° CW: x_side = y_up, y_side = 1 - x_up - w_up
+                # crop is in upright space, frame is sideways - convert back
+                # inverse of 90° cw: x_side = y_up, y_side = 1 - x_up - w_up
                 x0, y0, cw_n, ch_n = crop
                 crop_sideways = (y0, 1.0 - x0 - cw_n, ch_n, cw_n)
                 frame = _apply_crop_rect(frame.copy(), crop_sideways)
@@ -3374,7 +3372,7 @@ class GaitAnalysisDashboard(tk.Tk):
             canvas._img = img
             canvas.create_image((cw-nw)//2, (ch-nh)//2, anchor='nw', image=img)
 
-    # ── refresh ────────────────────────────────────────────────────────────
+    # refresh display and graph rendering
 
     def refresh(self):
         self.redraw_graphs()
@@ -3410,7 +3408,7 @@ class GaitAnalysisDashboard(tk.Tk):
             else:     fg = GREEN if val < 0 else RED
             lbl.config(text=txt, fg=fg)
 
-    # ── graph mouse (per-graph index gi) ──────────────────────────────────
+    # graph mouse interaction (per-graph index gi)
 
     def _seek_from_event(self, event, gi):
         ad = self._active_angle_data()
@@ -3531,7 +3529,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 canvases[gi].draw_idle()
         self._status_msg.set("Zoom reset")
 
-    # ── playback ───────────────────────────────────────────────────────────
+    # playback control
 
     def _play_tick(self):
         if not self.playing: return
@@ -3545,7 +3543,7 @@ class GaitAnalysisDashboard(tk.Tk):
             self.playing = False
             self._status_msg.set("Playback finished")
 
-    # ── controls ───────────────────────────────────────────────────────────
+    # ui controls and event handlers
 
     def _prev_frame(self):
         if self.playing: return
@@ -3874,7 +3872,7 @@ class GaitAnalysisDashboard(tk.Tk):
             self._play_after_id = None
         self._enter_marking_phase('left', 0)
 
-    # ── guided step marking screen ─────────────────────────────────────────
+    # guided step marking screen
 
     def _build_markup_screen(self):
         self._markup_frame = tk.Frame(self, bg=BG)
@@ -4153,7 +4151,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._markup_count_lbl.config(
             text=f"{total} {noun} step{'s' if total != 1 else ''} marked", fg=marker_col)
 
-    # ── PDF export ─────────────────────────────────────────────────────────
+    # pdf export dialog
 
     def _generate_pdf(self, output_path, graphs, limbs, measures):
         from reportlab.lib.pagesizes import letter
@@ -4256,7 +4254,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 self._show_excluded_in_pdf = graph_options.get('include_excluded', True)
                 self.redraw_graphs()
                 self.update()
-                # Capture the first graph figure for PDF (ankle as representative)
+                # capture the first graph figure for pdf (ankle as representative)
                 self._fig_ankle.savefig(temp_path, dpi=150, bbox_inches='tight', format='png')
                 gc.collect()
                 time.sleep(0.1)
@@ -4273,7 +4271,7 @@ class GaitAnalysisDashboard(tk.Tk):
             print(f"Error capturing graph: {e}")
             return None
 
-    # ── close ──────────────────────────────────────────────────────────────
+    # close and cleanup
 
     def _on_close(self):
         self._stop_pf = True
@@ -4283,7 +4281,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self.destroy()
 
 
-# ── session temp directory ─────────────────────────────────────────────────
+# session temp directory cleanup
 
 class SessionTempDir:
     def __init__(self):
@@ -4306,7 +4304,7 @@ class SessionTempDir:
     def __exit__(self, *_): self.cleanup()
 
 
-# ── entry point ────────────────────────────────────────────────────────────
+# entry point
 
 def main():
     app = GaitAnalysisDashboard()
