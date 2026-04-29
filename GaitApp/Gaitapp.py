@@ -51,6 +51,8 @@ pyglet.font.add_file(resource_path('Coiny-Cyrillic.ttf'))
 SLOWMO_FPS    = 240
 FILTER_CUTOFF = 6
 FILTER_ORDER  = 3
+# playback: how often to perform a full graph redraw during playback (frames)
+PLAY_FULL_REDRAW_EVERY = 30
 
 # frame storage settings
 SAVE_HEIGHT  = 540
@@ -1478,6 +1480,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
         'all_landmarks':      landmarks,
         'landmark_depths':    df_depths,
         'jittery_frames':     jittery_frames,
+        'total_video_frames': total,
         'needs_rotation':     needs_rotation,
         '_cache_key':         cache_key,
         '_cache_meta':        cache_meta or {},
@@ -1614,6 +1617,30 @@ class FrameCache:
     def clear(self):
         with self._lock:
             self._cache.clear()
+
+
+class DisplayCache:
+    """Caches fully-rendered, display-ready ImageTk.PhotoImage objects.
+    Keys are (ds_idx, frame_idx, canvas_w, canvas_h, show_mode, skeleton_thickness).
+    Must only be read/written from the main thread (Tk requirement for PhotoImage)."""
+    def __init__(self, limit=64):
+        self._cache = OrderedDict()
+        self._limit = limit
+
+    def get(self, key):
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+
+    def put(self, key, photo_image):
+        self._cache[key] = photo_image
+        self._cache.move_to_end(key)
+        if len(self._cache) > self._limit:
+            self._cache.popitem(last=False)
+
+    def clear(self):
+        self._cache.clear()
 
 
 HELP_TEXT = [
@@ -2176,7 +2203,14 @@ class GaitAnalysisDashboard(tk.Tk):
         self._markup_frame        = None
         self._play_after_id       = None
         self._graph_resize_after_id = None
+        self._cycle_frame_indices = [None, None]  # per-dataset frame idx used in cycle mode
         self._graph_dragging      = [False, False, False]   # per-graph
+        self._pending_graph_redraw = False   # throttle flag for scrub redraws
+        self._play_frame_counter   = 0       # count frames between graph redraws during play
+        self._btn_held             = None    # which button is currently held (prev/next)
+        self._btn_hold_after_id    = None
+        self._display_cache        = DisplayCache(limit=128)  # pre-rendered PhotoImage cache
+        self._canvas_image_ids     = [None, None]  # persistent canvas image item ids
         self._exclusion_selecting = [False, False, False]
         self._exclusion_start     = [None, None, None]
         self._graph_limb_btns     = {}
@@ -2184,13 +2218,17 @@ class GaitAnalysisDashboard(tk.Tk):
         # per-graph zoom state (ankle=0, hip=1, knee=2)
         self._ax_xlim_full        = [None, None, None]
         self._ax_xlim_per_mode    = [{}, {}, {}]
+        self._first_graph_draw    = [True, True, True]  # track first draw per graph
+        self._markup_xlim_full    = None  # frame range for markup graph zoom limits
 
+        self._graph_blit_cache  = [None, None, None]  # per-graph: (background, cursor_line) or None
         self._cache     = FrameCache()
         self._stop_pf   = False
         self._pf_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
         self._pf_thread.start()
 
         self._settings_dialog = None
+        self._needs_full_redraw = False
         self._cache_manager_dialog = None
         self._pdf_export_dialog = None
 
@@ -2231,7 +2269,7 @@ class GaitAnalysisDashboard(tk.Tk):
         except FileNotFoundError:
             pass
 
-        title_label = tk.Label(hdr, text="NOVITA GAIT ANALYSIS",
+        title_label = tk.Label(hdr, text="novita gait analysis",
                  font=("Coiny Cyrillic", 17), bg=BG2, fg=ACCENT, cursor="hand2")
         title_label.pack(side='left', pady=(6, 0))
         title_label.bind('<Button-1>', lambda e: self._open_settings())
@@ -2273,6 +2311,10 @@ class GaitAnalysisDashboard(tk.Tk):
         content.grid_rowconfigure(2, weight=1, uniform='row')
         content.grid_columnconfigure(0, weight=1)
         content.grid_columnconfigure(1, weight=2)
+        # bind scroll events at content level to detect which graph is under mouse
+        content.bind('<MouseWheel>', self._on_content_scroll)
+        content.bind('<Button-4>',   self._on_content_scroll)
+        content.bind('<Button-5>',   self._on_content_scroll)
 
         # hip graph (row 0, col 1)
         hip_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
@@ -2285,9 +2327,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._canvas_hip.mpl_connect('button_press_event',   lambda e: self._on_graph_click(e, 1))
         self._canvas_hip.mpl_connect('motion_notify_event',  lambda e: self._on_graph_drag(e, 1))
         self._canvas_hip.mpl_connect('button_release_event', lambda e: self._on_graph_release(e, 1))
-        self._canvas_hip.get_tk_widget().bind('<MouseWheel>', lambda e: self._on_canvas_scroll(e, 1))
-        self._canvas_hip.get_tk_widget().bind('<Button-4>',   lambda e: self._on_canvas_scroll(e, 1))
-        self._canvas_hip.get_tk_widget().bind('<Button-5>',   lambda e: self._on_canvas_scroll(e, 1))
+        self._canvas_hip.mpl_connect('scroll_event',         self._on_mpl_scroll)
 
         # display controls
         btn_panel = tk.Frame(sidebar, bg=BG2)
@@ -2305,9 +2345,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._canvas_knee.mpl_connect('button_press_event',   lambda e: self._on_graph_click(e, 2))
         self._canvas_knee.mpl_connect('motion_notify_event',  lambda e: self._on_graph_drag(e, 2))
         self._canvas_knee.mpl_connect('button_release_event', lambda e: self._on_graph_release(e, 2))
-        self._canvas_knee.get_tk_widget().bind('<MouseWheel>', lambda e: self._on_canvas_scroll(e, 2))
-        self._canvas_knee.get_tk_widget().bind('<Button-4>',   lambda e: self._on_canvas_scroll(e, 2))
-        self._canvas_knee.get_tk_widget().bind('<Button-5>',   lambda e: self._on_canvas_scroll(e, 2))
+        self._canvas_knee.mpl_connect('scroll_event',         self._on_mpl_scroll)
 
         # ankle graph (row 2, col 1)
         ankle_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
@@ -2320,32 +2358,55 @@ class GaitAnalysisDashboard(tk.Tk):
         self._canvas_ankle.mpl_connect('button_press_event',   lambda e: self._on_graph_click(e, 0))
         self._canvas_ankle.mpl_connect('motion_notify_event',  lambda e: self._on_graph_drag(e, 0))
         self._canvas_ankle.mpl_connect('button_release_event', lambda e: self._on_graph_release(e, 0))
-        self._canvas_ankle.get_tk_widget().bind('<MouseWheel>', lambda e: self._on_canvas_scroll(e, 0))
-        self._canvas_ankle.get_tk_widget().bind('<Button-4>',   lambda e: self._on_canvas_scroll(e, 0))
-        self._canvas_ankle.get_tk_widget().bind('<Button-5>',   lambda e: self._on_canvas_scroll(e, 0))
+        self._canvas_ankle.mpl_connect('scroll_event',         self._on_mpl_scroll)
 
         # videos panel (row 0, col 0), spanning all graph rows
         videos_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
         videos_frame.grid(row=0, column=0, rowspan=3, sticky='nsew', padx=(0, 4), pady=(2, 2))
         videos_frame.grid_columnconfigure(0, weight=1)
-        videos_frame.grid_rowconfigure(0, weight=1, uniform='video')
-        videos_frame.grid_rowconfigure(1, weight=1, uniform='video')
+        videos_frame.grid_rowconfigure(0, weight=1)   # video 1
+        videos_frame.grid_rowconfigure(1, weight=0)   # controls strip
+        videos_frame.grid_rowconfigure(2, weight=1)   # video 2
 
+        # --- video 1 ---
         vid1_outer = tk.Frame(videos_frame, bg=BG2)
-        vid1_outer.grid(row=0, column=0, sticky='nsew', padx=0, pady=(0, 2))
+        vid1_outer.grid(row=0, column=0, sticky='nsew', padx=0, pady=(0, 0))
         self._vid1_lbl = tk.Label(vid1_outer, text="VIDEO 1",
                       font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V1, anchor='w')
         self._vid1_lbl.pack(fill='x', padx=4, pady=(2, 0))
         self._vid_canvas1 = tk.Canvas(vid1_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas1.pack(fill='both', expand=True)
 
+        # --- playback controls between the two videos ---
+        vid_ctrl_outer = tk.Frame(videos_frame, bg=BG2)
+        vid_ctrl_outer.grid(row=1, column=0, sticky='ew', padx=0, pady=(2, 2))
+        vid_ctrl_frame = tk.Frame(vid_ctrl_outer, bg=BG2)
+        vid_ctrl_frame.pack(anchor='center')
+        _ctrl_colors = {'Prev': '#4a6fa5', 'Next': '#4a6fa5', 'Play': '#2e7d4f'}
+        for txt, cmd in [("Prev", self._prev_frame), ("Play", self._toggle_play), ("Next", self._next_frame)]:
+            _fg = _ctrl_colors[txt]
+            _pbtn_cfg = dict(
+                bg=BG3, fg=_fg, relief='flat',
+                font=("Helvetica", 9, "bold"), padx=10, pady=1,
+                cursor='hand2', width=5,
+                activebackground=_fg, activeforeground='white',
+                highlightthickness=1, highlightbackground=BG2, highlightcolor=BG2,
+            )
+            b = tk.Button(vid_ctrl_frame, text=txt, command=cmd, **_pbtn_cfg)
+            b.pack(side='left', padx=3)
+            if txt == "Play":
+                self._play_btn = b
+            elif txt in ("Prev", "Next"):
+                b.bind('<ButtonRelease-1>', lambda e: self.after(0, self._flush_graph_redraw))
+
+        # --- video 2 ---
         vid2_outer = tk.Frame(videos_frame, bg=BG2)
-        vid2_outer.grid(row=1, column=0, sticky='nsew', padx=0, pady=(2, 0))
-        self._vid2_lbl = tk.Label(vid2_outer, text="VIDEO 2",
-                      font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
-        self._vid2_lbl.pack(fill='x', padx=4, pady=(2, 0))
+        vid2_outer.grid(row=2, column=0, sticky='nsew', padx=0, pady=(0, 0))
         self._vid_canvas2 = tk.Canvas(vid2_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas2.pack(fill='both', expand=True)
+        self._vid2_lbl = tk.Label(vid2_outer, text="VIDEO 2",
+                      font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
+        self._vid2_lbl.pack(fill='x', padx=4, pady=(0, 2))
 
         self._vid_canvases = [self._vid_canvas1, self._vid_canvas2]
         self._graph_canvas_widgets = [
@@ -2376,19 +2437,9 @@ class GaitAnalysisDashboard(tk.Tk):
         bar = tk.Frame(bottom, bg=BG2)
         bar.pack(fill='x', expand=True, padx=6)
 
-        btn_cfg = dict(bg=BG3, fg=TEXT, relief='flat',
-                       font=("Helvetica", 8), padx=5, pady=1, cursor='hand2',
-                       activebackground=ACCENT, activeforeground='white')
-        for txt, cmd in [("Prev", self._prev_frame), ("Next", self._next_frame), ("Play", self._toggle_play)]:
-            tk.Button(bar, text=txt, command=cmd, **btn_cfg).pack(side='left', padx=2, pady=3)
-
         self._frame_lbl = tk.Label(bar, text="Frame: —",
                                    font=("Helvetica", 8), bg=BG2, fg=SUBTEXT)
         self._frame_lbl.pack(side='right', padx=8)
-
-        status_btn_cfg = dict(bg=BG3, fg=TEXT, relief='flat',
-                      font=("Helvetica", 8), padx=4, pady=0, cursor='hand2',
-                              activebackground=ACCENT, activeforeground='white')
 
         tk.Label(bar, textvariable=self._status_msg,
                  font=("Helvetica", 8), bg=BG2, fg=TEXT, anchor='w'
@@ -2449,7 +2500,16 @@ class GaitAnalysisDashboard(tk.Tk):
 
     def _toggle_graph_joint_visibility(self, joint_name):
         self.joint_visibility[joint_name] = not self.joint_visibility.get(joint_name, True)
+        # update button visuals
         self._update_graph_limb_btn_visuals()
+        # clear any pre-rendered video frames so skeleton visibility change appears immediately
+        try:
+            self._display_cache.clear()
+        except Exception:
+            pass
+        # invalidate graph blit cache to force full redraw (cursor backgrounds stale)
+        self._invalidate_blit_cache()
+        # redraw graphs and video frames
         self.redraw_graphs()
         self._show_video_frames()
 
@@ -2473,6 +2533,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
     def _sync_graph_canvas_sizes(self):
         self._graph_resize_after_id = None
+        self._graph_blit_cache = [None, None, None]  # pixel backgrounds are stale after resize
         dims = []
         for widget in getattr(self, '_graph_canvas_widgets', []):
             w, h = widget.winfo_width(), widget.winfo_height()
@@ -2805,22 +2866,24 @@ class GaitAnalysisDashboard(tk.Tk):
                     ds['angle_data'] = ds[key]
             self.angle_data         = self.datasets[0].get(key, self.datasets[0]['angle_data'])
             self.total_frames = max(len(results[0]['all_landmarks']), len(results[1]['all_landmarks']))
+            self.total_video_frames = max(results[0].get('total_video_frames', self.total_frames), results[1].get('total_video_frames', self.total_frames))
             min_video_frames = min(len(results[0]['all_landmarks']), len(results[1]['all_landmarks']))
             self.current_frame_idx = 0
+            self._cycle_frame_indices = [None, None]
             if not self.angle_data.empty:
                 data_min = self.angle_data['frame_num'].min()
-                full = (data_min, data_min + min_video_frames)
+                full = (data_min, data_min + self.total_video_frames)  # use full video frame count for continuous mode
                 self._ax_xlim_full = [full, full, full]
                 for gi in range(3):
-                    self._ax_xlim_per_mode[gi]['both'] = full
+                    self._ax_xlim_per_mode[gi]['both'] = (data_min, data_min + self.total_video_frames)  # full video length
                     for idx, ds in enumerate(results[:2]):
-                        v_frames = len(ds['all_landmarks'])
+                        v_frames = ds.get('total_video_frames', len(ds['all_landmarks']))
                         self._ax_xlim_per_mode[gi][f'v{idx+1}'] = (data_min, data_min + v_frames)
             self.progress = 1.0
             self.show_overlaid_cycles = False
             self.resample_cycles = False
             cached_loaded = self._resolve_cached_markup()
-            auto_excl_count = self._auto_exclude_bad_regions(overwrite=False)
+            # auto_excl_count = self._auto_exclude_bad_regions(overwrite=False)  # disabled - trigger with F4 instead
             if self._start_required_markup_flow():
                 return
             self.show_overlaid_cycles = True
@@ -2832,10 +2895,8 @@ class GaitAnalysisDashboard(tk.Tk):
             self.after(60, self._show_video_frames)
             if cached_loaded:
                 self._status_msg.set("Loaded cached steps")
-            elif auto_excl_count:
-                self._status_msg.set(f"Loaded analysis with {auto_excl_count} auto exclusion zones")
             else:
-                self._status_msg.set("Loaded analysis")
+                self._status_msg.set("Loaded analysis (press F4 to auto-exclude bad regions)")
 
         for t in scan_threads:
             t.start()
@@ -2844,11 +2905,6 @@ class GaitAnalysisDashboard(tk.Tk):
     # key bindings
 
     def _bind_keys(self):
-        for canvas in [self._canvas_ankle.get_tk_widget(),
-                       self._canvas_hip.get_tk_widget(),
-                       self._canvas_knee.get_tk_widget()]:
-            canvas.bind('<MouseWheel>', lambda e, gi=0: self._on_canvas_scroll(e, gi))
-
         shortcuts = {
             '<Key-1>': self._prev_frame,
             '<Key-2>': self._next_frame,
@@ -2870,6 +2926,7 @@ class GaitAnalysisDashboard(tk.Tk):
             'z': self._reset_zoom,
             '<Alt-c>': self._toggle_confidence,
             '<F3>': self._toggle_ankle_norm_offset,
+            '<F4>': self._manual_auto_exclude,
         }
 
         for seq, fn in shortcuts.items():
@@ -3031,15 +3088,55 @@ class GaitAnalysisDashboard(tk.Tk):
         return [self._canvas_ankle, self._canvas_hip, self._canvas_knee]
 
     def redraw_graphs(self):
-        """redraw all three joint graphs."""
-        axes    = self._get_graph_axes()
+        """Redraw all three joint graphs, then snapshot blit backgrounds for all three."""
+        axes     = self._get_graph_axes()
         canvases = self._get_graph_canvases()
+        figs     = [self._fig_ankle, self._fig_hip, self._fig_knee]
+        bottom_pad = 0.11
+
+        # Step 1: build all three axes (static content + animated cursor artist)
         for gi in range(3):
             self._redraw_single_graph(gi, axes[gi], canvases[gi])
+
+        # Step 2: for each graph, render via the figure renderer directly (no Tk event pump),
+        # snapshot the background without the cursor, then blit the cursor on top.
+        # Build the entire new cache before assigning so it is always fully warm or fully cold.
+        new_cache = [None, None, None]
+        for gi in range(3):
+            ax     = axes[gi]
+            canvas = canvases[gi]
+            fig    = figs[gi]
+            fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.18)
+
+            cursor_line = next(
+                (l for l in ax.lines if getattr(l, '_is_cursor', False)), None)
+
+            try:
+                _ = fig.canvas.renderer
+                if cursor_line is not None:
+                    cursor_line.set_visible(False)
+                    fig.draw(fig.canvas.renderer)
+                    bg = canvas.copy_from_bbox(fig.bbox)  # full figure, not just ax
+                    cursor_line.set_visible(True)
+                    ax.draw_artist(cursor_line)
+                    canvas.blit(fig.bbox)
+                    new_cache[gi] = (bg, cursor_line)
+                else:
+                    fig.draw(fig.canvas.renderer)
+                    canvas.blit(fig.bbox)
+            except Exception:
+                canvas.draw_idle()
+
+        self._graph_blit_cache = new_cache
         self._update_graph_limb_btn_visuals()
 
     def _redraw_single_graph(self, gi, ax, mpl_canvas):
         """draw one of the three joint graphs (gi=0 ankle, 1 hip, 2 knee)."""
+        self._graph_blit_cache[gi] = None  # static content is changing; invalidate blit cache
+        # preserve current zoom level if zoomed (but not on initial draw)
+        is_first_draw = self._first_graph_draw[gi]
+        current_xlim = ax.get_xlim() if not is_first_draw else None
+        
         ax.cla()
         ax.set_facecolor(BG_PLOT)
         ax.grid(False)
@@ -3047,11 +3144,12 @@ class GaitAnalysisDashboard(tk.Tk):
             spine.set_color(BG2)
         ax.tick_params(colors=SUBTEXT, labelsize=7, length=0)
         ax.tick_params(axis='y', labelleft=False)
-        ax.xaxis.label.set_color(SUBTEXT)
         ax.set_ylabel('')
 
         joint_names = self._GRAPH_JOINTS[gi]
         norm_key    = self._GRAPH_NORM_KEY[gi]
+
+        # heading will be drawn above the axes after figure layout is final
 
         if self.angle_data is None or self.angle_data.empty:
             ax.set_xlabel('')
@@ -3115,10 +3213,22 @@ class GaitAnalysisDashboard(tk.Tk):
                         seg = ad_f[(ad_f['frame_num'] >= strikes[i]) & (ad_f['frame_num'] <= strikes[i+1])]
                         if not seg.empty:
                             max_cycle_length = max(max_cycle_length, len(seg))
+        else:
+            longest_video_frames = 0
+            for _ds in self.datasets:
+                if _ds:
+                    _vf = _ds.get('total_video_frames', len(_ds.get('all_landmarks', [])))
+                    longest_video_frames = max(longest_video_frames, _vf)
+            if longest_video_frames == 0 and not self.angle_data.empty:
+                try:
+                    longest_video_frames = int(self.angle_data['frame_num'].max())
+                except Exception:
+                    longest_video_frames = 0
+            self._ax_xlim_full[gi] = (0, longest_video_frames)
 
         if not self.show_overlaid_cycles:
             # continuous mode
-            ax.set_xlabel('Frame', fontsize=7)
+            ax.set_xlabel('Frame', fontsize=7, color=SUBTEXT)
             ax.tick_params(axis='x', labelbottom=True)
             ax.set_ylabel('')
             continuous_y_vals = []
@@ -3149,14 +3259,27 @@ class GaitAnalysisDashboard(tk.Tk):
                     finite_vals = values[np.isfinite(values)]
                     if finite_vals.size:
                         continuous_y_vals.append(finite_vals)
+                    # plot segments: excluded regions as gray, non-excluded as normal color
                     if excluded and show_excluded:
-                        gray_vals = values.copy()
-                        gray_vals[~excl_mask] = np.nan
-                        ax.plot(frames, gray_vals, color='#999999', lw=1.0, alpha=0.5, linestyle=ls, zorder=2)
-                    clean_vals = values.copy()
-                    if excluded and show_excluded:
-                        clean_vals[excl_mask] = np.nan
-                    ax.plot(frames, clean_vals, color=col, lw=1.3, alpha=0.85, linestyle=ls, zorder=3)
+                        # find contiguous segments of excluded and non-excluded regions
+                        segment_starts = [0]
+                        for i in range(1, len(excl_mask)):
+                            if excl_mask[i] != excl_mask[i-1]:
+                                segment_starts.append(i)
+                        segment_starts.append(len(excl_mask))
+                        # plot each segment with appropriate color
+                        for i in range(len(segment_starts)-1):
+                            seg_start, seg_end = segment_starts[i], segment_starts[i+1]
+                            seg_frames = frames[seg_start:seg_end]
+                            seg_vals = values[seg_start:seg_end]
+                            seg_is_excluded = excl_mask[seg_start]
+                            seg_color = '#888888' if seg_is_excluded else col
+                            seg_alpha = 0.6 if seg_is_excluded else 0.85
+                            seg_lw = 1.0 if seg_is_excluded else 1.3
+                            ax.plot(seg_frames, seg_vals, color=seg_color, lw=seg_lw, alpha=seg_alpha, linestyle=ls, zorder=3)
+                    else:
+                        # no exclusions: plot all normally
+                        ax.plot(frames, values, color=col, lw=1.3, alpha=0.85, linestyle=ls, zorder=3)
 
                 nsteps  = _to_fnums(ad_f, sf)
                 fn_min  = int(ad['frame_num'].min())
@@ -3170,7 +3293,8 @@ class GaitAnalysisDashboard(tk.Tk):
             ref_ad = ref_ds['angle_data'] if ref_ds else self.angle_data
             if ref_ad is not None and not ref_ad.empty and self.current_frame_idx < len(ref_ad):
                 cf = ref_ad['frame_num'].iloc[self.current_frame_idx]
-                ax.axvline(cf, color=C_CURSOR, lw=1.5, linestyle='--', zorder=10)
+                line = ax.axvline(cf, color=C_CURSOR, lw=1.5, linestyle='--', zorder=10, animated=True)
+                line._is_cursor = True
 
             if continuous_y_vals:
                 merged_y = np.concatenate(continuous_y_vals)
@@ -3179,12 +3303,20 @@ class GaitAnalysisDashboard(tk.Tk):
                     y_pad = 0.08 * (y_max - y_min) if y_max > y_min else max(2.0, abs(y_max) * 0.08)
                     ax.set_ylim(y_min - y_pad, y_max + y_pad)
 
-            if self._ax_xlim_full[gi] is not None:
-                ax.set_xlim(self._ax_xlim_full[gi])
+            _full = self._ax_xlim_full[gi]
+            if _full is not None:
+                if not is_first_draw and current_xlim is not None:
+                    _is_zoomed = not (abs(current_xlim[0] - _full[0]) < 1e-6 and
+                                      abs(current_xlim[1] - _full[1]) < 1e-6)
+                    ax.set_xlim(current_xlim if _is_zoomed else _full)
+                else:
+                    ax.set_xlim(_full)
+            if is_first_draw:
+                self._first_graph_draw[gi] = False
 
         else:
             # overlaid cycles mode
-            ax.set_xlabel('Frames Since Strike', fontsize=7)
+            ax.set_xlabel('Gait Cycle Percentage (%)', fontsize=7, color=SUBTEXT)
             ax.tick_params(axis='x', labelbottom=True)
             ax.set_ylabel('')
 
@@ -3246,7 +3378,8 @@ class GaitAnalysisDashboard(tk.Tk):
                                 y_plot = interp1d(t, y)(np.linspace(0, 1, max_cycle_length))
                                 y_plot = _cycle_plot_transform(y_plot)
                                 plot_col = C_OUTLIER if not rmse_good else col
-                                ax.plot(np.arange(max_cycle_length), y_plot,
+                                x_pct = np.linspace(0, 100, max_cycle_length)
+                                ax.plot(x_pct, y_plot,
                                         color=plot_col, alpha=0.2 if not rmse_good else 0.25,
                                         lw=0.6, linestyle=ls)
                         else:
@@ -3268,109 +3401,167 @@ class GaitAnalysisDashboard(tk.Tk):
                             if self.align_cycle_angles and len(mean_c2):
                                 start = mean_c2[0]
                                 mean_c2 -= start; se_c  # se stays relative
-                            x_plot = np.arange(len(mean_c2))
+                            x_plot = np.linspace(0, 100, len(mean_c2))
                             if self.graph_display_mode == 'se_shading':
                                 ax.fill_between(x_plot, mean_c2-se_c, mean_c2+se_c, color=col, alpha=0.15, zorder=2)
                             ax.plot(x_plot, mean_c2, color=col, lw=2.0, linestyle=ls, zorder=3)
 
             if self.resample_cycles and self.show_normative:
-                norm_x = np.linspace(0, max_cycle_length, 100)
+                norm_x = np.linspace(0, 100, len(NORMATIVE_GAIT[norm_key]['mean']))
                 d = NORMATIVE_GAIT[norm_key]
                 norm_mean = np.asarray(d['mean'])
                 if self.align_cycle_angles and len(norm_mean):
                     norm_mean = norm_mean - norm_mean[0]
                 ax.plot(norm_x, norm_mean, color=C_NORM, lw=1.4, linestyle='-', alpha=0.8, zorder=2)
 
-            ax.set_xlim(0, max_cycle_length)
+            # draw red cursor line in cycle mode: find current frame's phase %
+            cursor_pct = self._get_cycle_cursor_pct()
+            if cursor_pct is not None:
+                line = ax.axvline(cursor_pct, color=C_CURSOR, lw=1.5, linestyle='--', zorder=10, animated=True)
+                line._is_cursor = True
+
+            # preserve zoom level if user has zoomed (but not on initial draw)
+            if not is_first_draw and current_xlim is not None:
+                is_zoomed = not (abs(current_xlim[0]) < 1e-6 and abs(current_xlim[1] - 100) < 1e-6)
+                if is_zoomed:
+                    ax.set_xlim(current_xlim)
+                else:
+                    ax.set_xlim(0, 100)
+            else:
+                ax.set_xlim(0, 100)  # initial draw - always show full (0-100%)
+            if is_first_draw:
+                self._first_graph_draw[gi] = False  # mark first draw as done
 
         fig = [self._fig_ankle, self._fig_hip, self._fig_knee][gi]
-        # tighter margins so plots fill their containers
-        bottom_pad = 0.11
-        fig.subplots_adjust(left=0.02, right=0.98, top=0.97, bottom=bottom_pad)
-        mpl_canvas.draw_idle()
+        # tighter margins so plots fill their containers; keep a little top margin for heading
+        fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.18)
+        # draw a figure-level heading above this axes so it sits outside the plot area
+        try:
+            for _t in fig.texts[:]:
+                _t.remove()
+            bbox = ax.get_position()
+            cx = bbox.x0 + bbox.width * 0.5
+            fig.text(cx, bbox.y1 + 0.02, f"{norm_key.capitalize()} Angle",
+                     ha='center', va='bottom', color=SUBTEXT, fontsize=7, zorder=20)
+        except Exception:
+            pass
+        # note: canvas.draw() / blit is handled by redraw_graphs() after all three graphs are drawn
 
     # convenience alias kept for markup screen
     def redraw_graph(self):
         self.redraw_graphs()
 
-    # video frame display and overlay drawing
+    def _render_video_frame(self, vi, frame_idx, cw, ch):
+        """Render one video frame to a display-ready ImageTk.PhotoImage.
+        Returns (photo_image, x_offset, y_offset) or None."""
+        if vi >= len(self.datasets):
+            return None
+        store = self.datasets[vi].get('all_landmarks', [])
+        if not (0 <= frame_idx < len(store)):
+            return None
+        entry = store[frame_idx]
+        frame = self._cache.get(vi, frame_idx, store)
+        if frame is None:
+            return None
+        pixel_lm = entry[1] if isinstance(entry, tuple) else None
+
+        # crop
+        crop = self.datasets[vi].get('crop_rect')
+        if crop is not None and self.datasets[vi].get('needs_rotation'):
+            x0, y0, cw_n, ch_n = crop
+            crop_sideways = (y0, 1.0 - x0 - cw_n, ch_n, cw_n)
+            frame = _apply_crop_rect(frame.copy(), crop_sideways)
+            if pixel_lm is not None:
+                sx0, sy0, scw, sch = crop_sideways
+                pixel_lm = [SimpleLandmark(
+                    (lm.x - sx0) / scw if scw > 0 else lm.x,
+                    (lm.y - sy0) / sch if sch > 0 else lm.y,
+                    lm.visibility) for lm in pixel_lm]
+        elif crop is not None:
+            frame = _apply_crop_rect(frame.copy(), crop)
+            if pixel_lm is not None:
+                x0, y0, cw_n, ch_n = crop
+                pixel_lm = [SimpleLandmark(
+                    (lm.x - x0) / cw_n if cw_n > 0 else lm.x,
+                    (lm.y - y0) / ch_n if ch_n > 0 else lm.y,
+                    lm.visibility) for lm in pixel_lm]
+
+        # skeleton overlay
+        jittery_frames = self.datasets[vi].get('jittery_frames', set()) if self.remove_jitter_frames else set()
+        is_jittery = frame_idx in jittery_frames
+        if pixel_lm is not None and not (is_jittery and not self.show_jitter_frames):
+            frame = frame.copy()
+            draw_pose_landmarks_on_frame(frame, pixel_lm, self.joint_visibility,
+                                         skeleton_thickness=self.skeleton_thickness,
+                                         draw_jitter_red=is_jittery and self.show_jitter_frames)
+
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        show_v1 = self.graph_show_mode in ('v1', 'both')
+        show_v2 = self.graph_show_mode in ('v2', 'both')
+        is_inactive = (vi == 0 and not show_v1) or (vi == 1 and not show_v2)
+        if is_inactive:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            rgb  = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+
+        fh, fw = rgb.shape[:2]
+        scale = min(cw / fw, ch / fh)
+        nw, nh = max(1, int(fw * scale)), max(1, int(fh * scale))
+        rgb = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        img = ImageTk.PhotoImage(Image.fromarray(rgb))
+        x_off = (cw - nw) // 2
+        y_off = (ch - nh) // 2
+        return (img, x_off, y_off)
 
     def _show_video_frames(self):
-            
         for vi, canvas in enumerate(self._vid_canvases):
             cw = canvas.winfo_width()
             ch = canvas.winfo_height()
-            if cw < 2 or ch < 2: continue
-
-            frame = None
-            pixel_lm = None
-            if vi < len(self.datasets):
-                store = self.datasets[vi].get('all_landmarks', [])
-                entry = None
-                if 0 <= self.current_frame_idx < len(store):
-                    entry = store[self.current_frame_idx]
-                if isinstance(entry, tuple):
-                    frame = self._cache.get(vi, self.current_frame_idx, store)
-                    pixel_lm = entry[1]
-                else:
-                    frame = self._cache.get(vi, self.current_frame_idx, store)
-
-            canvas.delete('all')
-            if frame is None:
-                canvas.create_text(cw//2, ch//2, text="No frame", fill=SUBTEXT, font=("Helvetica", 10))
+            if cw < 2 or ch < 2:
                 continue
 
-            # apply skeleton-based auto-crop
-            crop = self.datasets[vi].get('crop_rect') if vi < len(self.datasets) else None
-            if crop is not None and self.datasets[vi].get('needs_rotation'):
-                # crop is in upright space, frame is sideways - convert back
-                # inverse of 90° cw: x_side = y_up, y_side = 1 - x_up - w_up
-                x0, y0, cw_n, ch_n = crop
-                crop_sideways = (y0, 1.0 - x0 - cw_n, ch_n, cw_n)
-                frame = _apply_crop_rect(frame.copy(), crop_sideways)
-                if pixel_lm is not None:
-                    sx0, sy0, scw, sch = crop_sideways
-                    pixel_lm = [SimpleLandmark(
-                                    (lm.x - sx0) / scw if scw > 0 else lm.x,
-                                    (lm.y - sy0) / sch if sch > 0 else lm.y,
-                                    lm.visibility)
-                                for lm in pixel_lm]
-            elif crop is not None:
-                frame = _apply_crop_rect(frame.copy(), crop)
-                if pixel_lm is not None:
-                    x0, y0, cw_n, ch_n = crop
-                    pixel_lm = [SimpleLandmark(
-                                    (lm.x - x0) / cw_n if cw_n > 0 else lm.x,
-                                    (lm.y - y0) / ch_n if ch_n > 0 else lm.y,
-                                    lm.visibility)
-                                for lm in pixel_lm]
+            # pick frame index
+            if self.show_overlaid_cycles and vi < len(self._cycle_frame_indices) and self._cycle_frame_indices[vi] is not None:
+                frame_idx = self._cycle_frame_indices[vi]
+            else:
+                frame_idx = self.current_frame_idx
 
-            jittery_frames = self.datasets[vi].get('jittery_frames', set()) if self.remove_jitter_frames else set()
-            is_jittery = self.current_frame_idx in jittery_frames
-            if pixel_lm is not None:
-                if not (is_jittery and not self.show_jitter_frames):
-                    frame = frame.copy()
-                    draw_pose_landmarks_on_frame(frame, pixel_lm, self.joint_visibility,
-                                                 skeleton_thickness=self.skeleton_thickness,
-                                                 draw_jitter_red=is_jittery and self.show_jitter_frames)
+            # build display-cache key (includes all rendering params that affect appearance)
+            sk = round(self.skeleton_thickness * 2) / 2  # quantise to 0.5 steps
+            dc_key = (vi, frame_idx, cw, ch, self.graph_show_mode, sk,
+                      self.remove_jitter_frames, self.show_jitter_frames)
 
-            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = self._display_cache.get(dc_key)
+            if result is None:
+                if vi >= len(self.datasets):
+                    canvas.delete('all')
+                    canvas.create_text(cw // 2, ch // 2, text="No frame", fill=SUBTEXT, font=("Helvetica", 10))
+                    self._canvas_image_ids[vi] = None
+                    continue
+                result = self._render_video_frame(vi, frame_idx, cw, ch)
+                if result is None:
+                    canvas.delete('all')
+                    canvas.create_text(cw // 2, ch // 2, text="No frame", fill=SUBTEXT, font=("Helvetica", 10))
+                    self._canvas_image_ids[vi] = None
+                    continue
+                self._display_cache.put(dc_key, result)
 
-            show_v1 = self.graph_show_mode in ('v1', 'both')
-            show_v2 = self.graph_show_mode in ('v2', 'both')
-            is_inactive = (vi == 0 and not show_v1) or (vi == 1 and not show_v2)
-            if is_inactive:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                rgb  = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+            img, x_off, y_off = result
+            # reuse existing canvas image item if possible — avoids full canvas clear/recreate
+            if self._canvas_image_ids[vi] is not None:
+                try:
+                    canvas.itemconfigure(self._canvas_image_ids[vi], image=img)
+                    canvas.coords(self._canvas_image_ids[vi], x_off, y_off)
+                    canvas._img = img  # keep reference
+                    continue
+                except Exception:
+                    self._canvas_image_ids[vi] = None
 
-            fh, fw = rgb.shape[:2]
-            scale  = min(cw/fw, ch/fh)
-            nw, nh = int(fw*scale), int(fh*scale)
-            rgb    = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
-            img    = ImageTk.PhotoImage(Image.fromarray(rgb))
+            canvas.delete('all')
+            item_id = canvas.create_image(x_off, y_off, anchor='nw', image=img)
             canvas._img = img
-            canvas.create_image((cw-nw)//2, (ch-nh)//2, anchor='nw', image=img)
+            self._canvas_image_ids[vi] = item_id
 
     # refresh display and graph rendering
 
@@ -3411,14 +3602,230 @@ class GaitAnalysisDashboard(tk.Tk):
     # graph mouse interaction (per-graph index gi)
 
     def _seek_from_event(self, event, gi):
-        ad = self._active_angle_data()
-        if ad is None or ad.empty or event.xdata is None: return
-        fn  = ad['frame_num'].to_numpy()
-        idx = int(np.argmin(np.abs(fn - event.xdata)))
-        self.current_frame_idx = max(0, min(idx, len(ad)-1))
+        if event.xdata is None:
+            return
+        if self.show_overlaid_cycles:
+            self._seek_cycle_by_pct(event.xdata)
+        else:
+            ad = self._active_angle_data()
+            if ad is None or ad.empty:
+                return
+            fn  = ad['frame_num'].to_numpy()
+            idx = int(np.argmin(np.abs(fn - event.xdata)))
+            self.current_frame_idx = max(0, min(idx, len(ad)-1))
+        # fast path: update video frames immediately
         self._show_video_frames()
         self._update_status()
+        # use blit to move only the cursor line — no full redraw needed during scrub
+        self._update_cursor_blit()
+
+    def _flush_graph_redraw(self):
+        """Force an immediate full graph redraw, cancelling any pending idle redraw."""
+        self._pending_graph_redraw = False
         self.redraw_graphs()
+
+    def _do_pending_graph_redraw(self):
+        self._pending_graph_redraw = False
+        self.redraw_graphs()
+
+    def _invalidate_blit_cache(self):
+        """Call whenever the static graph content changes (mode, steps, zoom, data)."""
+        self._graph_blit_cache = [None, None, None]
+
+    def _update_cursor_blit(self):
+        """Fast cursor-only update using blit for all 3 graphs simultaneously.
+        If the blit cache is cold for any graph, schedules a full redraw instead."""
+        all_warm = all(self._graph_blit_cache[gi] is not None for gi in range(3))
+        if not all_warm:
+            if not self._pending_graph_redraw:
+                self._pending_graph_redraw = True
+                self.after_idle(self._do_pending_graph_redraw)
+            return
+        axes     = self._get_graph_axes()
+        canvases = self._get_graph_canvases()
+        # Compute cursor positions before touching any canvas (avoid reentrance).
+        if self.show_overlaid_cycles:
+            new_x = self._get_cycle_cursor_pct()
+        else:
+            ad = self._active_angle_data()
+            if ad is None or ad.empty:
+                new_x = None
+            else:
+                new_x = float(ad['frame_num'].iloc[
+                    max(0, min(self.current_frame_idx, len(ad) - 1))])
+        if new_x is None:
+            return
+        try:
+            for gi in range(3):
+                bg, cursor_line = self._graph_blit_cache[gi]
+                canvas = canvases[gi]
+                ax     = axes[gi]
+                fig    = [self._fig_ankle, self._fig_hip, self._fig_knee][gi]
+                cursor_line.set_xdata([new_x, new_x])
+                canvas.restore_region(bg)
+                ax.draw_artist(cursor_line)
+                canvas.blit(fig.bbox)
+        except Exception:
+            self._graph_blit_cache = [None, None, None]
+            if not self._pending_graph_redraw:
+                self._pending_graph_redraw = True
+                self.after_idle(self._do_pending_graph_redraw)
+
+    def _get_cycle_info(self, ds=None):
+        """Compute cycle info for a single dataset. Returns tuple or None."""
+        if ds is None:
+            ds = self._active_ds()
+        if ds is None:
+            return None
+        ad = ds.get('angle_data')
+        if ad is None or ad.empty:
+            return None
+        sf = ds.get('step_frames', [])
+        excluded = ds.get('excluded_regions', [])
+        ad_f = self._get_filtered_angle_data(ad, excluded)
+
+        def _to_fnums(ad_src, step_frames):
+            if not step_frames: return []
+            fn     = ad_src['frame_num'].to_numpy(dtype=int)
+            fn_set = set(fn.tolist())
+            vals   = [int(v) for v, _ in step_frames]
+            if sum(1 for v in vals if v in fn_set) >= max(1, len(vals)//2):
+                mapped = [(int(v), s) for v, s in step_frames if int(v) in fn_set]
+            else:
+                mapped = [(int(fn[int(v)]), s) for v, s in step_frames if 0 <= int(v) < len(fn)]
+            mapped.sort(key=lambda x: x[0])
+            return mapped
+
+        norm = _to_fnums(ad_f, sf)
+        if not norm:
+            return None
+
+        # pick a reference joint — use the knee as the reference for cycle matching
+        joint_names = self._GRAPH_JOINTS[2]
+        jn = joint_names[0]
+        for j in joint_names:
+            if j in ad.columns and self.joint_visibility.get(j, True):
+                jn = j
+                break
+
+        side = 'left' if jn.startswith('left_') else 'right'
+        strikes = [f for f, s in norm if s == side]
+        if len(strikes) < 2:
+            other = 'right' if side == 'left' else 'left'
+            strikes = [f for f, s in norm if s == other]
+        if len(strikes) < 2:
+            return None
+
+        # collect valid segments (non-excluded)
+        raw_segs = []
+        for i in range(len(strikes) - 1):
+            if self._region_crosses_exclusion(strikes[i], strikes[i+1], excluded):
+                continue
+            seg = ad_f[(ad_f['frame_num'] >= strikes[i]) & (ad_f['frame_num'] <= strikes[i+1])]
+            if not seg.empty and len(seg) >= 2:
+                raw_segs.append((strikes[i], strikes[i+1], seg))
+
+        if not raw_segs:
+            return None
+
+        lengths = [len(s) for _, _, s in raw_segs]
+        med = np.median(lengths)
+        length_ok = [(0.8 * med <= len(s) <= 1.2 * med) for _, _, s in raw_segs]
+
+        # compute max_cycle_length from length-ok segs BEFORE any resampling
+        ok_lengths = [len(s) for (_, _, s), ok in zip(raw_segs, length_ok) if ok]
+        max_cycle_length = max(self.resample_length, max(ok_lengths)) if ok_lengths else self.resample_length
+
+        # compute mean cycle
+        mean_c = None
+        if self.resample_cycles and jn in ad_f.columns:
+            inliers = []
+            for (_, _, seg), ok in zip(raw_segs, length_ok):
+                if not ok: continue
+                y = seg[jn].values
+                t = np.linspace(0, 1, len(y))
+                inliers.append(interp1d(t, y)(np.linspace(0, 1, max_cycle_length)))
+            if inliers:
+                mean_c = np.nanmean(np.vstack(inliers), axis=0)
+
+        fn_all = ad['frame_num'].to_numpy(dtype=int)
+        return (raw_segs, length_ok, mean_c, max_cycle_length, jn, fn_all, ad, ad_f, excluded)
+
+    def _get_cycle_cursor_pct(self):
+        """Return the phase % (0-100) of current frame, averaged across both datasets."""
+        pcts = []
+        for ds_idx, ds in enumerate(self.datasets[:2]):
+            info = self._get_cycle_info(ds)
+            if info is None:
+                continue
+            raw_segs, length_ok, mean_c, max_cycle_length, jn, fn_all, ad, ad_f, excluded = info
+            # use per-dataset frame index if set, else fall back to current_frame_idx
+            if self._cycle_frame_indices[ds_idx] is not None:
+                frame_idx = self._cycle_frame_indices[ds_idx]
+            else:
+                frame_idx = self.current_frame_idx
+            if frame_idx >= len(ad):
+                continue
+            cf = int(ad['frame_num'].iloc[frame_idx])
+            for start_f, end_f, seg in raw_segs:
+                cycle_frames = seg['frame_num'].values
+                if cf in cycle_frames:
+                    j = int(np.where(cycle_frames == cf)[0][0])
+                    cycle_len = len(cycle_frames)
+                    pcts.append((j / max(cycle_len - 1, 1)) * 100.0)
+                    break
+        return float(np.mean(pcts)) if pcts else None
+
+    def _seek_cycle_by_pct(self, pct):
+        """In cycle view: for each dataset independently, find the best-RMSE cycle
+        and seek to the frame at the given phase %. Sets per-dataset indices."""
+        pct = max(0.0, min(100.0, pct))
+        found_any = False
+        for ds_idx, ds in enumerate(self.datasets[:2]):
+            info = self._get_cycle_info(ds)
+            if info is None:
+                continue
+            raw_segs, length_ok, mean_c, max_cycle_length, jn, fn_all, ad, ad_f, excluded = info
+
+            # find the cycle with lowest RMSE vs. mean (most representative)
+            best_cycle_seg = None
+            if mean_c is not None and self.resample_cycles:
+                best_rmse = float('inf')
+                for (start_f, end_f, seg), ok in zip(raw_segs, length_ok):
+                    if not ok:
+                        continue
+                    y = seg[jn].values
+                    rmse = _compute_cycle_rmse(y, mean_c, max_cycle_length)
+                    if rmse < best_rmse:
+                        best_rmse = rmse
+                        best_cycle_seg = seg
+
+            # fall back to first valid cycle
+            if best_cycle_seg is None:
+                for (start_f, end_f, seg), ok in zip(raw_segs, length_ok):
+                    if ok:
+                        best_cycle_seg = seg
+                        break
+            if best_cycle_seg is None and raw_segs:
+                best_cycle_seg = raw_segs[0][2]
+            if best_cycle_seg is None:
+                continue
+
+            # find the frame at the target phase % within this cycle
+            cycle_frames = best_cycle_seg['frame_num'].values
+            cycle_len = len(cycle_frames)
+            target_j = int(round(pct / 100.0 * max(cycle_len - 1, 0)))
+            target_j = max(0, min(target_j, cycle_len - 1))
+            target_frame = int(cycle_frames[target_j])
+
+            # find its index in the full angle_data array
+            matches = np.where(fn_all == target_frame)[0]
+            if len(matches):
+                self._cycle_frame_indices[ds_idx] = int(matches[0])
+                if ds_idx == 0:
+                    # keep current_frame_idx in sync with dataset 0 for status bar etc.
+                    self.current_frame_idx = int(matches[0])
+                found_any = True
 
     def _on_graph_click(self, event, gi):
         axes = self._get_graph_axes()
@@ -3463,7 +3870,32 @@ class GaitAnalysisDashboard(tk.Tk):
             self._exclusion_selecting[gi] = False
             self._exclusion_start[gi] = None
 
-    def _on_canvas_scroll(self, event, gi):
+    def _get_graph_index_from_axes(self, ax):
+        """map axes object to graph index (ankle=0, hip=1, knee=2)"""
+        if ax is self._ax_ankle:
+            return 0
+        elif ax is self._ax_hip:
+            return 1
+        elif ax is self._ax_knee:
+            return 2
+        return None
+
+    def _on_mpl_scroll(self, event):
+        if self.angle_data is None or self.angle_data.empty: return
+        if self.show_overlaid_cycles: return
+        if event.inaxes is None: return
+        gi = self._get_graph_index_from_axes(event.inaxes)
+        if gi is None: return
+        scroll_dir = 1 if event.button == 'up' else -1
+        ctrl_held = bool(event.key == 'control')
+        mouse_x = event.xdata  # data coordinates
+        if ctrl_held:
+            self._on_graph_zoom(scroll_dir, gi, mouse_x)
+        else:
+            self._on_graph_pan(scroll_dir, gi)
+
+    def _on_content_scroll(self, event):
+        """handle scroll events from content frame, detect which graph is under mouse"""
         if self.angle_data is None or self.angle_data.empty: return
         if self.show_overlaid_cycles: return
         if hasattr(event, 'delta'):
@@ -3473,8 +3905,45 @@ class GaitAnalysisDashboard(tk.Tk):
         else:
             return
         ctrl_held = bool(event.state & 0x0004)
+        # determine which graph frame is under the mouse
+        widget = event.widget.winfo_containing(event.x_root, event.y_root)
+        if widget is None: return
+        # trace up to find which graph frame we're in
+        gi = None
+        canvas_widget = None
+        current = widget
+        while current:
+            if current == self._canvas_hip.get_tk_widget():
+                gi = 1
+                canvas_widget = current
+                break
+            elif current == self._canvas_knee.get_tk_widget():
+                gi = 2
+                canvas_widget = current
+                break
+            elif current == self._canvas_ankle.get_tk_widget():
+                gi = 0
+                canvas_widget = current
+                break
+            current = current.master if hasattr(current, 'master') else None
+        if gi is None: return
+        # convert mouse position to data coordinates
+        ax = self._get_ax_for(gi)
+        canvas_widget = self._get_canvas_for(gi).get_tk_widget()
+        # get mouse position relative to canvas
+        canvas_x = event.x_root - canvas_widget.winfo_rootx()
+        # get axes bounding box in canvas/display coords
+        renderer = self._get_canvas_for(gi).get_renderer()
+        bbox = ax.get_window_extent(renderer=renderer)
+        # transform canvas coords to axes data coords
+        if canvas_x >= bbox.x0 and canvas_x <= bbox.x1:
+            rel_x = (canvas_x - bbox.x0) / (bbox.x1 - bbox.x0)
+            cur_xlim = ax.get_xlim()
+            mouse_x = cur_xlim[0] + rel_x * (cur_xlim[1] - cur_xlim[0])
+        else:
+            mouse_x = None
         if ctrl_held:
-            self._on_graph_zoom(scroll_dir, gi)
+            self._on_graph_zoom(scroll_dir, gi, mouse_x)
         else:
             self._on_graph_pan(scroll_dir, gi)
 
@@ -3490,16 +3959,23 @@ class GaitAnalysisDashboard(tk.Tk):
         full = self._ax_xlim_full[gi]
         if not full: return
         full_min, full_max = full
-        pan_amount = (full_max - full_min) * 0.1 * direction
-        new_min = max(full_min, cur_xlim[0] - pan_amount)
-        new_max = min(full_max, cur_xlim[1] - pan_amount)
-        if new_max - new_min < (cur_xlim[1] - cur_xlim[0]) * 0.99:
-            if direction < 0: new_max = new_min + (cur_xlim[1] - cur_xlim[0])
-            else:              new_min = new_max - (cur_xlim[1] - cur_xlim[0])
+        window_size = cur_xlim[1] - cur_xlim[0]
+        # pan amount scales with current zoom level (10% of current window)
+        pan_amount = window_size * 0.1 * direction
+        new_min = cur_xlim[0] - pan_amount
+        new_max = cur_xlim[1] - pan_amount
+        # clamp to boundaries
+        if new_min < full_min:
+            new_min = full_min
+            new_max = min(new_min + window_size, full_max)
+        if new_max > full_max:
+            new_max = full_max
+            new_min = max(new_max - window_size, full_min)
         ax.set_xlim(new_min, new_max)
-        self._get_canvas_for(gi).draw_idle()
+        self._graph_blit_cache = [None, None, None]
+        self.redraw_graphs()
 
-    def _on_graph_zoom(self, direction, gi):
+    def _on_graph_zoom(self, direction, gi, mouse_x=None):
         ax = self._get_ax_for(gi)
         cur_xlim = ax.get_xlim()
         full = self._ax_xlim_full[gi]
@@ -3508,40 +3984,227 @@ class GaitAnalysisDashboard(tk.Tk):
         full_range = full_max - full_min
         zoom_factor = 0.8 if direction < 0 else 1.2
         new_width = (cur_xlim[1] - cur_xlim[0]) * zoom_factor
-        zoom_center = (cur_xlim[0] + cur_xlim[1]) / 2
+        # use mouse position as zoom center, or graph center if no mouse position
+        if mouse_x is not None:
+            zoom_center = mouse_x
+        else:
+            zoom_center = (cur_xlim[0] + cur_xlim[1]) / 2
         if new_width >= full_range:
             ax.set_xlim(full_min, full_max)
         else:
             rel_pos = (zoom_center - cur_xlim[0]) / max(cur_xlim[1] - cur_xlim[0], 1)
             new_min = zoom_center - new_width * rel_pos
             new_max = new_min + new_width
-            if new_min < full_min: new_min = full_min; new_max = full_min + new_width
-            if new_max > full_max: new_max = full_max; new_min = full_max - new_width
+            # clamp to boundaries
+            if new_min < full_min:
+                new_min = full_min
+                new_max = min(new_min + new_width, full_max)
+            elif new_max > full_max:
+                new_max = full_max
+                new_min = max(new_max - new_width, full_min)
             ax.set_xlim(new_min, new_max)
-        self._get_canvas_for(gi).draw_idle()
+        self._graph_blit_cache = [None, None, None]
+        self.redraw_graphs()
 
     def _reset_zoom(self):
         axes = self._get_graph_axes()
-        canvases = self._get_graph_canvases()
         for gi in range(3):
             if self._ax_xlim_full[gi]:
                 axes[gi].set_xlim(self._ax_xlim_full[gi])
-                canvases[gi].draw_idle()
+        self._graph_blit_cache = [None, None, None]
+        self.redraw_graphs()
         self._status_msg.set("Zoom reset")
+
+    def _on_markup_mpl_scroll(self, event):
+        if self._markup_xlim_full is None: return
+        if event.inaxes is None: return
+        scroll_dir = 1 if event.button == 'up' else -1
+        ctrl_held = bool(event.key == 'control')
+        mouse_x = event.xdata  # data coordinates
+        if ctrl_held:
+            self._on_markup_graph_zoom(scroll_dir, mouse_x)
+        else:
+            self._on_markup_graph_pan(scroll_dir)
+
+    def _on_markup_graph_pan(self, direction):
+        ax = self._markup_ax
+        cur_xlim = ax.get_xlim()
+        full_min, full_max = self._markup_xlim_full
+        window_size = cur_xlim[1] - cur_xlim[0]
+        # pan amount scales with current zoom level (10% of current window)
+        pan_amount = window_size * 0.1 * direction
+        new_min = cur_xlim[0] - pan_amount
+        new_max = cur_xlim[1] - pan_amount
+        # clamp to boundaries
+        if new_min < full_min:
+            new_min = full_min
+            new_max = min(new_min + window_size, full_max)
+        if new_max > full_max:
+            new_max = full_max
+            new_min = max(new_max - window_size, full_min)
+        ax.set_xlim(new_min, new_max)
+        self._markup_mpl_canvas.draw_idle()
+
+    def _on_markup_graph_zoom(self, direction, mouse_x=None):
+        ax = self._markup_ax
+        cur_xlim = ax.get_xlim()
+        full_min, full_max = self._markup_xlim_full
+        full_range = full_max - full_min
+        zoom_factor = 0.8 if direction < 0 else 1.2
+        new_width = (cur_xlim[1] - cur_xlim[0]) * zoom_factor
+        # use mouse position as zoom center, or graph center if no mouse position
+        if mouse_x is not None:
+            zoom_center = mouse_x
+        else:
+            zoom_center = (cur_xlim[0] + cur_xlim[1]) / 2
+        if new_width >= full_range:
+            ax.set_xlim(full_min, full_max)
+        else:
+            rel_pos = (zoom_center - cur_xlim[0]) / max(cur_xlim[1] - cur_xlim[0], 1)
+            new_min = zoom_center - new_width * rel_pos
+            new_max = new_min + new_width
+            # clamp to boundaries
+            if new_min < full_min:
+                new_min = full_min
+                new_max = min(new_min + new_width, full_max)
+            elif new_max > full_max:
+                new_max = full_max
+                new_min = max(new_max - new_width, full_min)
+            ax.set_xlim(new_min, new_max)
+        self._markup_mpl_canvas.draw_idle()
+
+    def _on_markup_area_scroll(self, event):
+        """handle scroll events from markup graph area"""
+        if self._markup_xlim_full is None: return
+        if hasattr(event, 'delta'):
+            scroll_dir = 1 if event.delta > 0 else -1
+        elif hasattr(event, 'num'):
+            scroll_dir = 1 if event.num == 4 else -1
+        else:
+            return
+        ctrl_held = bool(event.state & 0x0004)
+        # get mouse position in data coordinates
+        ax = self._markup_ax
+        canvas = self._markup_mpl_canvas.get_tk_widget()
+        canvas_x = event.x
+        # get axes bounding box in display coords
+        renderer = self._markup_mpl_canvas.get_renderer()
+        bbox = ax.get_window_extent(renderer=renderer)
+        # transform canvas coords to axes data coords
+        if canvas_x >= bbox.x0 and canvas_x <= bbox.x1:
+            rel_x = (canvas_x - bbox.x0) / (bbox.x1 - bbox.x0)
+            cur_xlim = ax.get_xlim()
+            mouse_x = cur_xlim[0] + rel_x * (cur_xlim[1] - cur_xlim[0])
+        else:
+            mouse_x = None
+        if ctrl_held:
+            self._on_markup_graph_zoom(scroll_dir, mouse_x)
+        else:
+            self._on_markup_graph_pan(scroll_dir)
 
     # playback control
 
     def _play_tick(self):
         if not self.playing: return
+        # if in cycle mode, play through the best cycle for each dataset
+        if self.show_overlaid_cycles:
+            any_played = False
+            for ds_idx, ds in enumerate(self.datasets[:2]):
+                info = self._get_cycle_info(ds)
+                if info is None:
+                    continue
+                raw_segs, length_ok, mean_c, max_cycle_length, jn, fn_all, ad, ad_f, excluded = info
+
+                # find the best cycle segment (same logic as _seek_cycle_by_pct)
+                best_cycle_seg = None
+                if mean_c is not None and self.resample_cycles:
+                    best_rmse = float('inf')
+                    for (start_f, end_f, seg), ok in zip(raw_segs, length_ok):
+                        if not ok: continue
+                        y = seg[jn].values
+                        rmse = _compute_cycle_rmse(y, mean_c, max_cycle_length)
+                        if rmse < best_rmse:
+                            best_rmse = rmse
+                            best_cycle_seg = seg
+
+                if best_cycle_seg is None:
+                    for (start_f, end_f, seg), ok in zip(raw_segs, length_ok):
+                        if ok:
+                            best_cycle_seg = seg
+                            break
+                if best_cycle_seg is None and raw_segs:
+                    best_cycle_seg = raw_segs[0][2]
+                if best_cycle_seg is None:
+                    continue
+
+                cycle_frames = best_cycle_seg['frame_num'].values
+                cycle_len = len(cycle_frames)
+                if cycle_len == 0:
+                    continue
+
+                # determine current position within this cycle
+                cur_idx_in_ad = self._cycle_frame_indices[ds_idx] if self._cycle_frame_indices[ds_idx] is not None else None
+                if cur_idx_in_ad is None or cur_idx_in_ad >= len(ad):
+                    pos = 0
+                else:
+                    cf = int(ad['frame_num'].iloc[cur_idx_in_ad])
+                    matches = np.where(cycle_frames == cf)[0]
+                    pos = int(matches[0]) if len(matches) else 0
+
+                # advance one frame in cycle
+                pos = (pos + 1) % cycle_len
+                target_frame = int(cycle_frames[pos])
+                matches = np.where(fn_all == target_frame)[0]
+                if len(matches):
+                    self._cycle_frame_indices[ds_idx] = int(matches[0])
+                    any_played = True
+                    if ds_idx == 0:
+                        # keep current_frame_idx synced to dataset 0
+                        self.current_frame_idx = int(matches[0])
+
+            if any_played:
+                self._show_video_frames()
+                self._update_status()
+                self._play_frame_counter += 1
+                if self._play_frame_counter % PLAY_FULL_REDRAW_EVERY == 0:
+                    # defer full redraw until playback stops to avoid blocking video frames
+                    self._needs_full_redraw = True
+                else:
+                    self._update_graph_cursor_only()
+                self._play_after_id = self.after(16, self._play_tick)
+                return
+            else:
+                # nothing to play
+                self.playing = False
+                if hasattr(self, '_play_btn'):
+                    self._play_btn.config(text="Play")
+                self._status_msg.set("Playback finished")
+                self.redraw_graphs()
+                return
+
+        # default continuous playback
         if self.current_frame_idx < self._active_max_index():
             self.current_frame_idx += 1
             self._show_video_frames()
-            self.redraw_graphs()
             self._update_status()
+            self._play_frame_counter += 1
+            # full graph redraw only every PLAY_FULL_REDRAW_EVERY frames; cursor line update every tick
+            if self._play_frame_counter % PLAY_FULL_REDRAW_EVERY == 0:
+                # defer heavy redraw until playback stops
+                self._needs_full_redraw = True
+            else:
+                self._update_graph_cursor_only()
             self._play_after_id = self.after(16, self._play_tick)
         else:
             self.playing = False
+            if hasattr(self, '_play_btn'):
+                self._play_btn.config(text="Play")
             self._status_msg.set("Playback finished")
+            self.redraw_graphs()
+
+    def _update_graph_cursor_only(self):
+        """Fast path: move the cursor using blit. Falls back to full redraw if blit cache is cold."""
+        self._update_cursor_blit()
 
     # ui controls and event handlers
 
@@ -3555,8 +4218,8 @@ class GaitAnalysisDashboard(tk.Tk):
             self._redraw_markup_graph()
             return
         self._show_video_frames()
-        self.redraw_graphs()
         self._update_status()
+        self._update_cursor_blit()
 
     def _next_frame(self):
         if self.playing: return
@@ -3572,23 +4235,46 @@ class GaitAnalysisDashboard(tk.Tk):
             return
         self.current_frame_idx = min(self._active_max_index(), self.current_frame_idx + 1)
         self._show_video_frames()
-        self.redraw_graphs()
         self._update_status()
+        self._update_cursor_blit()
 
     def _toggle_play(self):
         self.playing = not self.playing
         if self.playing:
+            self._play_frame_counter = 0
             self._status_msg.set("Playing")
+            if hasattr(self, '_play_btn'):
+                self._play_btn.config(text="Pause")
             self._play_tick()
         else:
             self._status_msg.set("Paused")
+            if hasattr(self, '_play_btn'):
+                self._play_btn.config(text="Play")
             if self._play_after_id:
                 self.after_cancel(self._play_after_id)
+            self.redraw_graphs()
 
     def _toggle_cycles(self):
         self.show_overlaid_cycles = not self.show_overlaid_cycles
         if self.show_overlaid_cycles:
             self.resample_cycles = True
+            # force x-axis to reset to 0-100 on next draw
+            for gi in range(3):
+                self._first_graph_draw[gi] = True
+        else:
+            self._cycle_frame_indices = [None, None]
+            _longest = 0
+            for _ds in self.datasets:
+                if _ds:
+                    _longest = max(_longest, _ds.get('total_video_frames', len(_ds.get('all_landmarks', []))))
+            if _longest == 0 and not self.angle_data.empty:
+                try:
+                    _longest = int(self.angle_data['frame_num'].max())
+                except Exception:
+                    pass
+            for gi in range(3):
+                self._ax_xlim_full[gi] = (0, _longest)
+                self._first_graph_draw[gi] = True
         self._status_msg.set("Overlaid cycles" if self.show_overlaid_cycles else "Continuous view")
         self._update_display_btn_visuals()
         self.redraw_graphs()
@@ -3700,6 +4386,14 @@ class GaitAnalysisDashboard(tk.Tk):
         current = NORMATIVE_GAIT['ankle'].get('offset', 120.0)
         _apply_ankle_normative_offset(0.0 if current > 0.0 else 120.0)
         self.redraw_graphs()
+
+    def _manual_auto_exclude(self):
+        if self.angle_data is None or self.angle_data.empty:
+            self._status_msg.set("No data loaded")
+            return
+        auto_excl_count = self._auto_exclude_bad_regions(overwrite=False)
+        self.redraw_graphs()
+        self._status_msg.set(f"Auto-excluded {auto_excl_count} regions")
 
     def _update_display_btn_visuals(self):
         active_map = {
@@ -3923,6 +4617,10 @@ class GaitAnalysisDashboard(tk.Tk):
         self._markup_mpl_canvas.mpl_connect('button_press_event',   self._on_markup_graph_click)
         self._markup_mpl_canvas.mpl_connect('motion_notify_event',  self._on_markup_graph_drag)
         self._markup_mpl_canvas.mpl_connect('button_release_event', self._on_markup_graph_release)
+        self._markup_mpl_canvas.mpl_connect('scroll_event',         self._on_markup_mpl_scroll)
+        graph_area.bind('<MouseWheel>', self._on_markup_area_scroll)
+        graph_area.bind('<Button-4>',   self._on_markup_area_scroll)
+        graph_area.bind('<Button-5>',   self._on_markup_area_scroll)
         self._markup_graph_dragging = False
         ctrl_row = tk.Frame(self._markup_frame, bg=BG2, height=52)
         ctrl_row.pack(fill='x', side='bottom')
@@ -4063,10 +4761,11 @@ class GaitAnalysisDashboard(tk.Tk):
             if joint not in ad.columns: continue
             vals = ad[joint].values.astype(float)
             if excluded:
+                # plot excluded regions as continuous gray line
                 gray_vals = vals.copy(); gray_vals[~excl_mask] = np.nan
-                ax.plot(frames, gray_vals, color='#7a7a7a', lw=1.2, alpha=0.9, zorder=2)
-            clean_vals = vals.copy(); clean_vals[excl_mask] = np.nan
-            ax.plot(frames, clean_vals, color=col, lw=1.0, alpha=0.85, zorder=3)
+                ax.plot(frames, gray_vals, color='#666666', lw=1.2, alpha=0.7, zorder=2)
+            # always plot full data in normal color
+            ax.plot(frames, vals, color=col, lw=1.0, alpha=0.85, zorder=3)
         side = self._marking_phase
         if side:
             fn_set = set(int(f) for f in frames)
@@ -4076,7 +4775,10 @@ class GaitAnalysisDashboard(tk.Tk):
         if self.current_frame_idx < len(ad):
             cf = int(ad['frame_num'].iloc[self.current_frame_idx])
             ax.axvline(cf, color=C_CURSOR, lw=1.5, linestyle='--', zorder=10)
-        ax.set_xlim(frames[0], frames[-1])
+        frame_min = frames[0]
+        frame_max = frame_min + self.total_frames
+        self._markup_xlim_full = (frame_min, frame_max)
+        ax.set_xlim(frame_min, frame_max)
         ax.set_xlabel('Frame', fontsize=7, color=SUBTEXT)
         ax.set_ylabel('°', fontsize=7, color=SUBTEXT)
         self._markup_fig.subplots_adjust(left=0.03, right=0.99, top=0.92, bottom=0.28)
@@ -4314,5 +5016,17 @@ def main():
     app._session.cleanup()
 
 
+def _safe_tk_exception_handler(exc, val, tb):
+    """Custom Tk exception reporter that avoids the Python 3.13 traceback recursion bug."""
+    import sys, traceback
+    try:
+        sys.setrecursionlimit(max(sys.getrecursionlimit(), 3000))
+        traceback.print_exception(exc, val, tb, limit=40)
+    except Exception as e2:
+        print(f"[Exception handler failed: {e2}]")
+        print(f"Original exception: {exc.__name__}: {val}")
+
 if __name__ == "__main__":
+    import tkinter as _tk
+    _tk.Tk.report_callback_exception = _safe_tk_exception_handler
     main()
