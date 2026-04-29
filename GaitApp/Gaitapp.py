@@ -2203,14 +2203,14 @@ class GaitAnalysisDashboard(tk.Tk):
         self._markup_frame        = None
         self._play_after_id       = None
         self._graph_resize_after_id = None
-        self._cycle_frame_indices = [None, None]  # per-dataset frame idx used in cycle mode
+        self._cycle_frame_indices = [None, None, None, None]  # [v1-left, v1-right, v2-left, v2-right] in cycle mode
         self._graph_dragging      = [False, False, False]   # per-graph
         self._pending_graph_redraw = False   # throttle flag for scrub redraws
         self._play_frame_counter   = 0       # count frames between graph redraws during play
         self._btn_held             = None    # which button is currently held (prev/next)
         self._btn_hold_after_id    = None
         self._display_cache        = DisplayCache(limit=128)  # pre-rendered PhotoImage cache
-        self._canvas_image_ids     = [None, None]  # persistent canvas image item ids
+        self._canvas_image_ids     = [None, None, None, None]  # persistent canvas image item ids
         self._exclusion_selecting = [False, False, False]
         self._exclusion_start     = [None, None, None]
         self._graph_limb_btns     = {}
@@ -2364,18 +2364,52 @@ class GaitAnalysisDashboard(tk.Tk):
         videos_frame = tk.Frame(content, bg=BG2, bd=1, relief='flat')
         videos_frame.grid(row=0, column=0, rowspan=3, sticky='nsew', padx=(0, 4), pady=(2, 2))
         videos_frame.grid_columnconfigure(0, weight=1)
-        videos_frame.grid_rowconfigure(0, weight=1)   # video 1
+        videos_frame.grid_rowconfigure(0, weight=1)   # video 1 row
         videos_frame.grid_rowconfigure(1, weight=0)   # controls strip
-        videos_frame.grid_rowconfigure(2, weight=1)   # video 2
+        videos_frame.grid_rowconfigure(2, weight=1)   # video 2 row
+        self._videos_frame = videos_frame
 
-        # --- video 1 ---
-        vid1_outer = tk.Frame(videos_frame, bg=BG2)
-        vid1_outer.grid(row=0, column=0, sticky='nsew', padx=0, pady=(0, 0))
+        # --- video 1 row: sub-row with two columns for cycle mode ---
+        vid1_row = tk.Frame(videos_frame, bg=BG2)
+        vid1_row.grid(row=0, column=0, sticky='nsew')
+        vid1_row.grid_columnconfigure(0, weight=1)
+        vid1_row.grid_columnconfigure(1, weight=1)
+        vid1_row.grid_rowconfigure(0, weight=1)
+        self._vid1_row = vid1_row
+
+        # Video 1 single canvas (continuous mode — spans both columns)
+        vid1_outer = tk.Frame(vid1_row, bg=BG2)
+        vid1_outer.grid(row=0, column=0, columnspan=2, sticky='nsew')
         self._vid1_lbl = tk.Label(vid1_outer, text="VIDEO 1",
                       font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V1, anchor='w')
         self._vid1_lbl.pack(fill='x', padx=4, pady=(2, 0))
         self._vid_canvas1 = tk.Canvas(vid1_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas1.pack(fill='both', expand=True)
+        self._vid1_outer = vid1_outer
+
+        # Video 1 Left — cycle mode only (col 0)
+        vid1L_outer = tk.Frame(vid1_row, bg=BG2)
+        vid1L_outer.grid(row=0, column=0, sticky='nsew')
+        self._vid1L_lbl = tk.Label(vid1L_outer, text="V1  LEFT",
+                      font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V1, anchor='w')
+        self._vid1L_lbl.pack(fill='x', padx=4, pady=(2, 0))
+        self._vid_canvas1L = tk.Canvas(vid1L_outer, bg=BG_VID, highlightthickness=0)
+        self._vid_canvas1L.pack(fill='both', expand=True)
+        self._vid1L_outer = vid1L_outer
+
+        # Video 1 Right — cycle mode only (col 1)
+        vid1R_outer = tk.Frame(vid1_row, bg=BG2)
+        vid1R_outer.grid(row=0, column=1, sticky='nsew')
+        self._vid1R_lbl = tk.Label(vid1R_outer, text="V1  RIGHT",
+                      font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V1, anchor='w')
+        self._vid1R_lbl.pack(fill='x', padx=4, pady=(2, 0))
+        self._vid_canvas1R = tk.Canvas(vid1R_outer, bg=BG_VID, highlightthickness=0)
+        self._vid_canvas1R.pack(fill='both', expand=True)
+        self._vid1R_outer = vid1R_outer
+
+        # Start with cycle panels hidden
+        vid1L_outer.grid_remove()
+        vid1R_outer.grid_remove()
 
         # --- playback controls between the two videos ---
         vid_ctrl_outer = tk.Frame(videos_frame, bg=BG2)
@@ -2399,16 +2433,55 @@ class GaitAnalysisDashboard(tk.Tk):
             elif txt in ("Prev", "Next"):
                 b.bind('<ButtonRelease-1>', lambda e: self.after(0, self._flush_graph_redraw))
 
-        # --- video 2 ---
-        vid2_outer = tk.Frame(videos_frame, bg=BG2)
-        vid2_outer.grid(row=2, column=0, sticky='nsew', padx=0, pady=(0, 0))
+        # --- video 2 row: sub-row with two columns for cycle mode ---
+        vid2_row = tk.Frame(videos_frame, bg=BG2)
+        vid2_row.grid(row=2, column=0, sticky='nsew')
+        vid2_row.grid_columnconfigure(0, weight=1)
+        vid2_row.grid_columnconfigure(1, weight=1)
+        vid2_row.grid_rowconfigure(0, weight=1)
+        self._vid2_row = vid2_row
+
+        # Video 2 single canvas (continuous mode — spans both columns)
+        vid2_outer = tk.Frame(vid2_row, bg=BG2)
+        vid2_outer.grid(row=0, column=0, columnspan=2, sticky='nsew')
         self._vid_canvas2 = tk.Canvas(vid2_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas2.pack(fill='both', expand=True)
         self._vid2_lbl = tk.Label(vid2_outer, text="VIDEO 2",
                       font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
         self._vid2_lbl.pack(fill='x', padx=4, pady=(0, 2))
+        self._vid2_outer = vid2_outer
 
+        # Video 2 Left — cycle mode only (col 0)
+        vid2L_outer = tk.Frame(vid2_row, bg=BG2)
+        vid2L_outer.grid(row=0, column=0, sticky='nsew')
+        self._vid2L_lbl = tk.Label(vid2L_outer, text="V2  LEFT",
+                      font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
+        self._vid2L_lbl.pack(fill='x', padx=4, pady=(2, 0))
+        self._vid_canvas2L = tk.Canvas(vid2L_outer, bg=BG_VID, highlightthickness=0)
+        self._vid_canvas2L.pack(fill='both', expand=True)
+        self._vid2L_outer = vid2L_outer
+
+        # Video 2 Right — cycle mode only (col 1)
+        vid2R_outer = tk.Frame(vid2_row, bg=BG2)
+        vid2R_outer.grid(row=0, column=1, sticky='nsew')
+        self._vid2R_lbl = tk.Label(vid2R_outer, text="V2  RIGHT",
+                      font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
+        self._vid2R_lbl.pack(fill='x', padx=4, pady=(2, 0))
+        self._vid_canvas2R = tk.Canvas(vid2R_outer, bg=BG_VID, highlightthickness=0)
+        self._vid_canvas2R.pack(fill='both', expand=True)
+        self._vid2R_outer = vid2R_outer
+
+        # Start with cycle panels hidden
+        vid2L_outer.grid_remove()
+        vid2R_outer.grid_remove()
+
+        # _vid_canvases: used in continuous mode (indices 0,1)
+        # _vid_canvases_cycle: used in cycle mode [v1L, v1R, v2L, v2R] (indices 0-3)
         self._vid_canvases = [self._vid_canvas1, self._vid_canvas2]
+        self._vid_canvases_cycle = [
+            self._vid_canvas1L, self._vid_canvas1R,
+            self._vid_canvas2L, self._vid_canvas2R,
+        ]
         self._graph_canvas_widgets = [
             self._canvas_ankle.get_tk_widget(),
             self._canvas_hip.get_tk_widget(),
@@ -2869,7 +2942,7 @@ class GaitAnalysisDashboard(tk.Tk):
             self.total_video_frames = max(results[0].get('total_video_frames', self.total_frames), results[1].get('total_video_frames', self.total_frames))
             min_video_frames = min(len(results[0]['all_landmarks']), len(results[1]['all_landmarks']))
             self.current_frame_idx = 0
-            self._cycle_frame_indices = [None, None]
+            self._cycle_frame_indices = [None, None, None, None]
             if not self.angle_data.empty:
                 data_min = self.angle_data['frame_num'].min()
                 full = (data_min, data_min + self.total_video_frames)  # use full video frame count for continuous mode
@@ -2888,6 +2961,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 return
             self.show_overlaid_cycles = True
             self.resample_cycles = True
+            self._enter_cycle_video_layout()
             self._update_display_btn_visuals()
             self.refresh()
             # force a second pass once tk has finalized widget sizes
@@ -3515,6 +3589,53 @@ class GaitAnalysisDashboard(tk.Tk):
         return (img, x_off, y_off)
 
     def _show_video_frames(self):
+        if self.show_overlaid_cycles:
+            # Cycle mode: render 4 canvases — [v1L, v1R, v2L, v2R]
+            # dataset index: slots 0,1 → ds 0;  slots 2,3 → ds 1
+            for slot, canvas in enumerate(self._vid_canvases_cycle):
+                cw = canvas.winfo_width()
+                ch = canvas.winfo_height()
+                if cw < 2 or ch < 2:
+                    continue
+                vi = slot // 2  # dataset index (0 or 1)
+                frame_idx = (self._cycle_frame_indices[slot]
+                             if self._cycle_frame_indices[slot] is not None
+                             else self.current_frame_idx)
+                sk = round(self.skeleton_thickness * 2) / 2
+                dc_key = (f'cyc{slot}', frame_idx, cw, ch, self.graph_show_mode, sk,
+                          self.remove_jitter_frames, self.show_jitter_frames)
+                result = self._display_cache.get(dc_key)
+                if result is None:
+                    if vi >= len(self.datasets):
+                        canvas.delete('all')
+                        canvas.create_text(cw // 2, ch // 2, text="No frame",
+                                           fill=SUBTEXT, font=("Helvetica", 10))
+                        self._canvas_image_ids[slot] = None
+                        continue
+                    result = self._render_video_frame(vi, frame_idx, cw, ch)
+                    if result is None:
+                        canvas.delete('all')
+                        canvas.create_text(cw // 2, ch // 2, text="No frame",
+                                           fill=SUBTEXT, font=("Helvetica", 10))
+                        self._canvas_image_ids[slot] = None
+                        continue
+                    self._display_cache.put(dc_key, result)
+                img, x_off, y_off = result
+                if self._canvas_image_ids[slot] is not None:
+                    try:
+                        canvas.itemconfigure(self._canvas_image_ids[slot], image=img)
+                        canvas.coords(self._canvas_image_ids[slot], x_off, y_off)
+                        canvas._img = img
+                        continue
+                    except Exception:
+                        self._canvas_image_ids[slot] = None
+                canvas.delete('all')
+                item_id = canvas.create_image(x_off, y_off, anchor='nw', image=img)
+                canvas._img = img
+                self._canvas_image_ids[slot] = item_id
+            return
+
+        # Continuous mode: render 2 canvases
         for vi, canvas in enumerate(self._vid_canvases):
             cw = canvas.winfo_width()
             ch = canvas.winfo_height()
@@ -3752,80 +3873,144 @@ class GaitAnalysisDashboard(tk.Tk):
         return (raw_segs, length_ok, mean_c, max_cycle_length, jn, fn_all, ad, ad_f, excluded)
 
     def _get_cycle_cursor_pct(self):
-        """Return the phase % (0-100) of current frame, averaged across both datasets."""
-        pcts = []
-        for ds_idx, ds in enumerate(self.datasets[:2]):
-            info = self._get_cycle_info(ds)
-            if info is None:
-                continue
-            raw_segs, length_ok, mean_c, max_cycle_length, jn, fn_all, ad, ad_f, excluded = info
-            # use per-dataset frame index if set, else fall back to current_frame_idx
-            if self._cycle_frame_indices[ds_idx] is not None:
-                frame_idx = self._cycle_frame_indices[ds_idx]
+        """Return the phase % (0-100) using V1-Left best cycle as reference."""
+        # Use dataset 0, left side (slot 0) as the cursor reference
+        ds = self.datasets[0] if self.datasets else None
+        result = self._get_best_cycle_seg_for_side(ds, 'left')
+        if result is None:
+            # fall back to right side
+            result = self._get_best_cycle_seg_for_side(ds, 'right')
+        if result is None:
+            return None
+        best_seg, ad = result
+        fn_all = ad['frame_num'].to_numpy(dtype=int)
+        slot = 0  # v1-left
+        frame_idx = (self._cycle_frame_indices[slot]
+                     if self._cycle_frame_indices[slot] is not None
+                     else self.current_frame_idx)
+        if frame_idx >= len(ad):
+            return None
+        cf = int(ad['frame_num'].iloc[frame_idx])
+        cycle_frames = best_seg['frame_num'].values
+        cycle_len = len(cycle_frames)
+        matches = np.where(cycle_frames == cf)[0]
+        if len(matches):
+            j = int(matches[0])
+            return (j / max(cycle_len - 1, 1)) * 100.0
+        return None
+
+    def _get_best_cycle_seg_for_side(self, ds, side):
+        """Return (best_seg, angle_data) for the best knee-RMSE cycle of the given side, or None."""
+        if ds is None:
+            return None
+        ad = ds.get('angle_data')
+        if ad is None or ad.empty:
+            return None
+        sf = ds.get('step_frames', [])
+        excluded = ds.get('excluded_regions', [])
+        ad_f = self._get_filtered_angle_data(ad, excluded)
+
+        def _to_fnums(ad_src, step_frames):
+            if not step_frames: return []
+            fn = ad_src['frame_num'].to_numpy(dtype=int)
+            fn_set = set(fn.tolist())
+            vals = [int(v) for v, _ in step_frames]
+            if sum(1 for v in vals if v in fn_set) >= max(1, len(vals)//2):
+                mapped = [(int(v), s) for v, s in step_frames if int(v) in fn_set]
             else:
-                frame_idx = self.current_frame_idx
-            if frame_idx >= len(ad):
+                mapped = [(int(fn[int(v)]), s) for v, s in step_frames if 0 <= int(v) < len(fn)]
+            mapped.sort(key=lambda x: x[0])
+            return mapped
+
+        norm = _to_fnums(ad_f, sf)
+        if not norm:
+            return None
+
+        # Use the knee as RMSE reference joint for this side
+        jn = f'{side}_knee'
+        if jn not in ad.columns:
+            jn = f'{side}_hip'
+        if jn not in ad.columns:
+            return None
+
+        strikes = [f for f, s in norm if s == side]
+        if len(strikes) < 2:
+            return None
+
+        raw_segs = []
+        for i in range(len(strikes) - 1):
+            if self._region_crosses_exclusion(strikes[i], strikes[i+1], excluded):
                 continue
-            cf = int(ad['frame_num'].iloc[frame_idx])
-            for start_f, end_f, seg in raw_segs:
-                cycle_frames = seg['frame_num'].values
-                if cf in cycle_frames:
-                    j = int(np.where(cycle_frames == cf)[0][0])
-                    cycle_len = len(cycle_frames)
-                    pcts.append((j / max(cycle_len - 1, 1)) * 100.0)
+            seg = ad_f[(ad_f['frame_num'] >= strikes[i]) & (ad_f['frame_num'] <= strikes[i+1])]
+            if not seg.empty and len(seg) >= 2:
+                raw_segs.append((strikes[i], strikes[i+1], seg))
+
+        if not raw_segs:
+            return None
+
+        lengths = [len(s) for _, _, s in raw_segs]
+        med = np.median(lengths)
+        length_ok = [(0.8 * med <= len(s) <= 1.2 * med) for _, _, s in raw_segs]
+
+        ok_lengths = [len(s) for (_, _, s), ok in zip(raw_segs, length_ok) if ok]
+        max_cycle_length = max(self.resample_length, max(ok_lengths)) if ok_lengths else self.resample_length
+
+        # Compute mean for RMSE comparison
+        mean_c = None
+        if self.resample_cycles and jn in ad_f.columns:
+            inliers = []
+            for (_, _, seg), ok in zip(raw_segs, length_ok):
+                if not ok: continue
+                y = seg[jn].values
+                t = np.linspace(0, 1, len(y))
+                inliers.append(interp1d(t, y)(np.linspace(0, 1, max_cycle_length)))
+            if inliers:
+                mean_c = np.nanmean(np.vstack(inliers), axis=0)
+
+        # Pick the best-RMSE cycle
+        best_seg = None
+        if mean_c is not None and self.resample_cycles:
+            best_rmse = float('inf')
+            for (_, _, seg), ok in zip(raw_segs, length_ok):
+                if not ok: continue
+                y = seg[jn].values
+                rmse = _compute_cycle_rmse(y, mean_c, max_cycle_length)
+                if rmse < best_rmse:
+                    best_rmse = rmse
+                    best_seg = seg
+
+        if best_seg is None:
+            for (_, _, seg), ok in zip(raw_segs, length_ok):
+                if ok:
+                    best_seg = seg
                     break
-        return float(np.mean(pcts)) if pcts else None
+        if best_seg is None and raw_segs:
+            best_seg = raw_segs[0][2]
+
+        return (best_seg, ad) if best_seg is not None else None
 
     def _seek_cycle_by_pct(self, pct):
-        """In cycle view: for each dataset independently, find the best-RMSE cycle
-        and seek to the frame at the given phase %. Sets per-dataset indices."""
+        """In cycle view: for each dataset+side, find the best-RMSE cycle and seek to that phase %."""
         pct = max(0.0, min(100.0, pct))
-        found_any = False
+        # _cycle_frame_indices: [v1-left, v1-right, v2-left, v2-right]
         for ds_idx, ds in enumerate(self.datasets[:2]):
-            info = self._get_cycle_info(ds)
-            if info is None:
-                continue
-            raw_segs, length_ok, mean_c, max_cycle_length, jn, fn_all, ad, ad_f, excluded = info
-
-            # find the cycle with lowest RMSE vs. mean (most representative)
-            best_cycle_seg = None
-            if mean_c is not None and self.resample_cycles:
-                best_rmse = float('inf')
-                for (start_f, end_f, seg), ok in zip(raw_segs, length_ok):
-                    if not ok:
-                        continue
-                    y = seg[jn].values
-                    rmse = _compute_cycle_rmse(y, mean_c, max_cycle_length)
-                    if rmse < best_rmse:
-                        best_rmse = rmse
-                        best_cycle_seg = seg
-
-            # fall back to first valid cycle
-            if best_cycle_seg is None:
-                for (start_f, end_f, seg), ok in zip(raw_segs, length_ok):
-                    if ok:
-                        best_cycle_seg = seg
-                        break
-            if best_cycle_seg is None and raw_segs:
-                best_cycle_seg = raw_segs[0][2]
-            if best_cycle_seg is None:
-                continue
-
-            # find the frame at the target phase % within this cycle
-            cycle_frames = best_cycle_seg['frame_num'].values
-            cycle_len = len(cycle_frames)
-            target_j = int(round(pct / 100.0 * max(cycle_len - 1, 0)))
-            target_j = max(0, min(target_j, cycle_len - 1))
-            target_frame = int(cycle_frames[target_j])
-
-            # find its index in the full angle_data array
-            matches = np.where(fn_all == target_frame)[0]
-            if len(matches):
-                self._cycle_frame_indices[ds_idx] = int(matches[0])
-                if ds_idx == 0:
-                    # keep current_frame_idx in sync with dataset 0 for status bar etc.
-                    self.current_frame_idx = int(matches[0])
-                found_any = True
+            for side_idx, side in enumerate(('left', 'right')):
+                slot = ds_idx * 2 + side_idx
+                result = self._get_best_cycle_seg_for_side(ds, side)
+                if result is None:
+                    continue
+                best_seg, ad = result
+                fn_all = ad['frame_num'].to_numpy(dtype=int)
+                cycle_frames = best_seg['frame_num'].values
+                cycle_len = len(cycle_frames)
+                target_j = int(round(pct / 100.0 * max(cycle_len - 1, 0)))
+                target_j = max(0, min(target_j, cycle_len - 1))
+                target_frame = int(cycle_frames[target_j])
+                matches = np.where(fn_all == target_frame)[0]
+                if len(matches):
+                    self._cycle_frame_indices[slot] = int(matches[0])
+                    if ds_idx == 0 and side_idx == 0:
+                        self.current_frame_idx = int(matches[0])
 
     def _on_graph_click(self, event, gi):
         axes = self._get_graph_axes()
@@ -4109,58 +4294,36 @@ class GaitAnalysisDashboard(tk.Tk):
         # if in cycle mode, play through the best cycle for each dataset
         if self.show_overlaid_cycles:
             any_played = False
+            # _cycle_frame_indices: [v1-left, v1-right, v2-left, v2-right]
             for ds_idx, ds in enumerate(self.datasets[:2]):
-                info = self._get_cycle_info(ds)
-                if info is None:
-                    continue
-                raw_segs, length_ok, mean_c, max_cycle_length, jn, fn_all, ad, ad_f, excluded = info
+                for side_idx, side in enumerate(('left', 'right')):
+                    slot = ds_idx * 2 + side_idx
+                    result = self._get_best_cycle_seg_for_side(ds, side)
+                    if result is None:
+                        continue
+                    best_cycle_seg, ad = result
+                    fn_all = ad['frame_num'].to_numpy(dtype=int)
+                    cycle_frames = best_cycle_seg['frame_num'].values
+                    cycle_len = len(cycle_frames)
+                    if cycle_len == 0:
+                        continue
 
-                # find the best cycle segment (same logic as _seek_cycle_by_pct)
-                best_cycle_seg = None
-                if mean_c is not None and self.resample_cycles:
-                    best_rmse = float('inf')
-                    for (start_f, end_f, seg), ok in zip(raw_segs, length_ok):
-                        if not ok: continue
-                        y = seg[jn].values
-                        rmse = _compute_cycle_rmse(y, mean_c, max_cycle_length)
-                        if rmse < best_rmse:
-                            best_rmse = rmse
-                            best_cycle_seg = seg
+                    cur_idx_in_ad = self._cycle_frame_indices[slot]
+                    if cur_idx_in_ad is None or cur_idx_in_ad >= len(ad):
+                        pos = 0
+                    else:
+                        cf = int(ad['frame_num'].iloc[cur_idx_in_ad])
+                        matches = np.where(cycle_frames == cf)[0]
+                        pos = int(matches[0]) if len(matches) else 0
 
-                if best_cycle_seg is None:
-                    for (start_f, end_f, seg), ok in zip(raw_segs, length_ok):
-                        if ok:
-                            best_cycle_seg = seg
-                            break
-                if best_cycle_seg is None and raw_segs:
-                    best_cycle_seg = raw_segs[0][2]
-                if best_cycle_seg is None:
-                    continue
-
-                cycle_frames = best_cycle_seg['frame_num'].values
-                cycle_len = len(cycle_frames)
-                if cycle_len == 0:
-                    continue
-
-                # determine current position within this cycle
-                cur_idx_in_ad = self._cycle_frame_indices[ds_idx] if self._cycle_frame_indices[ds_idx] is not None else None
-                if cur_idx_in_ad is None or cur_idx_in_ad >= len(ad):
-                    pos = 0
-                else:
-                    cf = int(ad['frame_num'].iloc[cur_idx_in_ad])
-                    matches = np.where(cycle_frames == cf)[0]
-                    pos = int(matches[0]) if len(matches) else 0
-
-                # advance one frame in cycle
-                pos = (pos + 1) % cycle_len
-                target_frame = int(cycle_frames[pos])
-                matches = np.where(fn_all == target_frame)[0]
-                if len(matches):
-                    self._cycle_frame_indices[ds_idx] = int(matches[0])
-                    any_played = True
-                    if ds_idx == 0:
-                        # keep current_frame_idx synced to dataset 0
-                        self.current_frame_idx = int(matches[0])
+                    pos = (pos + 1) % cycle_len
+                    target_frame = int(cycle_frames[pos])
+                    matches = np.where(fn_all == target_frame)[0]
+                    if len(matches):
+                        self._cycle_frame_indices[slot] = int(matches[0])
+                        any_played = True
+                        if ds_idx == 0 and side_idx == 0:
+                            self.current_frame_idx = int(matches[0])
 
             if any_played:
                 self._show_video_frames()
@@ -4261,8 +4424,9 @@ class GaitAnalysisDashboard(tk.Tk):
             # force x-axis to reset to 0-100 on next draw
             for gi in range(3):
                 self._first_graph_draw[gi] = True
+            self._enter_cycle_video_layout()
         else:
-            self._cycle_frame_indices = [None, None]
+            self._cycle_frame_indices = [None, None, None, None]
             _longest = 0
             for _ds in self.datasets:
                 if _ds:
@@ -4275,9 +4439,30 @@ class GaitAnalysisDashboard(tk.Tk):
             for gi in range(3):
                 self._ax_xlim_full[gi] = (0, _longest)
                 self._first_graph_draw[gi] = True
+            self._exit_cycle_video_layout()
         self._status_msg.set("Overlaid cycles" if self.show_overlaid_cycles else "Continuous view")
         self._update_display_btn_visuals()
         self.redraw_graphs()
+
+    def _enter_cycle_video_layout(self):
+        """Switch video panel to 4-up layout: V1-Left, V1-Right, V2-Left, V2-Right."""
+        self._vid1_outer.grid_remove()
+        self._vid2_outer.grid_remove()
+        self._vid1L_outer.grid()
+        self._vid1R_outer.grid()
+        self._vid2L_outer.grid()
+        self._vid2R_outer.grid()
+        self._canvas_image_ids = [None, None, None, None]
+
+    def _exit_cycle_video_layout(self):
+        """Switch video panel back to 2-up layout."""
+        self._vid1L_outer.grid_remove()
+        self._vid1R_outer.grid_remove()
+        self._vid2L_outer.grid_remove()
+        self._vid2R_outer.grid_remove()
+        self._vid1_outer.grid()
+        self._vid2_outer.grid()
+        self._canvas_image_ids = [None, None, None, None]
 
     def _toggle_resample(self):
         if not self.show_overlaid_cycles: return
@@ -4690,6 +4875,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._persist_all_dataset_markup()
         self.show_overlaid_cycles = True
         self.resample_cycles = True
+        self._enter_cycle_video_layout()
         self._status_msg.set("Steps confirmed — showing overlaid gait cycles")
         self._update_display_btn_visuals()
         self.refresh()
