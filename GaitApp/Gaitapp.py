@@ -1670,8 +1670,337 @@ HELP_TEXT = [
     ("Exclusions",    None),
     ("Right-click",   "Drag on graph to exclude region"),
     ("Clr Excl btn",  "Clear all excluded regions"),
-    ("h / H",         "This help screen"),
+    ("h / H",         "Open tutorial overlay"),
 ]
+
+TUTORIAL_VIDEO_FPS = 24
+TUTORIAL_VIDEO_SIZE = (1280, 720)
+TUTORIAL_VIDEO_NAME = "gaitapp_tutorial.avi"
+
+
+def _draw_centered_text(frame, text, y, scale, color, thickness=2):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    text_size, baseline = cv2.getTextSize(text, font, scale, thickness)
+    x = max((frame.shape[1] - text_size[0]) // 2, 0)
+    cv2.putText(frame, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+
+
+def _generate_tutorial_video(video_path):
+    width, height = TUTORIAL_VIDEO_SIZE
+    fps = TUTORIAL_VIDEO_FPS
+    writer = None
+    for codec in ('MJPG', 'XVID', 'mp4v'):
+        attempt = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*codec), fps, (width, height))
+        if attempt.isOpened():
+            writer = attempt
+            break
+        attempt.release()
+    if writer is None:
+        return False
+
+    total_frames = fps * 12
+    accent = (216, 130, 45)
+    text = (244, 244, 244)
+    muted = (178, 178, 178)
+    panel = (33, 37, 52)
+    panel2 = (25, 28, 40)
+
+    for idx in range(total_frames):
+        phase = idx / max(total_frames - 1, 1)
+        frame = np.full((height, width, 3), (18, 20, 28), dtype=np.uint8)
+        cv2.rectangle(frame, (0, 0), (width, 92), (28, 31, 44), -1)
+        cv2.rectangle(frame, (70, 130), (width - 70, height - 92), panel, -1)
+        cv2.rectangle(frame, (108, 176), (width - 108, height - 150), panel2, -1)
+
+        cv2.rectangle(frame, (108, height - 112), (width - 108, height - 84), (45, 48, 65), -1)
+        fill_w = int((width - 216) * phase)
+        cv2.rectangle(frame, (108, height - 112), (108 + fill_w, height - 84), accent, -1)
+        cv2.circle(frame, (108 + fill_w, height - 98), 12, text, -1)
+
+        if idx < fps * 4:
+            _draw_centered_text(frame, "tutorial overlay", 212, 1.4, accent, 3)
+            _draw_centered_text(frame, "press the help button again to close this window", 274, 0.85, text, 2)
+            _draw_centered_text(frame, "this clip is a placeholder tutorial you can swap later", 320, 0.8, muted, 2)
+            cv2.rectangle(frame, (180, 390), (width - 180, 530), (38, 41, 58), -1)
+            cv2.rectangle(frame, (220, 430), (420, 490), accent, -1)
+            cv2.rectangle(frame, (470, 430), (670, 490), (220, 92, 70), -1)
+            cv2.rectangle(frame, (720, 430), (920, 490), (68, 143, 86), -1)
+            _draw_centered_text(frame, "help", 473, 0.85, (255, 255, 255), 2)
+            _draw_centered_text(frame, "start", 473, 0.85, (255, 255, 255), 2)
+            _draw_centered_text(frame, "stop", 473, 0.85, (255, 255, 255), 2)
+        elif idx < fps * 8:
+            _draw_centered_text(frame, "player controls", 212, 1.25, accent, 3)
+            _draw_centered_text(frame, "start", 286, 0.9, text, 2)
+            _draw_centered_text(frame, "stop", 328, 0.9, text, 2)
+            _draw_centered_text(frame, "play / pause", 370, 0.9, text, 2)
+            cv2.rectangle(frame, (190, 410), (width - 190, 530), (38, 41, 58), -1)
+            cv2.rectangle(frame, (250, 430), (350, 505), accent, -1)
+            cv2.rectangle(frame, (390, 430), (490, 505), (220, 92, 70), -1)
+            cv2.rectangle(frame, (530, 430), (720, 505), (68, 143, 86), -1)
+            cv2.rectangle(frame, (780, 430), (930, 505), (100, 110, 138), -1)
+            cv2.rectangle(frame, (575, 447), (620, 488), (20, 20, 28), -1)
+            pts = np.array([[648, 447], [648, 488], [694, 467]], dtype=np.int32)
+            cv2.fillConvexPoly(frame, pts, (20, 20, 28))
+            cv2.rectangle(frame, (812, 447), (846, 488), (20, 20, 28), -1)
+        else:
+            _draw_centered_text(frame, "scrub the timeline", 212, 1.25, accent, 3)
+            _draw_centered_text(frame, "drag the bar below to jump around the video", 280, 0.88, text, 2)
+            _draw_centered_text(frame, "the tutorial player keeps the video frame in sync", 324, 0.8, muted, 2)
+            bar_x1, bar_x2 = 180, width - 180
+            bar_y = 438
+            cv2.rectangle(frame, (bar_x1, bar_y), (bar_x2, bar_y + 26), (55, 59, 77), -1)
+            thumb_x = int(bar_x1 + (bar_x2 - bar_x1) * phase)
+            cv2.rectangle(frame, (bar_x1, bar_y), (thumb_x, bar_y + 26), accent, -1)
+            cv2.circle(frame, (thumb_x, bar_y + 13), 18, text, -1)
+            cv2.circle(frame, (thumb_x, bar_y + 13), 9, accent, -1)
+
+        cv2.putText(frame, "gaitapp tutorial clip", (28, height - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, muted, 1, cv2.LINE_AA)
+        writer.write(frame)
+
+    writer.release()
+    return os.path.exists(video_path) and os.path.getsize(video_path) > 0
+
+
+def _resolve_tutorial_video_path():
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "tutorial.mp4"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "tutorial.avi"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "tutorial_video.mp4"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "tutorial_video.avi"),
+    ]
+    for path in candidates:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+
+    temp_path = os.path.join(tempfile.gettempdir(), TUTORIAL_VIDEO_NAME)
+    if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+        if not _generate_tutorial_video(temp_path):
+            return None
+    return temp_path
+
+
+class TutorialOverlay(tk.Toplevel):
+    def __init__(self, parent, video_path, on_close=None):
+        super().__init__(parent)
+        self._on_close = on_close
+        self._video_path = video_path
+        self._capture = None
+        self._frame_count = 0
+        self._fps = float(TUTORIAL_VIDEO_FPS)
+        self._frame_idx = 0
+        self._playing = False
+        self._play_after_id = None
+        self._seek_update_guard = False
+        self._current_photo = None
+
+        self.title("Tutorial")
+        self.configure(bg=BG)
+        self.transient(parent)
+        self.geometry("1080x720")
+        self.minsize(900, 620)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        header = tk.Frame(self, bg=BG2, height=46)
+        header.pack(fill='x', side='top')
+        header.pack_propagate(False)
+
+        tk.Label(header, text="TUTORIAL", font=("Helvetica", 10, "bold"), bg=BG2, fg=ACCENT).pack(side='left', padx=14)
+        tk.Label(header, text="video overlay", font=("Helvetica", 9), bg=BG2, fg=SUBTEXT).pack(side='left', pady=12)
+        tk.Button(header, text="Close", font=("Helvetica", 9), bg=BG3, fg=TEXT, relief='flat', padx=10,
+                  command=self._close).pack(side='right', padx=12, pady=8)
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill='both', expand=True, padx=10, pady=(10, 8))
+        body.grid_rowconfigure(0, weight=1)
+        body.grid_rowconfigure(1, weight=0)
+        body.grid_columnconfigure(0, weight=1)
+
+        video_frame = tk.Frame(body, bg=BG2, bd=1, relief='flat')
+        video_frame.grid(row=0, column=0, sticky='nsew')
+        self._video_label = tk.Label(video_frame, bg=BG_VID, anchor='center', text="Loading tutorial video...", fg=SUBTEXT)
+        self._video_label.pack(fill='both', expand=True)
+        self._video_label.bind('<Configure>', self._render_frame)
+
+        controls = tk.Frame(body, bg=BG2)
+        controls.grid(row=1, column=0, sticky='ew', pady=(8, 0))
+        controls.grid_columnconfigure(1, weight=1)
+
+        btn_cfg = dict(bg=BG3, fg=TEXT, relief='flat', font=("Helvetica", 9, "bold"), padx=12, pady=4,
+                       cursor='hand2', activebackground=ACCENT, activeforeground='white')
+
+        self._start_btn = tk.Button(controls, text="Start", command=self._start_from_beginning, **btn_cfg)
+        self._start_btn.grid(row=0, column=0, padx=(0, 6), pady=4, sticky='w')
+        self._stop_btn = tk.Button(controls, text="Stop", command=self._stop_and_reset, **btn_cfg)
+        self._stop_btn.grid(row=0, column=1, padx=(0, 6), pady=4, sticky='w')
+        self._play_btn = tk.Button(controls, text="Play", command=self._toggle_play, **btn_cfg)
+        self._play_btn.grid(row=0, column=2, padx=(0, 12), pady=4, sticky='w')
+
+        self._time_var = tk.StringVar(value="00:00 / 00:00")
+        self._time_lbl = tk.Label(controls, textvariable=self._time_var, bg=BG2, fg=SUBTEXT, font=("Helvetica", 8, "bold"))
+        self._time_lbl.grid(row=0, column=3, padx=(0, 10), pady=4, sticky='e')
+
+        self._seek_scale = tk.Scale(controls, from_=0, to=0, orient='horizontal', showvalue=0, length=520,
+                                    bg=BG2, fg=TEXT, troughcolor=BG3, highlightthickness=0,
+                                    relief='flat', command=self._on_seek)
+        self._seek_scale.grid(row=1, column=0, columnspan=4, sticky='ew', padx=(0, 0), pady=(0, 4))
+
+        self._status_var = tk.StringVar(value="")
+        self._status_lbl = tk.Label(body, textvariable=self._status_var, bg=BG, fg=SUBTEXT, anchor='w', font=("Helvetica", 8))
+        self._status_lbl.grid(row=2, column=0, sticky='ew', pady=(8, 0))
+
+        self._load_video()
+        self.after(50, self._render_frame)
+        self.after_idle(lambda: self.lift())
+
+    def _load_video(self):
+        if not self._video_path or not os.path.exists(self._video_path):
+            self._set_status("tutorial video not found")
+            self._disable_transport()
+            return
+
+        self._capture = cv2.VideoCapture(self._video_path)
+        if not self._capture.isOpened():
+            self._set_status("unable to open tutorial video")
+            self._disable_transport()
+            return
+
+        self._frame_count = int(self._capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self._fps = float(self._capture.get(cv2.CAP_PROP_FPS) or TUTORIAL_VIDEO_FPS)
+        if self._frame_count <= 0:
+            self._frame_count = 1
+        if self._fps <= 0:
+            self._fps = float(TUTORIAL_VIDEO_FPS)
+
+        self._seek_scale.config(to=max(0, self._frame_count - 1))
+        self._set_frame_index(0, refresh=False)
+        self._set_status(os.path.basename(self._video_path))
+
+    def _disable_transport(self):
+        for widget in (self._start_btn, self._stop_btn, self._play_btn, self._seek_scale):
+            try:
+                widget.config(state='disabled')
+            except Exception:
+                pass
+
+    def _set_status(self, text):
+        self._status_var.set(text)
+
+    def _format_time(self, frame_idx):
+        current = frame_idx / max(self._fps, 1.0)
+        total = max(self._frame_count - 1, 0) / max(self._fps, 1.0)
+        return f"{int(current // 60):02d}:{int(current % 60):02d} / {int(total // 60):02d}:{int(total % 60):02d}"
+
+    def _set_frame_index(self, frame_idx, refresh=True):
+        if self._frame_count <= 0:
+            return
+        self._frame_idx = max(0, min(int(frame_idx), self._frame_count - 1))
+        self._seek_update_guard = True
+        try:
+            self._seek_scale.set(self._frame_idx)
+        finally:
+            self._seek_update_guard = False
+        self._time_var.set(self._format_time(self._frame_idx))
+        if refresh:
+            self._render_frame()
+
+    def _read_frame(self, frame_idx):
+        if self._capture is None:
+            return None
+        self._capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = self._capture.read()
+        if not ok:
+            return None
+        return frame
+
+    def _render_frame(self, _event=None):
+        if not self.winfo_exists():
+            return
+
+        width = self._video_label.winfo_width()
+        height = self._video_label.winfo_height()
+        if width <= 2 or height <= 2:
+            self.after(40, self._render_frame)
+            return
+
+        frame = self._read_frame(self._frame_idx)
+        if frame is None:
+            if self._capture is None:
+                self._video_label.configure(image='', text="tutorial video unavailable")
+            return
+
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        source_h, source_w = frame.shape[:2]
+        scale = min(width / max(source_w, 1), height / max(source_h, 1))
+        new_w = max(1, int(source_w * scale))
+        new_h = max(1, int(source_h * scale))
+        resized = Image.fromarray(frame).resize((new_w, new_h), Image.LANCZOS)
+        self._current_photo = ImageTk.PhotoImage(resized)
+        self._video_label.configure(image=self._current_photo, text='')
+
+    def _step_forward(self):
+        if self._frame_count <= 0:
+            return
+        if self._frame_idx >= self._frame_count - 1:
+            self._set_playing(False)
+            return
+        self._set_frame_index(self._frame_idx + 1)
+
+    def _play_tick(self):
+        self._play_after_id = None
+        if not self._playing:
+            return
+        self._step_forward()
+        if self._playing:
+            delay = max(15, int(1000 / max(self._fps, 1.0)))
+            self._play_after_id = self.after(delay, self._play_tick)
+
+    def _set_playing(self, playing):
+        self._playing = playing
+        self._play_btn.config(text="Pause" if playing else "Play")
+        if playing:
+            if self._play_after_id is None:
+                self._play_after_id = self.after(0, self._play_tick)
+        else:
+            if self._play_after_id is not None:
+                try:
+                    self.after_cancel(self._play_after_id)
+                except Exception:
+                    pass
+                self._play_after_id = None
+
+    def _start_from_beginning(self):
+        if self._capture is None:
+            return
+        self._set_frame_index(0)
+        self._set_playing(True)
+
+    def _stop_and_reset(self):
+        if self._capture is None:
+            return
+        self._set_playing(False)
+        self._set_frame_index(0)
+
+    def _toggle_play(self):
+        if self._capture is None:
+            return
+        self._set_playing(not self._playing)
+
+    def _on_seek(self, value):
+        if self._seek_update_guard or self._capture is None:
+            return
+        self._set_frame_index(int(float(value)))
+
+    def _close(self):
+        self._set_playing(False)
+        if self._capture is not None:
+            try:
+                self._capture.release()
+            except Exception:
+                pass
+            self._capture = None
+        if callable(self._on_close):
+            self._on_close()
+        self.destroy()
 
 
 class CacheManagerDialog(tk.Toplevel):
@@ -2231,6 +2560,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._needs_full_redraw = False
         self._cache_manager_dialog = None
         self._pdf_export_dialog = None
+        self._tutorial_overlay = None
 
         self._build_ui()
         _apply_dynamic_window_size(self, preferred_width=1400, preferred_height=860)
@@ -2273,6 +2603,11 @@ class GaitAnalysisDashboard(tk.Tk):
                  font=("Coiny Cyrillic", 17), bg=BG2, fg=ACCENT, cursor="hand2")
         title_label.pack(side='left', pady=(6, 0))
         title_label.bind('<Button-1>', lambda e: self._open_settings())
+
+        tk.Button(hdr, text="Help", font=("Helvetica", 9),
+              bg=BG3, fg=TEXT, relief='flat', padx=8,
+              command=self._toggle_tutorial_overlay
+              ).pack(side='right', padx=2, pady=8)
 
         tk.Button(hdr, text="Re-mark", font=("Helvetica", 9),
               bg=BG3, fg=TEXT, relief='flat', padx=8,
@@ -2992,6 +3327,7 @@ class GaitAnalysisDashboard(tk.Tk):
             '<m>': self._toggle_mean,
             '<v>': self._cycle_graph_view,
             '<t>': self._toggle_active,
+            '<h>': self._toggle_tutorial_overlay,
             '<g>': self._toggle_suggestions,
             '<d>': self._clear_steps,
             '<space>': self._add_manual_step,
@@ -4453,6 +4789,15 @@ class GaitAnalysisDashboard(tk.Tk):
         self._vid2L_outer.grid()
         self._vid2R_outer.grid()
         self._canvas_image_ids = [None, None, None, None]
+        
+        # update cycle mode labels with video names
+        if hasattr(self, 'video_names') and len(self.video_names) >= 2:
+            v1_name = self.video_names[0]
+            v2_name = self.video_names[1]
+            self._vid1L_lbl.config(text=f"{v1_name} - Left Cycle")
+            self._vid1R_lbl.config(text=f"{v1_name} - Right Cycle")
+            self._vid2L_lbl.config(text=f"{v2_name} - Left Cycle")
+            self._vid2R_lbl.config(text=f"{v2_name} - Right Cycle")
 
     def _exit_cycle_video_layout(self):
         """Switch video panel back to 2-up layout."""
@@ -4463,6 +4808,14 @@ class GaitAnalysisDashboard(tk.Tk):
         self._vid1_outer.grid()
         self._vid2_outer.grid()
         self._canvas_image_ids = [None, None, None, None]
+        
+        # restore continuous mode labels
+        if hasattr(self, 'video_names') and len(self.video_names) >= 2:
+            self._vid1_lbl.config(text=f"VIDEO 1  —  {self.video_names[0]}")
+            self._vid2_lbl.config(text=f"VIDEO 2  —  {self.video_names[1]}")
+        else:
+            self._vid1_lbl.config(text="VIDEO 1")
+            self._vid2_lbl.config(text="VIDEO 2")
 
     def _toggle_resample(self):
         if not self.show_overlaid_cycles: return
@@ -4750,6 +5103,18 @@ class GaitAnalysisDashboard(tk.Tk):
             self.after_cancel(self._play_after_id)
             self._play_after_id = None
         self._enter_marking_phase('left', 0)
+
+    def _toggle_tutorial_overlay(self):
+        if self._tutorial_overlay is not None and self._tutorial_overlay.winfo_exists():
+            self._tutorial_overlay.destroy()
+            self._tutorial_overlay = None
+        else:
+            video_path = _resolve_tutorial_video_path()
+            if video_path:
+                self._tutorial_overlay = TutorialOverlay(self, video_path, on_close=self._on_tutorial_overlay_closed)
+
+    def _on_tutorial_overlay_closed(self):
+        self._tutorial_overlay = None
 
     # guided step marking screen
 
@@ -5163,6 +5528,9 @@ class GaitAnalysisDashboard(tk.Tk):
 
     def _on_close(self):
         self._stop_pf = True
+        if self._tutorial_overlay is not None and self._tutorial_overlay.winfo_exists():
+            self._tutorial_overlay.destroy()
+            self._tutorial_overlay = None
         if self.playing and self._play_after_id:
             self.after_cancel(self._play_after_id)
         plt.close('all')
