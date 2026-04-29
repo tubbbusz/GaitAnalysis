@@ -1673,11 +1673,6 @@ HELP_TEXT = [
     ("h / H",         "Open tutorial overlay"),
 ]
 
-TUTORIAL_VIDEO_FPS = 24
-TUTORIAL_VIDEO_SIZE = (1280, 720)
-TUTORIAL_VIDEO_NAME = "gaitapp_tutorial.avi"
-
-
 def _draw_centered_text(frame, text, y, scale, color, thickness=2):
     font = cv2.FONT_HERSHEY_SIMPLEX
     text_size, baseline = cv2.getTextSize(text, font, scale, thickness)
@@ -1685,322 +1680,472 @@ def _draw_centered_text(frame, text, y, scale, color, thickness=2):
     cv2.putText(frame, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
 
 
-def _generate_tutorial_video(video_path):
-    width, height = TUTORIAL_VIDEO_SIZE
-    fps = TUTORIAL_VIDEO_FPS
-    writer = None
-    for codec in ('MJPG', 'XVID', 'mp4v'):
-        attempt = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*codec), fps, (width, height))
-        if attempt.isOpened():
-            writer = attempt
-            break
-        attempt.release()
-    if writer is None:
-        return False
 
-    total_frames = fps * 12
-    accent = (216, 130, 45)
-    text = (244, 244, 244)
-    muted = (178, 178, 178)
-    panel = (33, 37, 52)
-    panel2 = (25, 28, 40)
+# ---------------------------------------------------------------------------
+# In-app spotlight tutorial  (replaces the old video-based TutorialOverlay)
+# ---------------------------------------------------------------------------
 
-    for idx in range(total_frames):
-        phase = idx / max(total_frames - 1, 1)
-        frame = np.full((height, width, 3), (18, 20, 28), dtype=np.uint8)
-        cv2.rectangle(frame, (0, 0), (width, 92), (28, 31, 44), -1)
-        cv2.rectangle(frame, (70, 130), (width - 70, height - 92), panel, -1)
-        cv2.rectangle(frame, (108, 176), (width - 108, height - 150), panel2, -1)
-
-        cv2.rectangle(frame, (108, height - 112), (width - 108, height - 84), (45, 48, 65), -1)
-        fill_w = int((width - 216) * phase)
-        cv2.rectangle(frame, (108, height - 112), (108 + fill_w, height - 84), accent, -1)
-        cv2.circle(frame, (108 + fill_w, height - 98), 12, text, -1)
-
-        if idx < fps * 4:
-            _draw_centered_text(frame, "tutorial overlay", 212, 1.4, accent, 3)
-            _draw_centered_text(frame, "press the help button again to close this window", 274, 0.85, text, 2)
-            _draw_centered_text(frame, "this clip is a placeholder tutorial you can swap later", 320, 0.8, muted, 2)
-            cv2.rectangle(frame, (180, 390), (width - 180, 530), (38, 41, 58), -1)
-            cv2.rectangle(frame, (220, 430), (420, 490), accent, -1)
-            cv2.rectangle(frame, (470, 430), (670, 490), (220, 92, 70), -1)
-            cv2.rectangle(frame, (720, 430), (920, 490), (68, 143, 86), -1)
-            _draw_centered_text(frame, "help", 473, 0.85, (255, 255, 255), 2)
-            _draw_centered_text(frame, "start", 473, 0.85, (255, 255, 255), 2)
-            _draw_centered_text(frame, "stop", 473, 0.85, (255, 255, 255), 2)
-        elif idx < fps * 8:
-            _draw_centered_text(frame, "player controls", 212, 1.25, accent, 3)
-            _draw_centered_text(frame, "start", 286, 0.9, text, 2)
-            _draw_centered_text(frame, "stop", 328, 0.9, text, 2)
-            _draw_centered_text(frame, "play / pause", 370, 0.9, text, 2)
-            cv2.rectangle(frame, (190, 410), (width - 190, 530), (38, 41, 58), -1)
-            cv2.rectangle(frame, (250, 430), (350, 505), accent, -1)
-            cv2.rectangle(frame, (390, 430), (490, 505), (220, 92, 70), -1)
-            cv2.rectangle(frame, (530, 430), (720, 505), (68, 143, 86), -1)
-            cv2.rectangle(frame, (780, 430), (930, 505), (100, 110, 138), -1)
-            cv2.rectangle(frame, (575, 447), (620, 488), (20, 20, 28), -1)
-            pts = np.array([[648, 447], [648, 488], [694, 467]], dtype=np.int32)
-            cv2.fillConvexPoly(frame, pts, (20, 20, 28))
-            cv2.rectangle(frame, (812, 447), (846, 488), (20, 20, 28), -1)
-        else:
-            _draw_centered_text(frame, "scrub the timeline", 212, 1.25, accent, 3)
-            _draw_centered_text(frame, "drag the bar below to jump around the video", 280, 0.88, text, 2)
-            _draw_centered_text(frame, "the tutorial player keeps the video frame in sync", 324, 0.8, muted, 2)
-            bar_x1, bar_x2 = 180, width - 180
-            bar_y = 438
-            cv2.rectangle(frame, (bar_x1, bar_y), (bar_x2, bar_y + 26), (55, 59, 77), -1)
-            thumb_x = int(bar_x1 + (bar_x2 - bar_x1) * phase)
-            cv2.rectangle(frame, (bar_x1, bar_y), (thumb_x, bar_y + 26), accent, -1)
-            cv2.circle(frame, (thumb_x, bar_y + 13), 18, text, -1)
-            cv2.circle(frame, (thumb_x, bar_y + 13), 9, accent, -1)
-
-        cv2.putText(frame, "gaitapp tutorial clip", (28, height - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, muted, 1, cv2.LINE_AA)
-        writer.write(frame)
-
-    writer.release()
-    return os.path.exists(video_path) and os.path.getsize(video_path) > 0
+# Each step: (widget_attr_path, title, description, callout_side)
+# widget_attr_path is a dot-separated path from the GaitAnalysisDashboard instance,
+# or None to show a centred modal card with no spotlight.
+TUTORIAL_STEPS = [
+    (None,
+     "Welcome to the Tutorial",
+     "This short guide will walk you through the main areas of the Gait Analysis tool.\n"
+     "Click  Next  to continue, or  Skip  at any time.",
+     "center"),
+    ("_vid_canvas1",
+     "Video 1",
+     "The top video panel shows the first recording. Once loaded, the skeleton overlay\n"
+     "is drawn in real-time as you scrub through frames.",
+     "right"),
+    ("_vid_canvas2",
+     "Video 2",
+     "The bottom video panel shows the second recording for side-by-side comparison.",
+     "right"),
+    ("_play_btn",
+     "Playback Controls",
+     "Use  Prev / Play / Next  to step through frames, or press  9  on your keyboard.\n"
+     "Both videos stay synchronised during playback.",
+     "right"),
+    ("_canvas_hip",
+     "Hip Angle Graph",
+     "The hip joint angle is plotted here across the full recording.\n"
+     "Click or drag to move the playback cursor.  Right-drag to exclude a region.",
+     "left"),
+    ("_canvas_knee",
+     "Knee Angle Graph",
+     "Knee flexion / extension for both limbs. Use  v  to toggle which version\n"
+     "is shown, and  c  to switch between continuous and overlaid cycle views.",
+     "left"),
+    ("_canvas_ankle",
+     "Ankle Angle Graph",
+     "Ankle dorsiflexion / plantarflexion.  Press  F3  to adjust the normative\n"
+     "offset, and  m  to toggle the mean curve overlay.",
+     "left"),
+    (None,
+     "You're all set!",
+     "Keyboard shortcuts are listed in the Help text at the top of the window.\n"
+     "Press  h  at any time to restart this tutorial.  Happy analysing!",
+     "center"),
+]
 
 
-def _resolve_tutorial_video_path():
-    candidates = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "tutorial.mp4"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "tutorial.avi"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "tutorial_video.mp4"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "tutorial_video.avi"),
-    ]
-    for path in candidates:
-        if os.path.exists(path) and os.path.getsize(path) > 0:
-            return path
+class SpotlightTutorial:
+    """
+    In-app guided tutorial.
 
-    temp_path = os.path.join(tempfile.gettempdir(), TUTORIAL_VIDEO_NAME)
-    if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
-        if not _generate_tutorial_video(temp_path):
-            return None
-    return temp_path
+    How the spotlight works
+    -----------------------
+    The overlay is a borderless, always-on-top Toplevel that exactly covers the
+    parent window.  Its canvas is painted with four solid dark rectangles that
+    surround the spotlight area — leaving a literal gap where the target widget
+    is visible.  On Windows we additionally set -transparentcolor on the overlay
+    to a magic pink colour (#fe01fe) and paint the spotlight gap with that colour,
+    making it a true transparent cut-out.  On other platforms the gap is simply
+    the canvas background (same dark colour), which still looks correct because
+    the overlay window uses -alpha for the dimming.
 
+    Card
+    ----
+    A separate always-on-top borderless Toplevel holds the callout card.
+    It is positioned to the requested side of the spotlight rectangle and
+    clamped inside the parent window bounds.
 
-class TutorialOverlay(tk.Toplevel):
-    def __init__(self, parent, video_path, on_close=None):
-        super().__init__(parent)
-        self._on_close = on_close
-        self._video_path = video_path
-        self._capture = None
-        self._frame_count = 0
-        self._fps = float(TUTORIAL_VIDEO_FPS)
-        self._frame_idx = 0
-        self._playing = False
-        self._play_after_id = None
-        self._seek_update_guard = False
-        self._current_photo = None
+    Parent tracking
+    ---------------
+    <Configure> on the parent → debounced refit so the overlay follows moves,
+                                resizes, and maximise/restore.
+    <Unmap>                   → hide overlay on minimise.
+    <Map>                     → show and redraw on restore.
+    """
 
-        self.title("Tutorial")
-        self.configure(bg=BG)
-        self.transient(parent)
-        self.geometry("1080x720")
-        self.minsize(900, 620)
-        self.protocol("WM_DELETE_WINDOW", self._close)
+    _DARK        = "#1c1c1c"    # dark fill colour for dimmed areas
+    _HOLE        = "#fe01fe"    # transparent-hole colour (Windows only)
+    _ALPHA       = 0.70         # overlay window alpha
+    _SPOT_PAD    = 10           # px around target widget
+    _CARD_GAP    = 22           # px between spotlight edge and card
+    _CARD_W      = 340          # card pixel width
+    _CARD_PAD    = 20
+    _CARD_BG     = "#ffffff"
+    _ACCENT      = ACCENT
 
-        header = tk.Frame(self, bg=BG2, height=46)
-        header.pack(fill='x', side='top')
-        header.pack_propagate(False)
+    def __init__(self, parent):
+        self._parent   = parent
+        self._step     = 0
+        self._overlay  = None
+        self._canvas   = None
+        self._card_win = None
+        self._closed   = False
+        self._after_id = None
+        self._use_hole = False   # True if -transparentcolor is supported
 
-        tk.Label(header, text="TUTORIAL", font=("Helvetica", 10, "bold"), bg=BG2, fg=ACCENT).pack(side='left', padx=14)
-        tk.Label(header, text="video overlay", font=("Helvetica", 9), bg=BG2, fg=SUBTEXT).pack(side='left', pady=12)
-        tk.Button(header, text="Close", font=("Helvetica", 9), bg=BG3, fg=TEXT, relief='flat', padx=10,
-                  command=self._close).pack(side='right', padx=12, pady=8)
+        self._build()
+        self._bind_parent()
+        parent.after(80, self._first_draw)
 
-        body = tk.Frame(self, bg=BG)
-        body.pack(fill='both', expand=True, padx=10, pady=(10, 8))
-        body.grid_rowconfigure(0, weight=1)
-        body.grid_rowconfigure(1, weight=0)
-        body.grid_columnconfigure(0, weight=1)
+    # ------------------------------------------------------------------ build
 
-        video_frame = tk.Frame(body, bg=BG2, bd=1, relief='flat')
-        video_frame.grid(row=0, column=0, sticky='nsew')
-        self._video_label = tk.Label(video_frame, bg=BG_VID, anchor='center', text="Loading tutorial video...", fg=SUBTEXT)
-        self._video_label.pack(fill='both', expand=True)
-        self._video_label.bind('<Configure>', self._render_frame)
+    def _build(self):
+        p = self._parent
+        p.update_idletasks()
 
-        controls = tk.Frame(body, bg=BG2)
-        controls.grid(row=1, column=0, sticky='ew', pady=(8, 0))
-        controls.grid_columnconfigure(1, weight=1)
-
-        btn_cfg = dict(bg=BG3, fg=TEXT, relief='flat', font=("Helvetica", 9, "bold"), padx=12, pady=4,
-                       cursor='hand2', activebackground=ACCENT, activeforeground='white')
-
-        self._start_btn = tk.Button(controls, text="Start", command=self._start_from_beginning, **btn_cfg)
-        self._start_btn.grid(row=0, column=0, padx=(0, 6), pady=4, sticky='w')
-        self._stop_btn = tk.Button(controls, text="Stop", command=self._stop_and_reset, **btn_cfg)
-        self._stop_btn.grid(row=0, column=1, padx=(0, 6), pady=4, sticky='w')
-        self._play_btn = tk.Button(controls, text="Play", command=self._toggle_play, **btn_cfg)
-        self._play_btn.grid(row=0, column=2, padx=(0, 12), pady=4, sticky='w')
-
-        self._time_var = tk.StringVar(value="00:00 / 00:00")
-        self._time_lbl = tk.Label(controls, textvariable=self._time_var, bg=BG2, fg=SUBTEXT, font=("Helvetica", 8, "bold"))
-        self._time_lbl.grid(row=0, column=3, padx=(0, 10), pady=4, sticky='e')
-
-        self._seek_scale = tk.Scale(controls, from_=0, to=0, orient='horizontal', showvalue=0, length=520,
-                                    bg=BG2, fg=TEXT, troughcolor=BG3, highlightthickness=0,
-                                    relief='flat', command=self._on_seek)
-        self._seek_scale.grid(row=1, column=0, columnspan=4, sticky='ew', padx=(0, 0), pady=(0, 4))
-
-        self._status_var = tk.StringVar(value="")
-        self._status_lbl = tk.Label(body, textvariable=self._status_var, bg=BG, fg=SUBTEXT, anchor='w', font=("Helvetica", 8))
-        self._status_lbl.grid(row=2, column=0, sticky='ew', pady=(8, 0))
-
-        self._load_video()
-        self.after(50, self._render_frame)
-        self.after_idle(lambda: self.lift())
-
-    def _load_video(self):
-        if not self._video_path or not os.path.exists(self._video_path):
-            self._set_status("tutorial video not found")
-            self._disable_transport()
-            return
-
-        self._capture = cv2.VideoCapture(self._video_path)
-        if not self._capture.isOpened():
-            self._set_status("unable to open tutorial video")
-            self._disable_transport()
-            return
-
-        self._frame_count = int(self._capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        self._fps = float(self._capture.get(cv2.CAP_PROP_FPS) or TUTORIAL_VIDEO_FPS)
-        if self._frame_count <= 0:
-            self._frame_count = 1
-        if self._fps <= 0:
-            self._fps = float(TUTORIAL_VIDEO_FPS)
-
-        self._seek_scale.config(to=max(0, self._frame_count - 1))
-        self._set_frame_index(0, refresh=False)
-        self._set_status(os.path.basename(self._video_path))
-
-    def _disable_transport(self):
-        for widget in (self._start_btn, self._stop_btn, self._play_btn, self._seek_scale):
-            try:
-                widget.config(state='disabled')
-            except Exception:
-                pass
-
-    def _set_status(self, text):
-        self._status_var.set(text)
-
-    def _format_time(self, frame_idx):
-        current = frame_idx / max(self._fps, 1.0)
-        total = max(self._frame_count - 1, 0) / max(self._fps, 1.0)
-        return f"{int(current // 60):02d}:{int(current % 60):02d} / {int(total // 60):02d}:{int(total % 60):02d}"
-
-    def _set_frame_index(self, frame_idx, refresh=True):
-        if self._frame_count <= 0:
-            return
-        self._frame_idx = max(0, min(int(frame_idx), self._frame_count - 1))
-        self._seek_update_guard = True
+        # --- overlay window ---
+        ov = tk.Toplevel(p)
+        ov.overrideredirect(True)
+        ov.attributes("-topmost", True)
+        ov.configure(bg=self._DARK)
         try:
-            self._seek_scale.set(self._frame_idx)
-        finally:
-            self._seek_update_guard = False
-        self._time_var.set(self._format_time(self._frame_idx))
-        if refresh:
-            self._render_frame()
+            ov.attributes("-alpha", self._ALPHA)
+        except Exception:
+            pass
+        # Windows: set transparentcolor so the hole colour is see-through
+        try:
+            ov.attributes("-transparentcolor", self._HOLE)
+            self._use_hole = True
+        except Exception:
+            self._use_hole = False
+        self._overlay = ov
 
-    def _read_frame(self, frame_idx):
-        if self._capture is None:
-            return None
-        self._capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame = self._capture.read()
-        if not ok:
-            return None
-        return frame
+        cv = tk.Canvas(ov, bg=self._DARK, highlightthickness=0, cursor="arrow")
+        cv.pack(fill="both", expand=True)
+        cv.bind("<Button-1>", lambda e: self._next_step())
+        self._canvas = cv
 
-    def _render_frame(self, _event=None):
-        if not self.winfo_exists():
+        self._fit_overlay()
+
+        # --- card window ---
+        cw = tk.Toplevel(p)
+        cw.overrideredirect(True)
+        cw.attributes("-topmost", True)
+        cw.configure(bg=self._CARD_BG)
+        self._card_win = cw
+        self._make_card()
+        cw.withdraw()
+
+    def _make_card(self):
+        cw  = self._card_win
+        W   = self._CARD_W
+        pad = self._CARD_PAD
+
+        # set a minimum width so winfo_reqwidth returns the right value
+        cw.minsize(W, 1)
+
+        # accent top bar
+        tk.Frame(cw, bg=self._ACCENT, height=5).pack(fill="x", side="top")
+
+        # thin border effect using a frame with a slightly darker bg
+        border = tk.Frame(cw, bg="#cccccc", bd=0)
+        border.pack(fill="both", expand=True)
+
+        body = tk.Frame(border, bg=self._CARD_BG)
+        body.pack(fill="both", expand=True, padx=1, pady=(0, 1))
+
+        inner = tk.Frame(body, bg=self._CARD_BG)
+        inner.pack(fill="both", expand=True, padx=pad, pady=(pad, pad))
+
+        self._step_lbl = tk.Label(inner, text="", font=("Helvetica", 8),
+                                   bg=self._CARD_BG, fg="#999999", anchor="w")
+        self._step_lbl.pack(fill="x")
+
+        self._title_lbl = tk.Label(inner, text="", font=("Helvetica", 12, "bold"),
+                                    bg=self._CARD_BG, fg=TEXT, anchor="w",
+                                    wraplength=W - pad * 2, justify="left")
+        self._title_lbl.pack(fill="x", pady=(5, 0))
+
+        self._desc_lbl = tk.Label(inner, text="", font=("Helvetica", 10),
+                                   bg=self._CARD_BG, fg=SUBTEXT, anchor="nw",
+                                   wraplength=W - pad * 2, justify="left")
+        self._desc_lbl.pack(fill="x", pady=(8, 14))
+
+        # progress dots
+        dots = tk.Frame(inner, bg=self._CARD_BG)
+        dots.pack(fill="x", pady=(0, 12))
+        self._dots = []
+        for _ in TUTORIAL_STEPS:
+            lbl = tk.Label(dots, text="●", font=("Helvetica", 9),
+                           bg=self._CARD_BG, fg="#dddddd")
+            lbl.pack(side="left", padx=2)
+            self._dots.append(lbl)
+
+        # buttons
+        btns = tk.Frame(inner, bg=self._CARD_BG)
+        btns.pack(fill="x")
+
+        self._skip_btn = tk.Button(btns, text="Skip", font=("Helvetica", 9),
+                                    bg="#eeeeee", fg="#888888", relief="flat",
+                                    padx=10, pady=5, cursor="hand2",
+                                    command=self.close)
+        self._skip_btn.pack(side="left")
+
+        self._next_btn = tk.Button(btns, text="Next →",
+                                    font=("Helvetica", 9, "bold"),
+                                    bg=self._ACCENT, fg="white",
+                                    relief="flat", padx=14, pady=5,
+                                    cursor="hand2", command=self._next_step)
+        self._next_btn.pack(side="right")
+
+        self._prev_btn = tk.Button(btns, text="← Prev", font=("Helvetica", 9),
+                                    bg=BG3, fg=TEXT, relief="flat",
+                                    padx=10, pady=5, cursor="hand2",
+                                    command=self._prev_step)
+        self._prev_btn.pack(side="right", padx=(0, 6))
+
+    # ---------------------------------------------------------------- events
+
+    def _bind_parent(self):
+        p = self._parent
+        p.bind("<Configure>", self._on_configure, add="+")
+        p.bind("<Unmap>",     self._on_unmap,     add="+")
+        p.bind("<Map>",       self._on_map,        add="+")
+
+    def _unbind_parent(self):
+        try:
+            self._parent.unbind("<Configure>")
+            self._parent.unbind("<Unmap>")
+            self._parent.unbind("<Map>")
+        except Exception:
+            pass
+
+    def _on_configure(self, _event):
+        if self._closed:
             return
-
-        width = self._video_label.winfo_width()
-        height = self._video_label.winfo_height()
-        if width <= 2 or height <= 2:
-            self.after(40, self._render_frame)
-            return
-
-        frame = self._read_frame(self._frame_idx)
-        if frame is None:
-            if self._capture is None:
-                self._video_label.configure(image='', text="tutorial video unavailable")
-            return
-
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        source_h, source_w = frame.shape[:2]
-        scale = min(width / max(source_w, 1), height / max(source_h, 1))
-        new_w = max(1, int(source_w * scale))
-        new_h = max(1, int(source_h * scale))
-        resized = Image.fromarray(frame).resize((new_w, new_h), Image.LANCZOS)
-        self._current_photo = ImageTk.PhotoImage(resized)
-        self._video_label.configure(image=self._current_photo, text='')
-
-    def _step_forward(self):
-        if self._frame_count <= 0:
-            return
-        if self._frame_idx >= self._frame_count - 1:
-            self._set_playing(False)
-            return
-        self._set_frame_index(self._frame_idx + 1)
-
-    def _play_tick(self):
-        self._play_after_id = None
-        if not self._playing:
-            return
-        self._step_forward()
-        if self._playing:
-            delay = max(15, int(1000 / max(self._fps, 1.0)))
-            self._play_after_id = self.after(delay, self._play_tick)
-
-    def _set_playing(self, playing):
-        self._playing = playing
-        self._play_btn.config(text="Pause" if playing else "Play")
-        if playing:
-            if self._play_after_id is None:
-                self._play_after_id = self.after(0, self._play_tick)
-        else:
-            if self._play_after_id is not None:
-                try:
-                    self.after_cancel(self._play_after_id)
-                except Exception:
-                    pass
-                self._play_after_id = None
-
-    def _start_from_beginning(self):
-        if self._capture is None:
-            return
-        self._set_frame_index(0)
-        self._set_playing(True)
-
-    def _stop_and_reset(self):
-        if self._capture is None:
-            return
-        self._set_playing(False)
-        self._set_frame_index(0)
-
-    def _toggle_play(self):
-        if self._capture is None:
-            return
-        self._set_playing(not self._playing)
-
-    def _on_seek(self, value):
-        if self._seek_update_guard or self._capture is None:
-            return
-        self._set_frame_index(int(float(value)))
-
-    def _close(self):
-        self._set_playing(False)
-        if self._capture is not None:
+        if self._after_id:
             try:
-                self._capture.release()
+                self._parent.after_cancel(self._after_id)
             except Exception:
                 pass
-            self._capture = None
-        if callable(self._on_close):
-            self._on_close()
-        self.destroy()
+        self._after_id = self._parent.after(100, self._redraw)
+
+    def _on_unmap(self, _event):
+        if self._closed:
+            return
+        for w in (self._overlay, self._card_win):
+            try:
+                if w and w.winfo_exists():
+                    w.withdraw()
+            except Exception:
+                pass
+
+    def _on_map(self, _event):
+        if self._closed:
+            return
+        for w in (self._overlay, self._card_win):
+            try:
+                if w and w.winfo_exists():
+                    w.deiconify()
+            except Exception:
+                pass
+        self._parent.after(80, self._redraw)
+
+    # --------------------------------------------------------------- geometry
+
+    def _fit_overlay(self):
+        """Resize overlay to exactly match parent window on screen."""
+        p = self._parent
+        p.update_idletasks()
+        x = p.winfo_rootx()
+        y = p.winfo_rooty()
+        w = p.winfo_width()
+        h = p.winfo_height()
+        self._overlay.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _resolve_widget(self, attr_path):
+        if not attr_path:
+            return None
+        _mpl = {"_canvas_hip", "_canvas_knee", "_canvas_ankle"}
+        obj = self._parent
+        for part in attr_path.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return None
+            if part in _mpl:
+                try:
+                    obj = obj.get_tk_widget()
+                except Exception:
+                    return None
+        return obj
+
+    def _spotlight_local(self, widget):
+        """Spotlight rect in overlay-local coords, plus overlay w/h."""
+        p   = self._parent
+        p.update_idletasks()
+        widget.update_idletasks()
+
+        # parent (= overlay) top-left in screen coords
+        ox = p.winfo_rootx()
+        oy = p.winfo_rooty()
+        ow = p.winfo_width()
+        oh = p.winfo_height()
+
+        wx = widget.winfo_rootx() - ox
+        wy = widget.winfo_rooty() - oy
+        ww = widget.winfo_width()
+        wh = widget.winfo_height()
+
+        pad = self._SPOT_PAD
+        sx0 = max(wx - pad, 0)
+        sy0 = max(wy - pad, 0)
+        sx1 = min(wx + ww + pad, ow)
+        sy1 = min(wy + wh + pad, oh)
+        return sx0, sy0, sx1, sy1, ow, oh
+
+    # --------------------------------------------------------------- drawing
+
+    def _draw(self, attr_path):
+        """Repaint the overlay canvas for the current step."""
+        cv = self._canvas
+        cv.delete("all")
+
+        p  = self._parent
+        p.update_idletasks()
+        ow = p.winfo_width()
+        oh = p.winfo_height()
+        if ow <= 1 or oh <= 1:
+            return
+
+        widget = self._resolve_widget(attr_path)
+
+        if widget is None:
+            # full dark cover, no spotlight
+            cv.create_rectangle(0, 0, ow, oh, fill=self._DARK, outline="")
+            return
+
+        sx0, sy0, sx1, sy1, ow, oh = self._spotlight_local(widget)
+
+        hole = self._HOLE if self._use_hole else self._DARK
+
+        # four dark panels around the spotlight
+        cv.create_rectangle(0,   0,   ow,  sy0, fill=self._DARK, outline="")
+        cv.create_rectangle(0,   sy1, ow,  oh,  fill=self._DARK, outline="")
+        cv.create_rectangle(0,   sy0, sx0, sy1, fill=self._DARK, outline="")
+        cv.create_rectangle(sx1, sy0, ow,  sy1, fill=self._DARK, outline="")
+
+        # spotlight hole (transparent on Windows, dark on others)
+        cv.create_rectangle(sx0, sy0, sx1, sy1, fill=hole, outline="")
+
+        # accent border around spotlight
+        cv.create_rectangle(sx0, sy0, sx1, sy1,
+                            outline=self._ACCENT, width=3, fill="")
+
+    def _place_card(self, attr_path, side):
+        cw = self._card_win
+        cw.deiconify()
+        cw.update_idletasks()
+
+        # winfo_reqwidth/height is reliable after update_idletasks when using pack
+        card_w = max(cw.winfo_reqwidth(),  self._CARD_W)
+        card_h = max(cw.winfo_reqheight(), 60)
+
+        p  = self._parent
+        px = p.winfo_rootx()
+        py = p.winfo_rooty()
+        pw = p.winfo_width()
+        ph = p.winfo_height()
+
+        widget = self._resolve_widget(attr_path)
+
+        if widget is None or side == "center":
+            cx = px + (pw - card_w) // 2
+            cy = py + (ph - card_h) // 2
+        else:
+            p.update_idletasks()
+            widget.update_idletasks()
+            wx = widget.winfo_rootx()
+            wy = widget.winfo_rooty()
+            ww = widget.winfo_width()
+            wh = widget.winfo_height()
+            gap = self._SPOT_PAD + self._CARD_GAP
+
+            if side == "right":
+                cx = wx + ww + gap
+                cy = wy + wh // 2 - card_h // 2
+            elif side == "left":
+                cx = wx - card_w - gap
+                cy = wy + wh // 2 - card_h // 2
+            elif side == "below":
+                cx = wx + ww // 2 - card_w // 2
+                cy = wy + wh + gap
+            else:  # above
+                cx = wx + ww // 2 - card_w // 2
+                cy = wy - card_h - gap
+
+            # clamp inside parent
+            m = 12
+            cx = max(px + m, min(cx, px + pw - card_w - m))
+            cy = max(py + m, min(cy, py + ph - card_h - m))
+
+        cw.geometry(f"{card_w}x{card_h}+{cx}+{cy}")
+
+    # --------------------------------------------------------------- steps
+
+    def _first_draw(self):
+        if not self._closed and self.winfo_exists():
+            self._show_step(0)
+
+    def _redraw(self):
+        self._after_id = None
+        if not self._closed and self.winfo_exists():
+            self._show_step(self._step)
+
+    def _show_step(self, idx):
+        if self._closed or not self.winfo_exists():
+            return
+        self._step = idx
+        attr_path, title, desc, side = TUTORIAL_STEPS[idx]
+        n = len(TUTORIAL_STEPS)
+
+        self._step_lbl.config(text=f"Step {idx + 1} of {n}")
+        self._title_lbl.config(text=title)
+        self._desc_lbl.config(text=desc)
+        for i, dot in enumerate(self._dots):
+            dot.config(fg=self._ACCENT if i == idx else "#dddddd")
+        self._prev_btn.config(state="normal" if idx > 0 else "disabled")
+        self._next_btn.config(text="Finish ✓" if idx == n - 1 else "Next →")
+
+        self._fit_overlay()
+        self._draw(attr_path)
+        self._place_card(attr_path, side)
+
+        self._overlay.lift()
+        self._card_win.lift()
+
+    def _prev_step(self):
+        if self._step > 0:
+            self._show_step(self._step - 1)
+
+    def _next_step(self):
+        if self._step < len(TUTORIAL_STEPS) - 1:
+            self._show_step(self._step + 1)
+        else:
+            self.close()
+
+    # --------------------------------------------------------------- cleanup
+
+    def close(self):
+        self._closed = True
+        self._unbind_parent()
+        if self._after_id:
+            try:
+                self._parent.after_cancel(self._after_id)
+            except Exception:
+                pass
+        for w in (self._card_win, self._overlay):
+            try:
+                if w and w.winfo_exists():
+                    w.destroy()
+            except Exception:
+                pass
+        self._overlay  = None
+        self._canvas   = None
+        self._card_win = None
+        if callable(getattr(self._parent, "_on_tutorial_overlay_closed", None)):
+            self._parent._on_tutorial_overlay_closed()
+
+    def winfo_exists(self):
+        return bool(self._overlay and self._overlay.winfo_exists())
+
+
 
 
 class CacheManagerDialog(tk.Toplevel):
@@ -2500,7 +2645,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self.angle_data         = pd.DataFrame()
 
         self.joint_visibility = {k: True for k in
-            ('left_hip','right_hip','left_knee','right_knee','left_ankle','right_ankle')}
+            ('left_hip','right_hip','left_knee','right_knee','left_ankle','right_ankle','all_left','all_right')}
 
         self.graph_show_mode      = 'both'
         self.show_overlaid_cycles = False
@@ -2543,6 +2688,8 @@ class GaitAnalysisDashboard(tk.Tk):
         self._exclusion_selecting = [False, False, False]
         self._exclusion_start     = [None, None, None]
         self._graph_limb_btns     = {}
+        self._last_motion_time    = 0       # throttle rapid motion_notify_event handlers
+        self._graph_zoom_after_id = None    # scheduled full redraw after zoom/pan
 
         # per-graph zoom state (ankle=0, hip=1, knee=2)
         self._ax_xlim_full        = [None, None, None]
@@ -2908,6 +3055,14 @@ class GaitAnalysisDashboard(tk.Tk):
 
     def _toggle_graph_joint_visibility(self, joint_name):
         self.joint_visibility[joint_name] = not self.joint_visibility.get(joint_name, True)
+        # update the combined all_left/all_right flag for the side
+        try:
+            side = 'left' if joint_name.startswith('left_') else 'right'
+            all_key = f'all_{side}'
+            joints = [f"{side}_hip", f"{side}_knee", f"{side}_ankle"]
+            self.joint_visibility[all_key] = any(self.joint_visibility.get(j, False) for j in joints)
+        except Exception:
+            pass
         # update button visuals
         self._update_graph_limb_btn_visuals()
         # clear any pre-rendered video frames so skeleton visibility change appears immediately
@@ -2930,6 +3085,28 @@ class GaitAnalysisDashboard(tk.Tk):
             parts['swatch'].config(bg=bg)
             parts['label'].config(bg=bg, fg=TEXT)
             parts['frame'].lift()
+
+    def _toggle_all_side(self, side):
+        # if any joint on side is currently enabled, turn them all off, otherwise turn them on
+        joints = [f"{side}_hip", f"{side}_knee", f"{side}_ankle"]
+        any_on = any(self.joint_visibility.get(j, False) for j in joints)
+        new_state = not any_on
+        for j in joints:
+            self.joint_visibility[j] = new_state
+        # update combined flag so header button visual matches
+        try:
+            self.joint_visibility[f'all_{side}'] = new_state
+        except Exception:
+            pass
+        # refresh visuals and displays
+        self._update_graph_limb_btn_visuals()
+        try:
+            self._display_cache.clear()
+        except Exception:
+            pass
+        self._invalidate_blit_cache()
+        self.redraw_graphs()
+        self._show_video_frames()
 
     def _schedule_graph_resize_sync(self, _event=None):
         if self._graph_resize_after_id is not None:
@@ -3007,7 +3184,47 @@ class GaitAnalysisDashboard(tk.Tk):
             'Ankle': {'bg': '#dbeeff', 'fg': '#1f4f7a'},
             'Hip':   {'bg': '#ffe7cc', 'fg': '#8a4b08'},
             'Knee':  {'bg': '#dff3df', 'fg': '#1f6b2f'},
+            'All':   {'bg': '#f5e6ff', 'fg': '#5a2a6e'},
         }
+        # header row: toggle-all buttons for left/right columns
+        hdr_row = tk.Frame(parent, bg=BG2)
+        hdr_row.pack(fill='x', padx=6, pady=(2, 2))
+        all_badge = tk.Label(hdr_row, text='All', font=("Helvetica", 8, "bold"),
+                             bg=badge_styles['All']['bg'], fg=badge_styles['All']['fg'], padx=4, pady=2, width=5)
+        all_badge.pack(side='left', padx=(0, 4))
+        # left control: combined swatch + label in a single clickable frame (match other toggle style)
+        enabled_left = self.joint_visibility.get('all_left', True)
+        left_ctrl = tk.Frame(hdr_row, bg=(BG3 if enabled_left else BG2), bd=0, relief='flat', cursor='hand2', highlightthickness=1,
+                             highlightbackground=BG2, highlightcolor=BG2)
+        left_ctrl.pack(side='left', padx=(0, 4))
+        l_swatch = tk.Canvas(left_ctrl, width=38, height=16, bg=left_ctrl['bg'], highlightthickness=0)
+        l_swatch.pack(side='left', padx=(5, 3), pady=2)
+        l_swatch.create_line(1, 8, 13, 8, fill='black', dash=(4, 3), width=2)
+        l_swatch.create_line(18, 8, 35, 8, fill='black', width=2)
+        l_label = tk.Label(left_ctrl, text='Left', font=("Helvetica", 9, "bold"), bg=left_ctrl['bg'], fg=TEXT,
+                   padx=1, pady=2)
+        l_label.pack(side='left', padx=(0, 5))
+        for w in (left_ctrl, l_swatch, l_label):
+            w.bind('<Button-1>', lambda e: self._toggle_all_side('left'))
+        # keep reference for visuals
+        self._graph_limb_btns['all_left'] = {'frame': left_ctrl, 'swatch': l_swatch, 'label': l_label, 'fg': 'black'}
+
+        # right control: combined swatch + label
+        enabled_right = self.joint_visibility.get('all_right', True)
+        right_ctrl = tk.Frame(hdr_row, bg=(BG3 if enabled_right else BG2), bd=0, relief='flat', cursor='hand2', highlightthickness=1,
+                              highlightbackground=BG2, highlightcolor=BG2)
+        right_ctrl.pack(side='left', padx=(0, 0))
+        r_swatch = tk.Canvas(right_ctrl, width=38, height=16, bg=right_ctrl['bg'], highlightthickness=0)
+        r_swatch.pack(side='left', padx=(5, 3), pady=2)
+        r_swatch.create_line(1, 8, 13, 8, fill='black', dash=(4, 3), width=2)
+        r_swatch.create_line(18, 8, 35, 8, fill='black', width=2)
+        r_label = tk.Label(right_ctrl, text='Right', font=("Helvetica", 9, "bold"), bg=right_ctrl['bg'], fg=TEXT,
+                   padx=1, pady=2)
+        r_label.pack(side='left', padx=(0, 5))
+        for w in (right_ctrl, r_swatch, r_label):
+            w.bind('<Button-1>', lambda e: self._toggle_all_side('right'))
+        self._graph_limb_btns['all_right'] = {'frame': right_ctrl, 'swatch': r_swatch, 'label': r_label, 'fg': 'black'}
+
         for group_joints, group_label in [
             (['left_hip',   'right_hip'],   'Hip'),
             (['left_knee',  'right_knee'],  'Knee'),
@@ -3540,6 +3757,38 @@ class GaitAnalysisDashboard(tk.Tk):
         self._graph_blit_cache = new_cache
         self._update_graph_limb_btn_visuals()
 
+    def _rebuild_blit_cache_for(self, gi):
+        """Rebuild blit cache for a single graph index (gi).
+        This mirrors the per-graph portion of redraw_graphs but only for one axes.
+        """
+        axes = self._get_graph_axes()
+        canvases = self._get_graph_canvases()
+        figs = [self._fig_ankle, self._fig_hip, self._fig_knee]
+        ax = axes[gi]
+        canvas = canvases[gi]
+        fig = figs[gi]
+
+        try:
+            cursor_line = next((l for l in ax.lines if getattr(l, '_is_cursor', False)), None)
+            _ = fig.canvas.renderer
+            if cursor_line is not None:
+                cursor_line.set_visible(False)
+                fig.draw(fig.canvas.renderer)
+                bg = canvas.copy_from_bbox(fig.bbox)
+                cursor_line.set_visible(True)
+                ax.draw_artist(cursor_line)
+                canvas.blit(fig.bbox)
+                self._graph_blit_cache[gi] = (bg, cursor_line)
+            else:
+                fig.draw(fig.canvas.renderer)
+                canvas.blit(fig.bbox)
+                self._graph_blit_cache[gi] = None
+        except Exception:
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
+
     def _redraw_single_graph(self, gi, ax, mpl_canvas):
         """draw one of the three joint graphs (gi=0 ankle, 1 hip, 2 knee)."""
         self._graph_blit_cache[gi] = None  # static content is changing; invalidate blit cache
@@ -3861,7 +4110,7 @@ class GaitAnalysisDashboard(tk.Tk):
     def redraw_graph(self):
         self.redraw_graphs()
 
-    def _render_video_frame(self, vi, frame_idx, cw, ch):
+    def _render_video_frame(self, vi, frame_idx, cw, ch, focus_side=None):
         """Render one video frame to a display-ready ImageTk.PhotoImage.
         Returns (photo_image, x_offset, y_offset) or None."""
         if vi >= len(self.datasets):
@@ -3901,7 +4150,19 @@ class GaitAnalysisDashboard(tk.Tk):
         is_jittery = frame_idx in jittery_frames
         if pixel_lm is not None and not (is_jittery and not self.show_jitter_frames):
             frame = frame.copy()
-            draw_pose_landmarks_on_frame(frame, pixel_lm, self.joint_visibility,
+            # if a focus_side is provided (cycle mode), only colour hip/knee/ankle for that side
+            if focus_side in ('left', 'right'):
+                base_jvis = self.joint_visibility or {}
+                jvis_override = {k: False for k in base_jvis}
+                for jt in ('hip', 'knee', 'ankle'):
+                    key = f"{focus_side}_{jt}"
+                    jvis_override[key] = base_jvis.get(key, True)
+                jvis_to_pass = jvis_override
+            else:
+                jvis_to_pass = self.joint_visibility
+
+            draw_pose_landmarks_on_frame(frame, pixel_lm, jvis_to_pass,
+                                         focus_side=focus_side,
                                          skeleton_thickness=self.skeleton_thickness,
                                          draw_jitter_red=is_jittery and self.show_jitter_frames)
 
@@ -3911,6 +4172,12 @@ class GaitAnalysisDashboard(tk.Tk):
         show_v1 = self.graph_show_mode in ('v1', 'both')
         show_v2 = self.graph_show_mode in ('v2', 'both')
         is_inactive = (vi == 0 and not show_v1) or (vi == 1 and not show_v2)
+        # if a side is focused (cycle slots) and that side's joints are all turned off,
+        # grey the corresponding canvas just like when a whole video is hidden
+        if focus_side == 'left' and not self.joint_visibility.get('all_left', True):
+            is_inactive = True
+        if focus_side == 'right' and not self.joint_visibility.get('all_right', True):
+            is_inactive = True
         if is_inactive:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             rgb  = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
@@ -3948,7 +4215,9 @@ class GaitAnalysisDashboard(tk.Tk):
                                            fill=SUBTEXT, font=("Helvetica", 10))
                         self._canvas_image_ids[slot] = None
                         continue
-                    result = self._render_video_frame(vi, frame_idx, cw, ch)
+                    # determine which side this cycle slot represents so we can focus colouring
+                    side = 'left' if (slot % 2) == 0 else 'right'
+                    result = self._render_video_frame(vi, frame_idx, cw, ch, focus_side=side)
                     if result is None:
                         canvas.delete('all')
                         canvas.create_text(cw // 2, ch // 2, text="No frame",
@@ -4360,6 +4629,11 @@ class GaitAnalysisDashboard(tk.Tk):
     def _on_graph_drag(self, event, gi):
         axes = self._get_graph_axes()
         if self._graph_dragging[gi] and event.inaxes == axes[gi]:
+            # throttle motion events to ~30 Hz to reduce lag during scrubbing
+            now = time.time()
+            if now - self._last_motion_time < 0.033:  # ~30 fps = 33ms
+                return
+            self._last_motion_time = now
             self._seek_from_event(event, gi)
 
     def _on_graph_release(self, event, gi):
@@ -4493,8 +4767,27 @@ class GaitAnalysisDashboard(tk.Tk):
             new_max = full_max
             new_min = max(new_max - window_size, full_min)
         ax.set_xlim(new_min, new_max)
+        # mark blit cache stale then perform a light update immediately
         self._graph_blit_cache = [None, None, None]
-        self.redraw_graphs()
+        try:
+            # update video frames and status immediately for responsiveness
+            self._show_video_frames()
+            self._update_status()
+            self._update_graph_cursor_only()
+        except Exception:
+            pass
+        # debounce full redraw to avoid expensive repeated draws while user scrolls
+        try:
+            if self._graph_zoom_after_id is not None:
+                self.after_cancel(self._graph_zoom_after_id)
+        except Exception:
+            pass
+        # schedule rebuild only for this graph to avoid redrawing all three
+        try:
+            gi_local = gi
+        except NameError:
+            gi_local = gi
+        self._graph_zoom_after_id = self.after(150, lambda gi=gi_local: (setattr(self, '_graph_zoom_after_id', None), self._rebuild_blit_cache_for(gi)))
 
     def _on_graph_zoom(self, direction, gi, mouse_x=None):
         ax = self._get_ax_for(gi)
@@ -4524,8 +4817,26 @@ class GaitAnalysisDashboard(tk.Tk):
                 new_max = full_max
                 new_min = max(new_max - new_width, full_min)
             ax.set_xlim(new_min, new_max)
+        # mark static blit cache stale and do a lightweight immediate update
         self._graph_blit_cache = [None, None, None]
-        self.redraw_graphs()
+        try:
+            self._show_video_frames()
+            self._update_status()
+            self._update_graph_cursor_only()
+        except Exception:
+            pass
+        # debounce full redraw while user is actively zooming
+        try:
+            if self._graph_zoom_after_id is not None:
+                self.after_cancel(self._graph_zoom_after_id)
+        except Exception:
+            pass
+        # schedule rebuild only for this graph to avoid redrawing all three
+        try:
+            gi_local = gi
+        except NameError:
+            gi_local = gi
+        self._graph_zoom_after_id = self.after(150, lambda gi=gi_local: (setattr(self, '_graph_zoom_after_id', None), self._rebuild_blit_cache_for(gi)))
 
     def _reset_zoom(self):
         axes = self._get_graph_axes()
@@ -5106,12 +5417,10 @@ class GaitAnalysisDashboard(tk.Tk):
 
     def _toggle_tutorial_overlay(self):
         if self._tutorial_overlay is not None and self._tutorial_overlay.winfo_exists():
-            self._tutorial_overlay.destroy()
+            self._tutorial_overlay.close()
             self._tutorial_overlay = None
         else:
-            video_path = _resolve_tutorial_video_path()
-            if video_path:
-                self._tutorial_overlay = TutorialOverlay(self, video_path, on_close=self._on_tutorial_overlay_closed)
+            self._tutorial_overlay = SpotlightTutorial(self)
 
     def _on_tutorial_overlay_closed(self):
         self._tutorial_overlay = None
@@ -5529,7 +5838,7 @@ class GaitAnalysisDashboard(tk.Tk):
     def _on_close(self):
         self._stop_pf = True
         if self._tutorial_overlay is not None and self._tutorial_overlay.winfo_exists():
-            self._tutorial_overlay.destroy()
+            self._tutorial_overlay.close()
             self._tutorial_overlay = None
         if self.playing and self._play_after_id:
             self.after_cancel(self._play_after_id)
