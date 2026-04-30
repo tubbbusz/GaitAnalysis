@@ -2105,7 +2105,20 @@ class SpotlightTutorial:
         y = p.winfo_rooty()
         w = p.winfo_width()
         h = p.winfo_height()
-        self._overlay.geometry(f"{w}x{h}+{x}+{y}")
+        ov = self._overlay
+        # On Windows, overrideredirect Toplevels sometimes ignore geometry()
+        # after the first placement.  withdraw → geometry → deiconify forces
+        # Win32 to honour the new position — but only if the overlay is
+        # currently visible.  If it has been hidden (e.g. for the file picker)
+        # we just update the geometry silently so it appears in the right place
+        # when it is later shown again.
+        currently_visible = ov.winfo_viewable()
+        if currently_visible:
+            ov.withdraw()
+        ov.geometry(f"{w}x{h}+{x}+{y}")
+        if currently_visible:
+            ov.deiconify()
+        ov.update_idletasks()
 
     def _resolve_widgets(self, attr):
         if attr is None:
@@ -2161,11 +2174,20 @@ class SpotlightTutorial:
         if pw <= 1 or ph <= 1:
             return
 
-        ox = p.winfo_rootx()
-        oy = p.winfo_rooty()
+        # Use the overlay window's own reported screen position as the canvas
+        # origin.  Trusting the parent's winfo_rootx/y caused the spotlight hole
+        # to stay locked to wherever the parent was when the tutorial first
+        # opened, because the overlay geometry change and the parent's reported
+        # position could be one Tk layout cycle out of sync.
+        ov = self._overlay
+        ov.update_idletasks()
+        ox = ov.winfo_rootx()
+        oy = ov.winfo_rooty()
 
         widgets = self._resolve_widgets(attr)
         rect    = self._union_rect(widgets)
+
+        print(f"[DRAW] step attr={attr!r}  overlay_origin=({ox},{oy})  parent_size=({pw}x{ph})  widget_rect={rect}")
 
         if rect is None:
             cv.create_rectangle(0, 0, pw, ph, fill=self._DARK, outline="")
@@ -2176,6 +2198,8 @@ class SpotlightTutorial:
         sy0 = max(rect[1] - oy - pad, 0)
         sx1 = min(rect[2] - ox + pad, pw)
         sy1 = min(rect[3] - oy + pad, ph)
+
+        print(f"[DRAW]   canvas hole: ({sx0},{sy0})->({sx1},{sy1})")
 
         hole = self._HOLE if self._use_hole else self._DARK
 
@@ -2194,7 +2218,10 @@ class SpotlightTutorial:
 
     def _place_card(self, attr, side):
         cw = self._card_win
-        cw.deiconify()
+        # On Windows, overrideredirect Toplevels sometimes ignore geometry()
+        # calls after the first placement.  Withdraw → geometry → deiconify
+        # forces the window manager to re-read the position every time.
+        cw.withdraw()
 
         card_w = self._CARD_W
         card_h = self._CARD_H
@@ -2233,7 +2260,10 @@ class SpotlightTutorial:
             cx = max(px + m, min(cx, px + pw - card_w - m))
             cy = max(py + m, min(cy, py + ph - card_h - m))
 
+        print(f"[CARD] geometry={card_w}x{card_h}+{cx}+{cy}  parent=({px},{py}) size=({pw}x{ph})  widget_rect={rect}")
         cw.geometry(f"{card_w}x{card_h}+{cx}+{cy}")
+        cw.deiconify()
+        cw.lift()
 
     # ------------------------------------------------------------------ steps
 
@@ -2278,11 +2308,22 @@ class SpotlightTutorial:
         self._prev_btn.config(state="normal" if idx > 0 else "disabled")
 
         self._fit_overlay()
-        self._draw(attr)
-        self._place_card(attr, side)
 
-        self._overlay.lift()
-        self._card_win.lift()
+        # Defer the actual drawing by one event-loop cycle.  This gives Tk time
+        # to finish laying out any widgets that may have just appeared (markup
+        # screen, analysis screen, etc.) before we call winfo_rootx/y on them.
+        # Without this the spotlight hole and card were computed against stale
+        # geometry and stayed locked to their initial positions.
+        def _do_draw():
+            if self._closed or not self.winfo_exists():
+                return
+            self._fit_overlay()
+            self._draw(attr)
+            self._place_card(attr, side)
+            self._overlay.lift()
+            self._card_win.lift()
+
+        self._parent.after(50, _do_draw)
 
     def _prev_step(self):
         if self._step > 0:
@@ -2950,17 +2991,17 @@ class GaitAnalysisDashboard(tk.Tk):
         self._help_btn = tk.Button(hdr, text="Help", font=("Helvetica", 9),
               bg=BG3, fg=TEXT, relief='flat', padx=8,
               command=self._toggle_tutorial_overlay)
-        self._help_btn.pack(side='right', padx=2, pady=8)
+        self._help_btn.pack(side='right', padx=8, pady=8)
 
         self._remark_btn = tk.Button(hdr, text="Re-mark", font=("Helvetica", 9),
               bg=BG3, fg=TEXT, relief='flat', padx=8,
               command=self._restart_marking_wizard)
-        self._remark_btn.pack(side='right', padx=2, pady=8)
+        self._remark_btn.pack(side='right', padx=8, pady=8)
 
-        self._select_btn = tk.Button(hdr, text="Select", font=("Helvetica", 9),
+        self._select_btn = tk.Button(hdr, text="Upload", font=("Helvetica", 9),
                   bg=BG3, fg=TEXT, relief='flat', padx=8,
                   command=self.find_videos)
-        self._select_btn.pack(side='right', padx=10, pady=8)
+        self._select_btn.pack(side='right', padx=8, pady=8)
 
         # main content area
         main = tk.Frame(self, bg=BG)
