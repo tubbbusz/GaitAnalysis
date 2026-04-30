@@ -374,33 +374,7 @@ def _crop_skeleton_stats(pixel_landmarks_list):
 
 def _debug_crop_stats(landmarks, stats, video_path):
     """Print per-frame y_min to find what's pulling the crop up."""
-    print(f"\n{'='*60}")
-    print(f"CROP DEBUG: {os.path.basename(video_path)}")
-    print(f"  tight_y_min={stats['tight_y_min']:.4f}  tight_y_max={stats['tight_y_max']:.4f}")
-    print(f"  tight_x_min={stats['tight_x_min']:.4f}  tight_x_max={stats['tight_x_max']:.4f}")
-    print(f"  Total frames: {len(landmarks)}")
-    
-    suspicious = []
-    for fi, entry in enumerate(landmarks):
-        if entry is None:
-            continue
-        lms = entry[1] if isinstance(entry, tuple) else entry
-        if lms is None:
-            continue
-        vis = [lm for lm in lms if lm.visibility > _CROP_VIS_THRESH]
-        if not vis:
-            continue
-        fys = [lm.y for lm in vis]
-        frame_y_min = min(fys)
-        if frame_y_min < stats['tight_y_min'] + 0.05:  # frames near top
-            suspicious.append((fi, frame_y_min, 
-                               [(i, lm.y, lm.visibility) for i, lm in enumerate(lms) 
-                                if lm.visibility > _CROP_VIS_THRESH and lm.y < 0.15]))
-    
-    print(f"  Frames with landmarks near top (y < {stats['tight_y_min']+0.05:.3f}):")
-    for fi, y_min, top_lms in suspicious[:20]:  # cap at 20
-        print(f"    frame {fi:4d}: y_min={y_min:.4f}  top landmarks: {top_lms}")
-    print(f"{'='*60}\n")
+    return
 
 def _compute_auto_crop(stats, fw, fh, pad=0.05):
     if stats is None:
@@ -411,7 +385,6 @@ def _compute_auto_crop(stats, fw, fh, pad=0.05):
     y1 = min(1.0, stats['tight_y_max'] + pad)
     w  = max(0.01, x1 - x0)
     h  = max(0.01, y1 - y0)
-    print(f"  _compute_auto_crop → x0={x0:.4f} y0={y0:.4f} w={w:.4f} h={h:.4f}  (fw={fw} fh={fh})")
     return x0, y0, w, h
 
 _CROP_TARGET_FILL = 0.70  # skeleton occupies this fraction of crop height
@@ -1142,7 +1115,6 @@ def _detect_subject_orientation(video_path):
     landmarker.close()
     if detections == 0:
         return False
-    print(f"  [{os.path.basename(video_path)}] vertical_votes={vertical_votes}/{detections} → needs_rotation={vertical_votes <= detections / 2}")
     return vertical_votes > detections / 2
 
 
@@ -1501,7 +1473,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
         _crop_sk_upright['cy'] = _crop_sk['cx']
         _fw_upright = _fh_for_crop
         _fh_upright = _fw_for_crop
-        print(f"  UPRIGHT STATS: tight_x=[{_crop_sk_upright['tight_x_min']:.4f}-{_crop_sk_upright['tight_x_max']:.4f}] tight_y=[{_crop_sk_upright['tight_y_min']:.4f}-{_crop_sk_upright['tight_y_max']:.4f}]")
+        
     else:
         _crop_sk_upright = _crop_sk
         _fw_upright = _fw_for_crop
@@ -2187,7 +2159,7 @@ class SpotlightTutorial:
         widgets = self._resolve_widgets(attr)
         rect    = self._union_rect(widgets)
 
-        print(f"[DRAW] step attr={attr!r}  overlay_origin=({ox},{oy})  parent_size=({pw}x{ph})  widget_rect={rect}")
+        
 
         if rect is None:
             cv.create_rectangle(0, 0, pw, ph, fill=self._DARK, outline="")
@@ -2199,7 +2171,7 @@ class SpotlightTutorial:
         sx1 = min(rect[2] - ox + pad, pw)
         sy1 = min(rect[3] - oy + pad, ph)
 
-        print(f"[DRAW]   canvas hole: ({sx0},{sy0})->({sx1},{sy1})")
+        
 
         hole = self._HOLE if self._use_hole else self._DARK
 
@@ -2260,12 +2232,12 @@ class SpotlightTutorial:
             cx = max(px + m, min(cx, px + pw - card_w - m))
             cy = max(py + m, min(cy, py + ph - card_h - m))
 
-        print(f"[CARD] geometry={card_w}x{card_h}+{cx}+{cy}  parent=({px},{py}) size=({pw}x{ph})  widget_rect={rect}")
+        
         cw.geometry(f"{card_w}x{card_h}+{cx}+{cy}")
         cw.deiconify()
         cw.lift()
 
-    # ------------------------------------------------------------------ steps
+    # steps
 
     def _first_draw(self):
         if not self._closed and self.winfo_exists():
