@@ -1,4 +1,4 @@
-# standard imports
+﻿# standard imports
 import atexit
 import gc
 import hashlib
@@ -1620,9 +1620,6 @@ class FrameCache:
 
 
 class DisplayCache:
-    """Caches fully-rendered, display-ready ImageTk.PhotoImage objects.
-    Keys are (ds_idx, frame_idx, canvas_w, canvas_h, show_mode, skeleton_thickness).
-    Must only be read/written from the main thread (Tk requirement for PhotoImage)."""
     def __init__(self, limit=64):
         self._cache = OrderedDict()
         self._limit = limit
@@ -1680,105 +1677,242 @@ def _draw_centered_text(frame, text, y, scale, color, thickness=2):
     cv2.putText(frame, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
 
 
-
-# ---------------------------------------------------------------------------
-# In-app spotlight tutorial  (replaces the old video-based TutorialOverlay)
-# ---------------------------------------------------------------------------
-
-# Each step: (widget_attr_path, title, description, callout_side)
-# widget_attr_path is a dot-separated path from the GaitAnalysisDashboard instance,
-# or None to show a centred modal card with no spotlight.
 TUTORIAL_STEPS = [
+    # 0: Welcome
     (None,
-     "Welcome to the Tutorial",
-     "This short guide will walk you through the main areas of the Gait Analysis tool.\n"
-     "Click  Next  to continue, or  Skip  at any time.",
-     "center"),
-    ("_vid_canvas1",
-     "Video 1",
-     "The top video panel shows the first recording. Once loaded, the skeleton overlay\n"
-     "is drawn in real-time as you scrub through frames.",
-     "right"),
-    ("_vid_canvas2",
-     "Video 2",
-     "The bottom video panel shows the second recording for side-by-side comparison.",
-     "right"),
-    ("_play_btn",
-     "Playback Controls",
-     "Use  Prev / Play / Next  to step through frames, or press  9  on your keyboard.\n"
-     "Both videos stay synchronised during playback.",
-     "right"),
+     "Welcome to Novita Gait Analysis",
+     "This app lets you compare walking kinematics between two video recordings.\n\n"
+     "You'll upload two videos, mark foot-strike steps on each one, then explore "
+     "hip, knee, and ankle angle graphs alongside outcome metrics.\n\n"
+     "Click  Next  to start the walkthrough, or  Skip  at any time.",
+     "center", None),
+
+    # 1: Upload button — gate advances when Select is clicked
+    ("_select_btn",
+     "Step 1 — Upload your videos",
+     "Click the  Select  button highlighted above.\n\n"
+     "You will be asked to choose two video files — one for each condition "
+     "(e.g. pre- and post-intervention).\n\n"
+     "The tutorial will advance automatically once you have selected both files.",
+     "below", "upload_clicked"),
+
+    # 2: Processing — gate advances when videos finish loading
+    ("_bottom_bar",
+     "Step 2 — Processing your videos",
+     "The app is now running pose estimation on every frame of both videos.\n\n"
+     "Watch the status message at the bottom of the window for progress.\n\n"
+     "If a video was processed before it will load instantly from cache.\n\n"
+     "The tutorial will advance automatically when processing is complete.",
+     "above", "videos_loaded"),
+
+    # 3: Marking — video player
+    ("_markup_canvas",
+     "Step 3 — The marking screen: video player",
+     "The video player shows your first recording with a pose skeleton overlaid.\n\n"
+     "Scrub through the recording by clicking or dragging the graph below the video.\n\n"
+     "Use  1  and  2  to step one frame at a time.",
+     "right", None),
+
+    # 4: Scrub bar
+    ("_markup_mpl_canvas",
+     "Step 4 — Scrubbing through frames",
+     "Click anywhere on this graph to jump to that frame, or drag left and right "
+     "to scrub through the recording.\n\n"
+     "Find the exact moment each heel makes contact with the ground.",
+     "above", None),
+
+    # 5: Mark a step
+    ("_markup_banner_area",
+     "Step 5 — Marking a step",
+     "When the highlighted leg's heel just makes contact with the ground, "
+     "press  SPACE  to record that frame as a step.\n\n"
+     "Aim for at least 6 steps per side for reliable averages.",
+     "below", None),
+
+    # 6: Undo
+    ("_markup_undo_btn",
+     "Step 6 — Undo last step",
+     "Made a mistake?  Click  Undo Last Step  (or press  Backspace) to remove "
+     "the most recently marked step.\n\n"
+     "You can undo as many times as needed before moving on.",
+     "above", None),
+
+    # 7: Done button — spotlight video + scrubber + done button so user can mark then click done
+    (["_markup_canvas", "_markup_mpl_canvas", "_markup_continue_btn"],
+     "Step 7 — Mark steps then click Done",
+     "Scrub through the video and press  SPACE  at each heel contact to mark steps.\n\n"
+     "The  Done  button at the bottom-right advances to the next video or side.\n\n"
+     "Work through all four phases (Left V1 → Left V2 → Right V1 → Right V2).\n\n"
+     "The tutorial will advance automatically after all marking is complete.",
+     "left", "all_marking_done"),
+
+    # 8: Analysis overview
+    (["_vid_canvas1L", "_vid_canvas1R", "_vid_canvas2L", "_vid_canvas2R",
+      "_canvas_hip", "_canvas_knee", "_canvas_ankle"],
+     "The analysis screen",
+     "You are now on the main analysis screen.\n\n"
+     "It shows four gait-cycle video panels, three joint-angle graphs, "
+     "a display control panel on the right, and outcome metrics.\n\n"
+     "Click  Next  for a detailed tour of each section.",
+     "left", None),
+
+    # 9: Video panels
+    (["_vid_canvas1L", "_vid_canvas1R"],
+     "Video panels — Video 1",
+     "These panels show the best representative gait cycle for the Left and Right "
+     "legs of Video 1.\n\n"
+     "They loop through a single stride and stay synchronised with all three graphs.",
+     "right", None),
+
+    # 10: Video panels V2
+    (["_vid_canvas2L", "_vid_canvas2R"],
+     "Video panels — Video 2",
+     "These panels show the Left and Right cycles for Video 2 — your second condition.\n\n"
+     "Compare with the Video 1 panels above to spot changes between sessions.",
+     "right", None),
+
+    # 11: Hip graph
     ("_canvas_hip",
-     "Hip Angle Graph",
-     "The hip joint angle is plotted here across the full recording.\n"
-     "Click or drag to move the playback cursor.  Right-drag to exclude a region.",
-     "left"),
+     "Hip angle graph",
+     "Shows hip flexion / extension across the gait cycle (0–100 %).\n\n"
+     "Dotted = Video 1 · Solid = Video 2\n"
+     "Red/warm = Left · Blue/cool = Right\n\n"
+     "The shaded band is the confidence interval across all cycles.\n"
+     "Click the graph to seek all four videos to that gait phase.",
+     "left", None),
+
+    # 12: Knee graph
     ("_canvas_knee",
-     "Knee Angle Graph",
-     "Knee flexion / extension for both limbs. Use  v  to toggle which version\n"
-     "is shown, and  c  to switch between continuous and overlaid cycle views.",
-     "left"),
+     "Knee angle graph",
+     "Shows knee flexion across the gait cycle.\n\n"
+     "The large flexion peak in mid-graph is the swing-phase knee bend — "
+     "a key indicator of gait quality.\n\n"
+     "Same colour / line-style convention as the hip graph.",
+     "left", None),
+
+    # 13: Ankle graph
     ("_canvas_ankle",
-     "Ankle Angle Graph",
-     "Ankle dorsiflexion / plantarflexion.  Press  F3  to adjust the normative\n"
-     "offset, and  m  to toggle the mean curve overlay.",
-     "left"),
+     "Ankle angle graph",
+     "Shows ankle dorsiflexion / plantarflexion across the cycle.\n\n"
+     "Look for the plantarflexion dip at push-off (~60 %) and the "
+     "dorsiflexion rise during swing.\n\n"
+     "Same colour / line-style convention as the other graphs.",
+     "left", None),
+
+    # 14: Display toggles
+    (["_cycles_btn", "_world_btn"],
+     "Display toggle buttons",
+     "Cycles  switches between overlaid gait-cycle view and a raw time-series view.\n\n"
+     "World / Pixel  toggles between MediaPipe 3-D world-space angles and "
+     "2-D pixel-based angles.",
+     "left", None),
+
+    # 15: Mean / Data / Normal / Outliers
+    (["_display_btns.mean", "_display_btns.data",
+      "_display_btns.normal", "_display_btns.outliers"],
+     "Mean, Data, Normal, Outliers",
+     "These buttons change what is plotted on all three graphs:\n"
+     "  Mean     — average curve with a shaded confidence band\n"
+     "  Data     — every individual cycle as a faint line\n"
+     "  Normal   — a healthy normative reference curve in grey\n"
+     "  Outliers — cycles that deviate significantly from the mean",
+     "left", None),
+
+    # 16: Playback
+    (["_prev_frame_btn", "_play_btn", "_next_frame_btn"],
+     "Prev, Play, and Next",
+     "Prev  and  Next  step through individual frames of the gait cycle.\n"
+     "Play  animates all four videos together in real time.\n\n"
+     "Useful for comparing movement timing and bilateral symmetry side-by-side.",
+     "right", None),
+
+    # 17: Metrics
+    ("_metrics_canvas",
+     "Outcome metrics",
+     "Shows percentage changes from Video 1 to Video 2:\n"
+     "  Cadence — steps per minute\n"
+     "  Step Variability — left-right timing CV\n"
+     "  Knee ROM (mean / peak) — average and peak knee flexion\n"
+     "  Hip ROM (mean) — average hip range of motion\n\n"
+     "Green arrows = increase · Red arrows = decrease.",
+     "left", None),
+
+    # 18: Clear buttons
+    (["_clear_steps_btn", "_clear_excl_btn"],
+     "Clear Steps and Clear Excl. Zone",
+     "Clear Steps  removes all your marked steps so you can re-mark from scratch.\n\n"
+     "Clear Excl. Zone  removes any exclusion zone drawn on the scrub bar — "
+     "used to ignore a segment such as a turn-around.",
+     "left", None),
+
+    # 19: Upload / Re-mark
+    (["_select_btn", "_remark_btn"],
+     "Upload and Re-mark",
+     "Select  (top-right) loads a completely new pair of videos at any time.\n\n"
+     "Re-mark  takes you back to the step-marking screen to add or correct steps "
+     "without discarding your current videos.",
+     "below", None),
+
+    # 20: Done
     (None,
      "You're all set!",
-     "Keyboard shortcuts are listed in the Help text at the top of the window.\n"
-     "Press  h  at any time to restart this tutorial.  Happy analysing!",
-     "center"),
+     "That's the full tour of the Novita Gait Analysis app.\n\n"
+     "Press  h  at any time to reopen this tutorial.\n\n"
+     "Happy analysing!",
+     "center", None),
 ]
+
 
 
 class SpotlightTutorial:
     """
-    In-app guided tutorial.
+    In-app guided tutorial — spotlight overlay + callout card.
 
-    How the spotlight works
-    -----------------------
-    The overlay is a borderless, always-on-top Toplevel that exactly covers the
-    parent window.  Its canvas is painted with four solid dark rectangles that
-    surround the spotlight area — leaving a literal gap where the target widget
-    is visible.  On Windows we additionally set -transparentcolor on the overlay
-    to a magic pink colour (#fe01fe) and paint the spotlight gap with that colour,
-    making it a true transparent cut-out.  On other platforms the gap is simply
-    the canvas background (same dark colour), which still looks correct because
-    the overlay window uses -alpha for the dimming.
+    TUTORIAL_STEPS format:
+        (widget_attr, title, desc, side, gate)
 
-    Card
-    ----
-    A separate always-on-top borderless Toplevel holds the callout card.
-    It is positioned to the requested side of the spotlight rectangle and
-    clamped inside the parent window bounds.
+    widget_attr: str | list[str] | None
+        Attribute name(s) on GaitAnalysisDashboard.
+        list → bounding-box union of all widgets.
+        None → no spotlight (centred card).
+    gate: str | None
+        If set, the Next button is disabled until the dashboard calls
+        self._tutorial_overlay.advance(gate).
+
+    Spotlight
+    ---------
+    On Windows: -transparentcolor punches a true transparent hole so the
+    live UI shows through.
+    Other platforms: -alpha dimming with an accent border around the gap.
 
     Parent tracking
     ---------------
-    <Configure> on the parent → debounced refit so the overlay follows moves,
-                                resizes, and maximise/restore.
-    <Unmap>                   → hide overlay on minimise.
-    <Map>                     → show and redraw on restore.
+    <Configure> → debounced refit (move / resize / maximise).
+    <Unmap>     → hide on minimise.
+    <Map>       → show + redraw on restore.
     """
 
-    _DARK        = "#1c1c1c"    # dark fill colour for dimmed areas
-    _HOLE        = "#fe01fe"    # transparent-hole colour (Windows only)
-    _ALPHA       = 0.70         # overlay window alpha
-    _SPOT_PAD    = 10           # px around target widget
-    _CARD_GAP    = 22           # px between spotlight edge and card
-    _CARD_W      = 340          # card pixel width
-    _CARD_PAD    = 20
-    _CARD_BG     = "#ffffff"
-    _ACCENT      = ACCENT
+    _DARK     = "#1c1c1c"
+    _HOLE     = "#fe01fe"
+    _ALPHA    = 0.72
+    _SPOT_PAD = 10
+    _CARD_GAP = 24
+    _CARD_W   = 340
+    _CARD_H   = 340
+    _CARD_PAD = 18
+    _CARD_BG  = "#ffffff"
+    _ACCENT   = ACCENT
 
-    def __init__(self, parent):
-        self._parent   = parent
-        self._step     = 0
-        self._overlay  = None
-        self._canvas   = None
-        self._card_win = None
-        self._closed   = False
-        self._after_id = None
-        self._use_hole = False   # True if -transparentcolor is supported
+    def __init__(self, parent, start_step=0):
+        self._parent    = parent
+        self._step      = max(0, min(start_step, len(TUTORIAL_STEPS) - 1))
+        self._overlay   = None
+        self._canvas    = None
+        self._card_win  = None
+        self._closed    = False
+        self._after_id  = None
+        self._use_hole  = False
+        self._gated     = False   # True when waiting for a gate event
 
         self._build()
         self._bind_parent()
@@ -1790,7 +1924,6 @@ class SpotlightTutorial:
         p = self._parent
         p.update_idletasks()
 
-        # --- overlay window ---
         ov = tk.Toplevel(p)
         ov.overrideredirect(True)
         ov.attributes("-topmost", True)
@@ -1799,7 +1932,6 @@ class SpotlightTutorial:
             ov.attributes("-alpha", self._ALPHA)
         except Exception:
             pass
-        # Windows: set transparentcolor so the hole colour is see-through
         try:
             ov.attributes("-transparentcolor", self._HOLE)
             self._use_hole = True
@@ -1809,16 +1941,16 @@ class SpotlightTutorial:
 
         cv = tk.Canvas(ov, bg=self._DARK, highlightthickness=0, cursor="arrow")
         cv.pack(fill="both", expand=True)
-        cv.bind("<Button-1>", lambda e: self._next_step())
+        cv.bind("<Button-1>", lambda e: self._on_overlay_click())
         self._canvas = cv
 
         self._fit_overlay()
 
-        # --- card window ---
         cw = tk.Toplevel(p)
         cw.overrideredirect(True)
         cw.attributes("-topmost", True)
         cw.configure(bg=self._CARD_BG)
+        cw.minsize(self._CARD_W, 1)
         self._card_win = cw
         self._make_card()
         cw.withdraw()
@@ -1826,23 +1958,29 @@ class SpotlightTutorial:
     def _make_card(self):
         cw  = self._card_win
         W   = self._CARD_W
+        H   = self._CARD_H
         pad = self._CARD_PAD
 
-        # set a minimum width so winfo_reqwidth returns the right value
-        cw.minsize(W, 1)
+        # Fix the card to an exact size — avoids unreliable winfo_req* measurements
+        cw.geometry(f"{W}x{H}")
+        cw.resizable(False, False)
 
-        # accent top bar
-        tk.Frame(cw, bg=self._ACCENT, height=5).pack(fill="x", side="top")
+        # accent bar
+        tk.Frame(cw, bg=self._ACCENT, height=5).place(x=0, y=0, width=W)
 
-        # thin border effect using a frame with a slightly darker bg
-        border = tk.Frame(cw, bg="#cccccc", bd=0)
-        border.pack(fill="both", expand=True)
+        # border
+        tk.Frame(cw, bg="#cccccc").place(x=0, y=5, width=W, height=H - 5)
 
-        body = tk.Frame(border, bg=self._CARD_BG)
-        body.pack(fill="both", expand=True, padx=1, pady=(0, 1))
+        # white body (1px inset from border)
+        body = tk.Frame(cw, bg=self._CARD_BG)
+        body.place(x=1, y=6, width=W - 2, height=H - 7)
 
+        # inner padded container
         inner = tk.Frame(body, bg=self._CARD_BG)
-        inner.pack(fill="both", expand=True, padx=pad, pady=(pad, pad))
+        inner.place(x=pad, y=pad, width=W - 2 - pad * 2,
+                    height=H - 7 - pad * 2)
+
+        iw = W - 2 - pad * 2   # inner width for wraplength
 
         self._step_lbl = tk.Label(inner, text="", font=("Helvetica", 8),
                                    bg=self._CARD_BG, fg="#999999", anchor="w")
@@ -1850,27 +1988,25 @@ class SpotlightTutorial:
 
         self._title_lbl = tk.Label(inner, text="", font=("Helvetica", 12, "bold"),
                                     bg=self._CARD_BG, fg=TEXT, anchor="w",
-                                    wraplength=W - pad * 2, justify="left")
+                                    wraplength=iw, justify="left")
         self._title_lbl.pack(fill="x", pady=(5, 0))
 
         self._desc_lbl = tk.Label(inner, text="", font=("Helvetica", 10),
                                    bg=self._CARD_BG, fg=SUBTEXT, anchor="nw",
-                                   wraplength=W - pad * 2, justify="left")
-        self._desc_lbl.pack(fill="x", pady=(8, 14))
+                                   wraplength=iw, justify="left")
+        self._desc_lbl.pack(fill="x", pady=(8, 0))
 
-        # progress dots
-        dots = tk.Frame(inner, bg=self._CARD_BG)
-        dots.pack(fill="x", pady=(0, 12))
-        self._dots = []
-        for _ in TUTORIAL_STEPS:
-            lbl = tk.Label(dots, text="●", font=("Helvetica", 9),
-                           bg=self._CARD_BG, fg="#dddddd")
-            lbl.pack(side="left", padx=2)
-            self._dots.append(lbl)
+        self._gate_lbl = tk.Label(inner, text="", font=("Helvetica", 9, "italic"),
+                                   bg=self._CARD_BG, fg=self._ACCENT, anchor="w",
+                                   wraplength=iw, justify="left")
+        self._gate_lbl.pack(fill="x", pady=(6, 0))
 
-        # buttons
-        btns = tk.Frame(inner, bg=self._CARD_BG)
-        btns.pack(fill="x")
+        # push buttons + dots to the bottom of the inner frame
+        btn_area = tk.Frame(inner, bg=self._CARD_BG)
+        btn_area.pack(side="bottom", fill="x")
+
+        btns = tk.Frame(btn_area, bg=self._CARD_BG)
+        btns.pack(fill="x", pady=(0, 2))
 
         self._skip_btn = tk.Button(btns, text="Skip", font=("Helvetica", 9),
                                     bg="#eeeeee", fg="#888888", relief="flat",
@@ -1891,34 +2027,56 @@ class SpotlightTutorial:
                                     command=self._prev_step)
         self._prev_btn.pack(side="right", padx=(0, 6))
 
-    # ---------------------------------------------------------------- events
+        dots_frame = tk.Frame(btn_area, bg=self._CARD_BG)
+        dots_frame.pack(fill="x", pady=(0, 6))
+        self._dots = []
+        for _ in TUTORIAL_STEPS:
+            lbl = tk.Label(dots_frame, text="●", font=("Helvetica", 9),
+                           bg=self._CARD_BG, fg="#dddddd")
+            lbl.pack(side="left", padx=2)
+            self._dots.append(lbl)
+
+    # ----------------------------------------------------------------- events
 
     def _bind_parent(self):
         p = self._parent
-        p.bind("<Configure>", self._on_configure, add="+")
-        p.bind("<Unmap>",     self._on_unmap,     add="+")
-        p.bind("<Map>",       self._on_map,        add="+")
+        # Store funcids so we only remove our own bindings on cleanup
+        self._bind_ids = {
+            "<Configure>": p.bind("<Configure>", self._on_configure, add="+"),
+            "<Unmap>":     p.bind("<Unmap>",     self._on_unmap,     add="+"),
+            "<Map>":       p.bind("<Map>",        self._on_map,       add="+"),
+        }
 
     def _unbind_parent(self):
         try:
-            self._parent.unbind("<Configure>")
-            self._parent.unbind("<Unmap>")
-            self._parent.unbind("<Map>")
+            p = self._parent
+            for event, fid in getattr(self, "_bind_ids", {}).items():
+                try:
+                    p.unbind(event, fid)
+                except Exception:
+                    pass
         except Exception:
             pass
 
-    def _on_configure(self, _event):
+    def _on_overlay_click(self):
+        if not self._gated:
+            self._next_step()
+
+    def _on_configure(self, event):
         if self._closed:
+            return
+        # Only react to the top-level window's own Configure (not child widgets)
+        if event.widget is not self._parent:
             return
         if self._after_id:
             try:
                 self._parent.after_cancel(self._after_id)
             except Exception:
                 pass
-        self._after_id = self._parent.after(100, self._redraw)
+        self._after_id = self._parent.after(80, self._redraw)
 
-    def _on_unmap(self, _event):
-        if self._closed:
+    def _on_unmap(self, event):
+        if self._closed or event.widget is not self._parent:
             return
         for w in (self._overlay, self._card_win):
             try:
@@ -1927,8 +2085,8 @@ class SpotlightTutorial:
             except Exception:
                 pass
 
-    def _on_map(self, _event):
-        if self._closed:
+    def _on_map(self, event):
+        if self._closed or event.widget is not self._parent:
             return
         for w in (self._overlay, self._card_win):
             try:
@@ -1941,7 +2099,6 @@ class SpotlightTutorial:
     # --------------------------------------------------------------- geometry
 
     def _fit_overlay(self):
-        """Resize overlay to exactly match parent window on screen."""
         p = self._parent
         p.update_idletasks()
         x = p.winfo_rootx()
@@ -1950,13 +2107,23 @@ class SpotlightTutorial:
         h = p.winfo_height()
         self._overlay.geometry(f"{w}x{h}+{x}+{y}")
 
-    def _resolve_widget(self, attr_path):
-        if not attr_path:
-            return None
-        _mpl = {"_canvas_hip", "_canvas_knee", "_canvas_ankle"}
+    def _resolve_widgets(self, attr):
+        if attr is None:
+            return []
+        if isinstance(attr, list):
+            return [w for w in (self._resolve_one(a) for a in attr) if w]
+        w = self._resolve_one(attr)
+        return [w] if w else []
+
+    def _resolve_one(self, attr_path):
+        _mpl = {"_canvas_hip", "_canvas_knee", "_canvas_ankle", "_markup_mpl_canvas"}
         obj = self._parent
         for part in attr_path.split("."):
-            obj = getattr(obj, part, None)
+            # _display_btns is a dict; use dict lookup for the sub-key
+            if isinstance(obj, dict):
+                obj = obj.get(part)
+            else:
+                obj = getattr(obj, part, None)
             if obj is None:
                 return None
             if part in _mpl:
@@ -1966,122 +2133,113 @@ class SpotlightTutorial:
                     return None
         return obj
 
-    def _spotlight_local(self, widget):
-        """Spotlight rect in overlay-local coords, plus overlay w/h."""
-        p   = self._parent
-        p.update_idletasks()
-        widget.update_idletasks()
-
-        # parent (= overlay) top-left in screen coords
-        ox = p.winfo_rootx()
-        oy = p.winfo_rooty()
-        ow = p.winfo_width()
-        oh = p.winfo_height()
-
-        wx = widget.winfo_rootx() - ox
-        wy = widget.winfo_rooty() - oy
-        ww = widget.winfo_width()
-        wh = widget.winfo_height()
-
-        pad = self._SPOT_PAD
-        sx0 = max(wx - pad, 0)
-        sy0 = max(wy - pad, 0)
-        sx1 = min(wx + ww + pad, ow)
-        sy1 = min(wy + wh + pad, oh)
-        return sx0, sy0, sx1, sy1, ow, oh
+    def _union_rect(self, widgets):
+        rects = []
+        for w in widgets:
+            try:
+                w.update_idletasks()
+                rects.append((w.winfo_rootx(), w.winfo_rooty(),
+                               w.winfo_rootx() + w.winfo_width(),
+                               w.winfo_rooty() + w.winfo_height()))
+            except Exception:
+                pass
+        if not rects:
+            return None
+        return (min(r[0] for r in rects), min(r[1] for r in rects),
+                max(r[2] for r in rects), max(r[3] for r in rects))
 
     # --------------------------------------------------------------- drawing
 
-    def _draw(self, attr_path):
-        """Repaint the overlay canvas for the current step."""
+    def _draw(self, attr):
         cv = self._canvas
         cv.delete("all")
 
-        p  = self._parent
+        p = self._parent
         p.update_idletasks()
-        ow = p.winfo_width()
-        oh = p.winfo_height()
-        if ow <= 1 or oh <= 1:
+        pw = p.winfo_width()
+        ph = p.winfo_height()
+        if pw <= 1 or ph <= 1:
             return
 
-        widget = self._resolve_widget(attr_path)
+        ox = p.winfo_rootx()
+        oy = p.winfo_rooty()
 
-        if widget is None:
-            # full dark cover, no spotlight
-            cv.create_rectangle(0, 0, ow, oh, fill=self._DARK, outline="")
+        widgets = self._resolve_widgets(attr)
+        rect    = self._union_rect(widgets)
+
+        if rect is None:
+            cv.create_rectangle(0, 0, pw, ph, fill=self._DARK, outline="")
             return
 
-        sx0, sy0, sx1, sy1, ow, oh = self._spotlight_local(widget)
+        pad = self._SPOT_PAD
+        sx0 = max(rect[0] - ox - pad, 0)
+        sy0 = max(rect[1] - oy - pad, 0)
+        sx1 = min(rect[2] - ox + pad, pw)
+        sy1 = min(rect[3] - oy + pad, ph)
 
         hole = self._HOLE if self._use_hole else self._DARK
 
-        # four dark panels around the spotlight
-        cv.create_rectangle(0,   0,   ow,  sy0, fill=self._DARK, outline="")
-        cv.create_rectangle(0,   sy1, ow,  oh,  fill=self._DARK, outline="")
-        cv.create_rectangle(0,   sy0, sx0, sy1, fill=self._DARK, outline="")
-        cv.create_rectangle(sx1, sy0, ow,  sy1, fill=self._DARK, outline="")
+        if sy0 > 0:
+            cv.create_rectangle(0, 0, pw, sy0, fill=self._DARK, outline="")
+        if sy1 < ph:
+            cv.create_rectangle(0, sy1, pw, ph, fill=self._DARK, outline="")
+        if sx0 > 0:
+            cv.create_rectangle(0, sy0, sx0, sy1, fill=self._DARK, outline="")
+        if sx1 < pw:
+            cv.create_rectangle(sx1, sy0, pw, sy1, fill=self._DARK, outline="")
 
-        # spotlight hole (transparent on Windows, dark on others)
         cv.create_rectangle(sx0, sy0, sx1, sy1, fill=hole, outline="")
-
-        # accent border around spotlight
         cv.create_rectangle(sx0, sy0, sx1, sy1,
                             outline=self._ACCENT, width=3, fill="")
 
-    def _place_card(self, attr_path, side):
+    def _place_card(self, attr, side):
         cw = self._card_win
         cw.deiconify()
-        cw.update_idletasks()
 
-        # winfo_reqwidth/height is reliable after update_idletasks when using pack
-        card_w = max(cw.winfo_reqwidth(),  self._CARD_W)
-        card_h = max(cw.winfo_reqheight(), 60)
+        card_w = self._CARD_W
+        card_h = self._CARD_H
 
         p  = self._parent
+        p.update_idletasks()
         px = p.winfo_rootx()
         py = p.winfo_rooty()
         pw = p.winfo_width()
         ph = p.winfo_height()
 
-        widget = self._resolve_widget(attr_path)
+        widgets = self._resolve_widgets(attr)
+        rect    = self._union_rect(widgets)
 
-        if widget is None or side == "center":
+        if rect is None or side == "center":
             cx = px + (pw - card_w) // 2
             cy = py + (ph - card_h) // 2
         else:
-            p.update_idletasks()
-            widget.update_idletasks()
-            wx = widget.winfo_rootx()
-            wy = widget.winfo_rooty()
-            ww = widget.winfo_width()
-            wh = widget.winfo_height()
+            wx0, wy0, wx1, wy1 = rect
             gap = self._SPOT_PAD + self._CARD_GAP
 
             if side == "right":
-                cx = wx + ww + gap
-                cy = wy + wh // 2 - card_h // 2
+                cx = wx1 + gap
+                cy = wy0 + (wy1 - wy0) // 2 - card_h // 2
             elif side == "left":
-                cx = wx - card_w - gap
-                cy = wy + wh // 2 - card_h // 2
+                cx = wx0 - card_w - gap
+                cy = wy0 + (wy1 - wy0) // 2 - card_h // 2
             elif side == "below":
-                cx = wx + ww // 2 - card_w // 2
-                cy = wy + wh + gap
+                cx = wx0 + (wx1 - wx0) // 2 - card_w // 2
+                cy = wy1 + gap
             else:  # above
-                cx = wx + ww // 2 - card_w // 2
-                cy = wy - card_h - gap
+                cx = wx0 + (wx1 - wx0) // 2 - card_w // 2
+                cy = wy0 - card_h - gap
 
-            # clamp inside parent
             m = 12
             cx = max(px + m, min(cx, px + pw - card_w - m))
             cy = max(py + m, min(cy, py + ph - card_h - m))
 
         cw.geometry(f"{card_w}x{card_h}+{cx}+{cy}")
 
-    # --------------------------------------------------------------- steps
+    # ------------------------------------------------------------------ steps
 
     def _first_draw(self):
         if not self._closed and self.winfo_exists():
-            self._show_step(0)
+            self._show_step(self._step)
 
     def _redraw(self):
         self._after_id = None
@@ -2092,20 +2250,36 @@ class SpotlightTutorial:
         if self._closed or not self.winfo_exists():
             return
         self._step = idx
-        attr_path, title, desc, side = TUTORIAL_STEPS[idx]
+        step = TUTORIAL_STEPS[idx]
+        attr, title, desc, side, gate = step[0], step[1], step[2], step[3], step[4]
         n = len(TUTORIAL_STEPS)
+
+        self._gated = bool(gate)
 
         self._step_lbl.config(text=f"Step {idx + 1} of {n}")
         self._title_lbl.config(text=title)
         self._desc_lbl.config(text=desc)
+
+        if gate:
+            self._gate_lbl.config(text="⏳  Waiting for you to complete this action…")
+            self._next_btn.config(state="disabled",
+                                   bg="#aaaaaa", cursor="")
+        else:
+            self._gate_lbl.config(text="")
+            last = (idx == n - 1)
+            self._next_btn.config(
+                state="normal",
+                bg=self._ACCENT,
+                cursor="hand2",
+                text="Finish ✓" if last else "Next →")
+
         for i, dot in enumerate(self._dots):
             dot.config(fg=self._ACCENT if i == idx else "#dddddd")
         self._prev_btn.config(state="normal" if idx > 0 else "disabled")
-        self._next_btn.config(text="Finish ✓" if idx == n - 1 else "Next →")
 
         self._fit_overlay()
-        self._draw(attr_path)
-        self._place_card(attr_path, side)
+        self._draw(attr)
+        self._place_card(attr, side)
 
         self._overlay.lift()
         self._card_win.lift()
@@ -2115,10 +2289,34 @@ class SpotlightTutorial:
             self._show_step(self._step - 1)
 
     def _next_step(self):
+        if self._gated:
+            return
         if self._step < len(TUTORIAL_STEPS) - 1:
             self._show_step(self._step + 1)
         else:
             self.close()
+
+    def advance(self, gate_id):
+        """
+        Called by the dashboard when a gated action occurs.
+        If the current step's gate matches gate_id, auto-advance to next step.
+        """
+        if self._closed or not self.winfo_exists():
+            return
+        step = TUTORIAL_STEPS[self._step]
+        if step[4] == gate_id:
+            self._gated = False
+            # ensure windows are visible (may have been hidden during file picker)
+            for w in (self._overlay, self._card_win):
+                try:
+                    if w and w.winfo_exists():
+                        w.deiconify()
+                except Exception:
+                    pass
+            if self._step < len(TUTORIAL_STEPS) - 1:
+                self._show_step(self._step + 1)
+            else:
+                self.close()
 
     # --------------------------------------------------------------- cleanup
 
@@ -2144,8 +2342,6 @@ class SpotlightTutorial:
 
     def winfo_exists(self):
         return bool(self._overlay and self._overlay.winfo_exists())
-
-
 
 
 class CacheManagerDialog(tk.Toplevel):
@@ -2751,20 +2947,20 @@ class GaitAnalysisDashboard(tk.Tk):
         title_label.pack(side='left', pady=(6, 0))
         title_label.bind('<Button-1>', lambda e: self._open_settings())
 
-        tk.Button(hdr, text="Help", font=("Helvetica", 9),
+        self._help_btn = tk.Button(hdr, text="Help", font=("Helvetica", 9),
               bg=BG3, fg=TEXT, relief='flat', padx=8,
-              command=self._toggle_tutorial_overlay
-              ).pack(side='right', padx=2, pady=8)
+              command=self._toggle_tutorial_overlay)
+        self._help_btn.pack(side='right', padx=2, pady=8)
 
-        tk.Button(hdr, text="Re-mark", font=("Helvetica", 9),
+        self._remark_btn = tk.Button(hdr, text="Re-mark", font=("Helvetica", 9),
               bg=BG3, fg=TEXT, relief='flat', padx=8,
-              command=self._restart_marking_wizard
-              ).pack(side='right', padx=2, pady=8)
+              command=self._restart_marking_wizard)
+        self._remark_btn.pack(side='right', padx=2, pady=8)
 
-        tk.Button(hdr, text="Select", font=("Helvetica", 9),
+        self._select_btn = tk.Button(hdr, text="Select", font=("Helvetica", 9),
                   bg=BG3, fg=TEXT, relief='flat', padx=8,
-                  command=self.find_videos
-                  ).pack(side='right', padx=10, pady=8)
+                  command=self.find_videos)
+        self._select_btn.pack(side='right', padx=10, pady=8)
 
         # main content area
         main = tk.Frame(self, bg=BG)
@@ -2912,7 +3108,11 @@ class GaitAnalysisDashboard(tk.Tk):
             b.pack(side='left', padx=3)
             if txt == "Play":
                 self._play_btn = b
-            elif txt in ("Prev", "Next"):
+            elif txt == "Prev":
+                self._prev_frame_btn = b
+                b.bind('<ButtonRelease-1>', lambda e: self.after(0, self._flush_graph_redraw))
+            elif txt == "Next":
+                self._next_frame_btn = b
                 b.bind('<ButtonRelease-1>', lambda e: self.after(0, self._flush_graph_redraw))
 
         # --- video 2 row: sub-row with two columns for cycle mode ---
@@ -3277,10 +3477,12 @@ class GaitAnalysisDashboard(tk.Tk):
         tk.Frame(parent, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
 
         # section 3: clear steps and exclusion zones
-        tk.Button(parent, text="Clear Steps", **btn_cfg,
-              command=self._clear_steps).pack(fill='x', padx=6, pady=1)
-        tk.Button(parent, text="Clear Excl. Zone", **btn_cfg,
-              command=self._clear_exclusions).pack(fill='x', padx=6, pady=1)
+        self._clear_steps_btn = tk.Button(parent, text="Clear Steps", **btn_cfg,
+              command=self._clear_steps)
+        self._clear_steps_btn.pack(fill='x', padx=6, pady=1)
+        self._clear_excl_btn = tk.Button(parent, text="Clear Excl. Zone", **btn_cfg,
+              command=self._clear_exclusions)
+        self._clear_excl_btn.pack(fill='x', padx=6, pady=1)
 
         self._update_display_btn_visuals()
 
@@ -3354,8 +3556,24 @@ class GaitAnalysisDashboard(tk.Tk):
     # video selection
 
     def find_videos(self):
+        # hide tutorial overlay so the file-picker is not blocked
+        _tov = self._tutorial_overlay
+        if _tov is not None and _tov.winfo_exists():
+            try:
+                _tov._overlay.withdraw()
+                _tov._card_win.withdraw()
+            except Exception:
+                pass
+
         video_paths = list(select_video_paths())
         if len(video_paths) == 0:
+            # restore overlay if user cancelled
+            if _tov is not None and _tov.winfo_exists():
+                try:
+                    _tov._overlay.deiconify()
+                    _tov._card_win.deiconify()
+                except Exception:
+                    pass
             return
         if len(video_paths) == 1:
             second = filedialog.askopenfilename(
@@ -3364,9 +3582,17 @@ class GaitAnalysisDashboard(tk.Tk):
             if not second:
                 messagebox.showwarning("Two videos required",
                                        "Please select two videos to run the analysis.", parent=self)
+                # restore overlay if user cancelled
+                if _tov is not None and _tov.winfo_exists():
+                    try:
+                        _tov._overlay.deiconify()
+                        _tov._card_win.deiconify()
+                    except Exception:
+                        pass
                 return
             video_paths.append(second)
         video_paths = video_paths[:2]
+        self._tutorial_gate('upload_clicked')  # tutorial: user clicked Select and picked files
         self.video_names = [os.path.splitext(os.path.basename(p))[0] for p in video_paths]
         self._vid1_lbl.config(text=f"VIDEO 1  —  {self.video_names[0]}")
         self._vid2_lbl.config(text=f"VIDEO 2  —  {self.video_names[1]}")
@@ -3509,6 +3735,7 @@ class GaitAnalysisDashboard(tk.Tk):
             self.resample_cycles = False
             cached_loaded = self._resolve_cached_markup()
             # auto_excl_count = self._auto_exclude_bad_regions(overwrite=False)  # disabled - trigger with F4 instead
+            self._tutorial_gate('videos_loaded')  # tutorial: processing complete
             if self._start_required_markup_flow():
                 return
             self.show_overlaid_cycles = True
@@ -5415,15 +5642,52 @@ class GaitAnalysisDashboard(tk.Tk):
             self._play_after_id = None
         self._enter_marking_phase('left', 0)
 
+    def _tutorial_start_step(self):
+        """
+        Return the TUTORIAL_STEPS index that best matches the current app state.
+
+        Step map
+        --------
+        0  — welcome / no videos yet
+        1  — Upload button (never jumped to; 0 is used before upload)
+        2  — processing (datasets empty but progress > 0 / loading thread running)
+        3  — markup screen (any of the 4 marking phases)
+        8  — analysis screen, cycle view
+        """
+        # Videos are loading (find_videos was called but _finish hasn't run yet)
+        if not self.datasets and self.progress > 0.0:
+            return 2  # processing step
+
+        # On the markup / marking screen
+        if self._marking_phase is not None:
+            return 3  # marking screen — video player step
+
+        # On the analysis screen with overlaid cycles
+        if self.datasets and self.show_overlaid_cycles:
+            return 8  # analysis overview step
+
+        # Analysis screen but in continuous mode (also treat as analysis)
+        if self.datasets and not self.show_overlaid_cycles and self._markup_frame is not None:
+            return 8
+
+        # Default: no videos uploaded yet — start from the beginning
+        return 0
+
     def _toggle_tutorial_overlay(self):
         if self._tutorial_overlay is not None and self._tutorial_overlay.winfo_exists():
             self._tutorial_overlay.close()
             self._tutorial_overlay = None
         else:
-            self._tutorial_overlay = SpotlightTutorial(self)
+            start = self._tutorial_start_step()
+            self._tutorial_overlay = SpotlightTutorial(self, start_step=start)
 
     def _on_tutorial_overlay_closed(self):
         self._tutorial_overlay = None
+
+    def _tutorial_gate(self, gate_id):
+        """Notify the tutorial that a gated action has occurred."""
+        if self._tutorial_overlay is not None and self._tutorial_overlay.winfo_exists():
+            self._tutorial_overlay.advance(gate_id)
 
     # guided step marking screen
 
@@ -5484,9 +5748,10 @@ class GaitAnalysisDashboard(tk.Tk):
         ctrl_row = tk.Frame(self._markup_frame, bg=BG2, height=52)
         ctrl_row.pack(fill='x', side='bottom')
         ctrl_row.pack_propagate(False)
-        tk.Button(ctrl_row, text="⌫  Undo Last Step",
+        self._markup_undo_btn = tk.Button(ctrl_row, text="⌫  Undo Last Step",
             font=("Helvetica", 9), bg=BG3, fg=TEXT, relief='flat', padx=12, cursor='hand2',
-            command=self._markup_remove_last).pack(side='left', padx=16, pady=10)
+            command=self._markup_remove_last)
+        self._markup_undo_btn.pack(side='left', padx=16, pady=10)
         self._markup_frame_lbl = tk.Label(ctrl_row, text="Frame 3  (0.01 s)",
             font=("Helvetica", 9, "bold"), bg=BG2, fg=TEXT)
         self._markup_frame_lbl.pack(side='left', padx=(0, 16))
@@ -5542,6 +5807,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self.after(60, self._redraw_markup_graph)
 
     def _exit_marking_phase(self):
+        self._tutorial_gate('all_marking_done')  # tutorial: all marking phases complete
         self._marking_phase = None
         self._markup_frame.pack_forget()
         self._bottom_bar.pack(fill='x', side='bottom')
