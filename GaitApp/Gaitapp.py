@@ -26,10 +26,64 @@ import numpy as np
 import pandas as pd
 from PIL import Image, ImageTk
 import pyglet
-from scipy.interpolate import interp1d
-from scipy.signal import butter, filtfilt, find_peaks
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+try:
+    from scipy.interpolate import interp1d
+    from scipy.signal import butter, filtfilt, find_peaks
+except Exception:
+    def interp1d(x, y, kind='linear', bounds_error=False, fill_value='extrapolate'):
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+
+        def _call(x_new):
+            return np.interp(np.asarray(x_new, dtype=float), x, y)
+
+        return _call
+
+    def butter(order, normal_cutoff, btype='low', analog=False):
+        return None, None
+
+    def filtfilt(b, a, data):
+        arr = np.asarray(data, dtype=float)
+        if arr.size < 3:
+            return arr
+        window = max(3, min(15, int(round(arr.size * 0.05))))
+        if window % 2 == 0:
+            window += 1
+        kernel = np.ones(window, dtype=float) / window
+        pad = window // 2
+        padded = np.pad(arr, (pad, pad), mode='edge')
+        smooth = np.convolve(padded, kernel, mode='valid')
+        padded2 = np.pad(smooth, (pad, pad), mode='edge')
+        return np.convolve(padded2, kernel, mode='valid')
+
+    def find_peaks(vals, distance=1, prominence=0.0):
+        arr = np.asarray(vals, dtype=float)
+        if arr.size < 3:
+            return np.array([], dtype=int), {}
+
+        candidates = []
+        for idx in range(1, arr.size - 1):
+            if arr[idx] <= arr[idx - 1] or arr[idx] < arr[idx + 1]:
+                continue
+            left_start = max(0, idx - distance)
+            right_end = min(arr.size, idx + distance + 1)
+            left_min = np.min(arr[left_start:idx]) if idx > left_start else arr[idx]
+            right_min = np.min(arr[idx + 1:right_end]) if idx + 1 < right_end else arr[idx]
+            peak_prom = arr[idx] - max(left_min, right_min)
+            if peak_prom >= prominence:
+                candidates.append(idx)
+
+        filtered = []
+        for idx in candidates:
+            if not filtered or idx - filtered[-1] >= distance:
+                filtered.append(idx)
+            elif arr[idx] > arr[filtered[-1]]:
+                filtered[-1] = idx
+
+        return np.asarray(filtered, dtype=int), {}
 
 try:
     from reportlab.lib.pagesizes import letter, A4
@@ -1654,15 +1708,15 @@ TUTORIAL_STEPS = [
     (None,
      "Welcome to Novita Gait Analysis",
      "This app lets you compare walking kinematics between two video recordings.\n\n"
-     "You'll upload two videos, mark foot-strike steps on each one, then explore "
-     "hip, knee, and ankle angle graphs alongside outcome metrics.\n\n"
+     "You'll upload two videos, mark heel-strikes, then explore "
+     "hip, knee, and ankle joint angles alongside specified outcome measures.\n\n"
      "Click  Next  to start the walkthrough, or  Skip  at any time.",
      "center", None),
 
     # 1: Upload button — gate advances when Select is clicked
     ("_select_btn",
      "Step 1 — Upload your videos",
-     "Click the  Select  button highlighted above.\n\n"
+     "Click the  Upload  button highlighted above.\n\n"
      "You will be asked to choose two video files — one for each condition "
      "(e.g. pre- and post-intervention).\n\n"
      "The tutorial will advance automatically once you have selected both files.",
@@ -1680,7 +1734,7 @@ TUTORIAL_STEPS = [
     # 3: Marking — video player
     ("_markup_canvas",
      "Step 3 — The marking screen: video player",
-     "The video player shows your first recording with a pose skeleton overlaid.\n\n"
+     "The video player shows your first video with the pose estimation overlaid.\n\n"
      "Scrub through the recording by clicking or dragging the graph below the video.\n\n"
      "Use  1  and  2  to step one frame at a time.",
      "right", None),
@@ -1690,15 +1744,15 @@ TUTORIAL_STEPS = [
      "Step 4 — Scrubbing through frames",
      "Click anywhere on this graph to jump to that frame, or drag left and right "
      "to scrub through the recording.\n\n"
-     "Find the exact moment each heel makes contact with the ground.",
+     "Find the moment each heel makes contact with the ground.",
      "above", None),
 
     # 5: Mark a step
     ("_markup_banner_area",
      "Step 5 — Marking a step",
      "When the highlighted leg's heel just makes contact with the ground, "
-     "press  SPACE  to record that frame as a step.\n\n"
-     "Aim for at least 6 steps per side for reliable averages.",
+     "press  SPACE  to record that frame as a heel strike.\n\n"
+     "Ideally videos contain 6 steps or more per side for the best quality data, more is better.",
      "below", None),
 
     # 6: Undo
@@ -1713,8 +1767,8 @@ TUTORIAL_STEPS = [
     (["_markup_canvas", "_markup_mpl_canvas", "_markup_continue_btn"],
      "Step 7 — Mark steps then click Done",
      "Scrub through the video and press  SPACE  at each heel contact to mark steps.\n\n"
-     "The  Done  button at the bottom-right advances to the next video or side.\n\n"
-     "Work through all four phases (Left V1 → Left V2 → Right V1 → Right V2).\n\n"
+     "The  Done  button at the bottom-right advances to the next leg.\n\n"
+     "You will need to do both legs for both videos.\n\n"
      "The tutorial will advance automatically after all marking is complete.",
      "left", "all_marking_done"),
 
@@ -1723,7 +1777,7 @@ TUTORIAL_STEPS = [
       "_canvas_hip", "_canvas_knee", "_canvas_ankle"],
      "The analysis screen",
      "You are now on the main analysis screen.\n\n"
-     "It shows four gait-cycle video panels, three joint-angle graphs, "
+     "It shows gait-cycle video panels alongside synchronised joint-angle graphs, "
      "a display control panel on the right, and outcome metrics.\n\n"
      "Click  Next  for a detailed tour of each section.",
      "left", None),
@@ -1731,7 +1785,7 @@ TUTORIAL_STEPS = [
     # 9: Video panels
     (["_vid_canvas1L", "_vid_canvas1R"],
      "Video panels — Video 1",
-     "These panels show the best representative gait cycle for the Left and Right "
+     "These panels show the gait cycle for the Left and Right "
      "legs of Video 1.\n\n"
      "They loop through a single stride and stay synchronised with all three graphs.",
      "right", None),
@@ -1739,58 +1793,34 @@ TUTORIAL_STEPS = [
     # 10: Video panels V2
     (["_vid_canvas2L", "_vid_canvas2R"],
      "Video panels — Video 2",
-     "These panels show the Left and Right cycles for Video 2 — your second condition.\n\n"
+     "These panels show the Left and Right cycles for Video 2.\n\n"
      "Compare with the Video 1 panels above to spot changes between sessions.",
      "right", None),
 
     # 11: Hip graph
     ("_canvas_hip",
      "Hip angle graph",
-     "Shows hip flexion / extension across the gait cycle (0–100 %).\n\n"
+     "Shows hip flexion / extension across the gait cycle.\n\n"
      "Dotted = Video 1 · Solid = Video 2\n"
      "Red/warm = Left · Blue/cool = Right\n\n"
-     "The shaded band is the confidence interval across all cycles.\n"
-     "Click the graph to seek all four videos to that gait phase.",
+     "The shaded band is the standard deviation between cycles. If the shaded region is very large, there may be an issue with the video recorded",
      "left", None),
 
     # 12: Knee graph
     ("_canvas_knee",
      "Knee angle graph",
-     "Shows knee flexion across the gait cycle.\n\n"
-     "The large flexion peak in mid-graph is the swing-phase knee bend — "
-     "a key indicator of gait quality.\n\n"
+     "Shows knee extension / flexion across the gait cycle.\n\n"
      "Same colour / line-style convention as the hip graph.",
      "left", None),
 
     # 13: Ankle graph
     ("_canvas_ankle",
      "Ankle angle graph",
-     "Shows ankle dorsiflexion / plantarflexion across the cycle.\n\n"
-     "Look for the plantarflexion dip at push-off (~60 %) and the "
-     "dorsiflexion rise during swing.\n\n"
+     "Shows ankle plantarflexion / dorsiflexion across the cycle.\n\n"
      "Same colour / line-style convention as the other graphs.",
      "left", None),
 
-    # 14: Display toggles
-    (["_cycles_btn", "_world_btn"],
-     "Display toggle buttons",
-     "Cycles  switches between overlaid gait-cycle view and a raw time-series view.\n\n"
-     "World / Pixel  toggles between MediaPipe 3-D world-space angles and "
-     "2-D pixel-based angles.",
-     "left", None),
-
-    # 15: Mean / Data / Normal / Outliers
-    (["_display_btns.mean", "_display_btns.data",
-      "_display_btns.normal", "_display_btns.outliers"],
-     "Mean, Data, Normal, Outliers",
-     "These buttons change what is plotted on all three graphs:\n"
-     "  Mean     — average curve with a shaded confidence band\n"
-     "  Data     — every individual cycle as a faint line\n"
-     "  Normal   — a healthy normative reference curve in grey\n"
-     "  Outliers — cycles that deviate significantly from the mean",
-     "left", None),
-
-    # 16: Playback
+    # 15: Playback
     (["_prev_frame_btn", "_play_btn", "_next_frame_btn"],
      "Prev, Play, and Next",
      "Prev  and  Next  step through individual frames of the gait cycle.\n"
@@ -1798,29 +1828,16 @@ TUTORIAL_STEPS = [
      "Useful for comparing movement timing and bilateral symmetry side-by-side.",
      "right", None),
 
-    # 17: Metrics
+    # 16: Metrics
     ("_metrics_canvas",
      "Outcome metrics",
-     "Shows percentage changes from Video 1 to Video 2:\n"
-     "  Cadence — steps per minute\n"
-     "  Step Variability — left-right timing CV\n"
-     "  Knee ROM (mean / peak) — average and peak knee flexion\n"
-     "  Hip ROM (mean) — average hip range of motion\n\n"
-     "Green arrows = increase · Red arrows = decrease.",
-     "left", None),
-
-    # 18: Clear buttons
-    (["_clear_steps_btn", "_clear_excl_btn"],
-     "Clear Steps and Clear Excl. Zone",
-     "Clear Steps  removes all your marked steps so you can re-mark from scratch.\n\n"
-     "Clear Excl. Zone  removes any exclusion zone drawn on the scrub bar — "
-     "used to ignore a segment such as a turn-around.",
+     "Shows changes in key metrics from Video 1 to Video 2:",
      "left", None),
 
     # 19: Upload / Re-mark
     (["_select_btn", "_remark_btn"],
      "Upload and Re-mark",
-     "Select  (top-right) loads a completely new pair of videos at any time.\n\n"
+     "Upload  (top-right) loads a completely new pair of videos at any time.\n\n"
      "Re-mark  takes you back to the step-marking screen to add or correct steps "
      "without discarding your current videos.",
      "below", None),
@@ -1829,7 +1846,7 @@ TUTORIAL_STEPS = [
     (None,
      "You're all set!",
      "That's the full tour of the Novita Gait Analysis app.\n\n"
-     "Press  h  at any time to reopen this tutorial.\n\n"
+     "Press the help button at any time to reopen this tutorial.\n\n"
      "Happy analysing!",
      "center", None),
 ]
@@ -2253,7 +2270,11 @@ class SpotlightTutorial:
             return
         self._step = idx
         step = TUTORIAL_STEPS[idx]
-        attr, title, desc, side, gate = step[0], step[1], step[2], step[3], step[4]
+        attr = step[0] if len(step) > 0 else None
+        title = step[1] if len(step) > 1 else ""
+        desc  = step[2] if len(step) > 2 else ""
+        side  = step[3] if len(step) > 3 else "center"
+        gate  = step[4] if len(step) > 4 else None
         n = len(TUTORIAL_STEPS)
 
         self._gated = bool(gate)
@@ -2880,6 +2901,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self.manual_step_mode     = True
         self.manual_side          = 'right'
         self.show_suggestions     = False
+        self.show_advanced_display_controls = False
         self.playing              = False
         self._marking_phase       = None
         self._marking_video_idx   = 0
@@ -2892,6 +2914,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._play_frame_counter   = 0       # count frames between graph redraws during play
         self._btn_held             = None    # which button is currently held (prev/next)
         self._btn_hold_after_id    = None
+        self._video_refresh_after_id = None
         self._display_cache        = DisplayCache(limit=128)  # pre-rendered PhotoImage cache
         self._canvas_image_ids     = [None, None, None, None]  # persistent canvas image item ids
         self._exclusion_selecting = [False, False, False]
@@ -3399,8 +3422,12 @@ class GaitAnalysisDashboard(tk.Tk):
             'Knee':  {'bg': '#dff3df', 'fg': '#1f6b2f'},
             'All':   {'bg': '#f5e6ff', 'fg': '#5a2a6e'},
         }
+
+        joint_frame = tk.Frame(parent, bg=BG2)
+        joint_frame.pack(fill='x', padx=0, pady=0)
+
         # header row: toggle-all buttons for left/right columns
-        hdr_row = tk.Frame(parent, bg=BG2)
+        hdr_row = tk.Frame(joint_frame, bg=BG2)
         hdr_row.pack(fill='x', padx=6, pady=(2, 2))
         all_badge = tk.Label(hdr_row, text='All', font=("Helvetica", 8, "bold"),
                              bg=badge_styles['All']['bg'], fg=badge_styles['All']['fg'], padx=4, pady=2, width=5)
@@ -3443,7 +3470,7 @@ class GaitAnalysisDashboard(tk.Tk):
             (['left_knee',  'right_knee'],  'Knee'),
             (['left_ankle', 'right_ankle'], 'Ankle'),
         ]:
-            row = tk.Frame(parent, bg=BG2)
+            row = tk.Frame(joint_frame, bg=BG2)
             row.pack(fill='x', padx=6, pady=1)
             style = badge_styles.get(group_label, {'bg': BG2, 'fg': SUBTEXT})
             badge = tk.Label(row, text=group_label, font=("Helvetica", 8, "bold"),
@@ -3462,40 +3489,38 @@ class GaitAnalysisDashboard(tk.Tk):
 
         tk.Frame(parent, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
 
-        # section 1: cycles and world
+        self._advanced_display_frame = tk.Frame(parent, bg=BG2)
         self._display_btns = {}
-        
-        # cycles button (text changes based on state)
-        self._cycles_btn = tk.Button(parent, text="Cycles", **btn_cfg,
-                           command=lambda: self._panel_btn_dispatch('Cycles'))
+
+        self._cycles_btn = tk.Button(self._advanced_display_frame, text="Cycles", **btn_cfg,
+                                     command=lambda: self._panel_btn_dispatch('Cycles'))
         self._cycles_btn.pack(fill='x', padx=6, pady=1)
         self._display_btns['cycles'] = self._cycles_btn
-        
-        # world button (text changes based on state)
-        self._world_btn = tk.Button(parent, text="World", **btn_cfg,
-                          command=lambda: self._panel_btn_dispatch('World'))
+
+        self._world_btn = tk.Button(self._advanced_display_frame, text="World", **btn_cfg,
+                                    command=lambda: self._panel_btn_dispatch('World'))
         self._world_btn.pack(fill='x', padx=6, pady=1)
         self._display_btns['world_px'] = self._world_btn
 
-        tk.Frame(parent, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
+        tk.Frame(self._advanced_display_frame, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
 
-        # section 2: mean, data, normal, outliers
         for label, key in [("Mean", "mean"), ("Data", "data"),
-                   ("Normal", "normal"), ("Outliers", "outliers")]:
-            btn = tk.Button(parent, text=label, **btn_cfg,
-                           command=lambda k=label: self._panel_btn_dispatch(k))
+                           ("Normal", "normal"), ("Outliers", "outliers")]:
+            btn = tk.Button(self._advanced_display_frame, text=label, **btn_cfg,
+                            command=lambda k=label: self._panel_btn_dispatch(k))
             btn.pack(fill='x', padx=6, pady=1)
             self._display_btns[key] = btn
 
-        tk.Frame(parent, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
+        tk.Frame(self._advanced_display_frame, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
 
-        # section 3: clear steps and exclusion zones
-        self._clear_steps_btn = tk.Button(parent, text="Clear Steps", **btn_cfg,
-              command=self._clear_steps)
+        self._clear_steps_btn = tk.Button(self._advanced_display_frame, text="Clear Steps", **btn_cfg,
+                                          command=self._clear_steps)
         self._clear_steps_btn.pack(fill='x', padx=6, pady=1)
-        self._clear_excl_btn = tk.Button(parent, text="Clear Excl. Zone", **btn_cfg,
-              command=self._clear_exclusions)
+        self._clear_excl_btn = tk.Button(self._advanced_display_frame, text="Clear Excl. Zone", **btn_cfg,
+                                         command=self._clear_exclusions)
         self._clear_excl_btn.pack(fill='x', padx=6, pady=1)
+
+        self._advanced_display_frame.pack_forget()
 
         self._update_display_btn_visuals()
 
@@ -3566,7 +3591,15 @@ class GaitAnalysisDashboard(tk.Tk):
         if fn:
             fn()
 
-    # video selection
+    def _toggle_advanced_display_controls(self):
+        self.show_advanced_display_controls = not self.show_advanced_display_controls
+        if self.show_advanced_display_controls:
+            self._advanced_display_frame.pack(fill='x', padx=0, pady=0)
+            self._status_msg.set("Advanced display controls shown")
+        else:
+            self._advanced_display_frame.pack_forget()
+            self._status_msg.set("Advanced display controls hidden")
+        self.update_idletasks()
 
     def find_videos(self):
         # hide tutorial overlay so the file-picker is not blocked
@@ -3756,9 +3789,6 @@ class GaitAnalysisDashboard(tk.Tk):
             self._enter_cycle_video_layout()
             self._update_display_btn_visuals()
             self.refresh()
-            # force a second pass once tk has finalized widget sizes
-            self.after_idle(self._show_video_frames)
-            self.after(60, self._show_video_frames)
             if cached_loaded:
                 self._status_msg.set("Loaded cached steps")
             else:
@@ -3787,6 +3817,7 @@ class GaitAnalysisDashboard(tk.Tk):
             '<h>': self._toggle_tutorial_overlay,
             '<g>': self._toggle_suggestions,
             '<d>': self._clear_steps,
+            '<F5>': self._toggle_advanced_display_controls,
             '<space>': self._add_manual_step,
             '<BackSpace>': self._delete_nearest_step,
             '<Delete>': self._delete_nearest_step,
@@ -5304,6 +5335,32 @@ class GaitAnalysisDashboard(tk.Tk):
                 self.after_cancel(self._play_after_id)
             self.redraw_graphs()
 
+    def _refresh_video_frames_after_layout(self):
+        try:
+            if self._video_refresh_after_id is not None:
+                self.after_cancel(self._video_refresh_after_id)
+        except Exception:
+            pass
+
+        def _do_refresh():
+            self._video_refresh_after_id = None
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
+            self._show_video_frames()
+
+        self._video_refresh_after_id = self.after_idle(_do_refresh)
+        self.after(60, _do_refresh)
+
+    def _select_start_frame_for_current_view(self):
+        if self.show_overlaid_cycles:
+            self._cycle_frame_indices = [None, None, None, None]
+            self.current_frame_idx = 0
+            self._seek_cycle_by_pct(0.0)
+        else:
+            self.current_frame_idx = 0
+
     def _toggle_cycles(self):
         self.show_overlaid_cycles = not self.show_overlaid_cycles
         if self.show_overlaid_cycles:
@@ -5327,6 +5384,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 self._ax_xlim_full[gi] = (0, _longest)
                 self._first_graph_draw[gi] = True
             self._exit_cycle_video_layout()
+        self._select_start_frame_for_current_view()
         self._status_msg.set("Overlaid cycles" if self.show_overlaid_cycles else "Continuous view")
         self._update_display_btn_visuals()
         self.redraw_graphs()
@@ -5349,6 +5407,7 @@ class GaitAnalysisDashboard(tk.Tk):
             self._vid1R_lbl.config(text=f"{v1_name} - Right Cycle")
             self._vid2L_lbl.config(text=f"{v2_name} - Left Cycle")
             self._vid2R_lbl.config(text=f"{v2_name} - Right Cycle")
+        self._refresh_video_frames_after_layout()
 
     def _exit_cycle_video_layout(self):
         """Switch video panel back to 2-up layout."""
@@ -5367,6 +5426,7 @@ class GaitAnalysisDashboard(tk.Tk):
         else:
             self._vid1_lbl.config(text="VIDEO 1")
             self._vid2_lbl.config(text="VIDEO 2")
+        self._refresh_video_frames_after_layout()
 
     def _toggle_resample(self):
         if not self.show_overlaid_cycles: return
@@ -5828,6 +5888,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._persist_all_dataset_markup()
         self.show_overlaid_cycles = True
         self.resample_cycles = True
+        self._select_start_frame_for_current_view()
         self._enter_cycle_video_layout()
         self._status_msg.set("Steps confirmed — showing overlaid gait cycles")
         self._update_display_btn_visuals()
@@ -6158,7 +6219,7 @@ def main():
     app._session.cleanup()
 
 
-def _safe_tk_exception_handler(exc, val, tb):
+def _safe_tk_exception_handler(self, exc, val, tb):
     """Custom Tk exception reporter that avoids the Python 3.13 traceback recursion bug."""
     import sys, traceback
     try:
