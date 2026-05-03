@@ -1187,6 +1187,37 @@ def _subject_bounds_from_landmarks(pixel_landmarks, frame_w, frame_h):
     }
 
 
+def _find_first_valid_detection(landmarks):
+    for idx, entry in enumerate(landmarks):
+        if entry is not None:
+            return idx
+    return 0
+
+
+def _trim_data_from_first_detection(landmarks, landmarks_for_crop, df_w, df_p, df_p_filtered, df_confidence, 
+                                     world_landmarks_list, df_depths, jittery_frames, landmark_depths):
+    first_idx = _find_first_valid_detection(landmarks)
+    if first_idx == 0:
+        return landmarks, landmarks_for_crop, df_w, df_p, df_p_filtered, df_confidence, world_landmarks_list, df_depths, jittery_frames, landmark_depths
+    
+    # trim landmark-based lists
+    landmarks = landmarks[first_idx:]
+    landmarks_for_crop = landmarks_for_crop[first_idx:]
+    world_landmarks_list = world_landmarks_list[first_idx:]
+    landmark_depths = landmark_depths[first_idx:]
+    
+    # update frame_num in dataframes
+    for df in (df_w, df_p, df_p_filtered, df_confidence, df_depths):
+        if not df.empty and 'frame_num' in df.columns:
+            df.reset_index(drop=True, inplace=True)
+            df['frame_num'] = range(1, len(df) + 1)
+    
+    # adjust jittery frames indices
+    jittery_frames = {idx - first_idx for idx in jittery_frames if idx >= first_idx}
+    
+    return landmarks, landmarks_for_crop, df_w, df_p, df_p_filtered, df_confidence, world_landmarks_list, df_depths, jittery_frames, landmark_depths
+
+
 def process_video(video_path, ann_dir, progress_cb, status_cb,
                   target_output_size=None, needs_rotation=None,
                   crop_rect=None, cache_key=None, cache_meta=None):
@@ -1490,6 +1521,11 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     for df in (df_w, df_p, df_p_filtered):
         if '_direction' in df.columns:
             df.drop('_direction', axis=1, inplace=True)
+
+    # trim data to start from when subject first appears
+    landmarks, landmarks_for_crop, df_w, df_p, df_p_filtered, df_confidence, world_landmarks_list, df_depths, jittery_frames, landmark_depths = \
+        _trim_data_from_first_detection(landmarks, landmarks_for_crop, df_w, df_p, df_p_filtered, df_confidence, 
+                                        world_landmarks_list, df_depths, jittery_frames, landmark_depths)
 
     ad = df_w if USE_WORLD_LANDMARKS else df_p_filtered
     del world_rows, pixel_rows
