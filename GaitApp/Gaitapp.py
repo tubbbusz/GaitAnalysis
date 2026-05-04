@@ -116,7 +116,7 @@ DEBUG_DIRECTION_DIAGNOSTICS = False
 DEBUG_LOG_JITTER = False
 DEBUG_SKELETON_WIDTH = True
 DEBUG_SKELETON_BASE_THICKNESS = 8.0
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 
 # pose model path
 MODEL_PATH = resource_path("pose_landmarker_full.task")
@@ -875,6 +875,24 @@ def _bool_runs(mask):
     return runs
 
 
+def _suppress_short_valid_runs(values, max_run_len=5):
+    y = np.asarray(values, dtype=float).copy()
+    finite = np.isfinite(y)
+    if not np.any(finite):
+        return y
+    start = None
+    for idx, is_finite in enumerate(finite):
+        if is_finite and start is None:
+            start = idx
+        elif not is_finite and start is not None:
+            if (idx - start) <= max_run_len and (start > 0 or idx < len(y)):
+                y[start:idx] = np.nan
+            start = None
+    if start is not None and (len(y) - start) <= max_run_len and start > 0:
+        y[start:] = np.nan
+    return y
+
+
 def _peak_prominence_scores(vals, peaks):
     scores = {}
     if len(peaks) == 0:
@@ -1194,28 +1212,21 @@ def _find_first_valid_detection(landmarks):
     return 0
 
 
-def _trim_data_from_first_detection(landmarks, landmarks_for_crop, df_w, df_p, df_p_filtered, df_confidence, 
-                                     world_landmarks_list, df_depths, jittery_frames, landmark_depths):
-    first_idx = _find_first_valid_detection(landmarks)
-    if first_idx == 0:
-        return landmarks, landmarks_for_crop, df_w, df_p, df_p_filtered, df_confidence, world_landmarks_list, df_depths, jittery_frames, landmark_depths
-    
-    # trim landmark-based lists
-    landmarks = landmarks[first_idx:]
-    landmarks_for_crop = landmarks_for_crop[first_idx:]
-    world_landmarks_list = world_landmarks_list[first_idx:]
-    landmark_depths = landmark_depths[first_idx:]
-    
-    # update frame_num in dataframes
-    for df in (df_w, df_p, df_p_filtered, df_confidence, df_depths):
-        if not df.empty and 'frame_num' in df.columns:
-            df.reset_index(drop=True, inplace=True)
-            df['frame_num'] = range(1, len(df) + 1)
-    
-    # adjust jittery frames indices
-    jittery_frames = {idx - first_idx for idx in jittery_frames if idx >= first_idx}
-    
-    return landmarks, landmarks_for_crop, df_w, df_p, df_p_filtered, df_confidence, world_landmarks_list, df_depths, jittery_frames, landmark_depths
+def _pad_dataframes_to_full_timeline(df_w, df_p, df_p_filtered, df_confidence, df_depths, total_frames):
+    if total_frames <= 0:
+        return df_w, df_p, df_p_filtered, df_confidence, df_depths
+
+    full_index = pd.Index(range(1, total_frames + 1), name='frame_num')
+
+    def _pad(df):
+        if df is None or df.empty or 'frame_num' not in df.columns:
+            return df
+        padded = df.set_index('frame_num').reindex(full_index).reset_index()
+        if 'avg_confidence' in padded.columns:
+            padded['avg_confidence'] = padded['avg_confidence'].fillna(0.0)
+        return padded
+
+    return _pad(df_w), _pad(df_p), _pad(df_p_filtered), _pad(df_confidence), _pad(df_depths)
 
 
 def process_video(video_path, ann_dir, progress_cb, status_cb,
@@ -1522,10 +1533,9 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
         if '_direction' in df.columns:
             df.drop('_direction', axis=1, inplace=True)
 
-    # trim data to start from when subject first appears
-    landmarks, landmarks_for_crop, df_w, df_p, df_p_filtered, df_confidence, world_landmarks_list, df_depths, jittery_frames, landmark_depths = \
-        _trim_data_from_first_detection(landmarks, landmarks_for_crop, df_w, df_p, df_p_filtered, df_confidence, 
-                                        world_landmarks_list, df_depths, jittery_frames, landmark_depths)
+    # keep the full frame timeline so missing subject sections stay aligned
+    df_w, df_p, df_p_filtered, df_confidence, df_depths = _pad_dataframes_to_full_timeline(
+        df_w, df_p, df_p_filtered, df_confidence, df_depths, frame_count)
 
     ad = df_w if USE_WORLD_LANDMARKS else df_p_filtered
     del world_rows, pixel_rows
@@ -3985,6 +3995,76 @@ class GaitAnalysisDashboard(tk.Tk):
             mask &= ~((angle_data['frame_num'] >= start_frame) & (angle_data['frame_num'] < end_frame))
         return angle_data[mask].reset_index(drop=True)
 
+    def _analysis_active_frame_indices(self):
+        """get visible frame indices in continuous/cycle mode (excludes short masked runs)"""
+        if self.show_overlaid_cycles or not self.datasets:
+            return []
+        active = np.zeros(len(self.angle_data), dtype=bool)
+        for joint in JOINT_COLORS_MPL.keys():
+            if joint not in self.angle_data.columns:
+                continue
+            vals = _suppress_short_valid_runs(self.angle_data[joint].values.astype(float), max_run_len=5)
+            active |= np.isfinite(vals)
+        return np.flatnonzero(active).tolist()
+
+    def _analysis_nearest_visible_frame_idx(self, idx):
+        """snap frame index to nearest visible frame in continuous/cycle mode"""
+        if self.show_overlaid_cycles or not self.datasets:
+            return max(0, idx)
+        idx = max(0, min(int(idx), len(self.angle_data) - 1))
+        active = self._analysis_active_frame_indices()
+        if not active:
+            return idx
+        if idx in active:
+            return idx
+        pos = int(np.searchsorted(active, idx))
+        if pos <= 0:
+            return int(active[0])
+        if pos >= len(active):
+            return int(active[-1])
+        before = int(active[pos - 1])
+        after = int(active[pos])
+        return before if (idx - before) <= (after - idx) else after
+
+    def _analysis_active_frame_indices_for_ds(self, ds_idx):
+        """get visible frame indices for a specific dataset (excludes short masked runs)"""
+        if self.show_overlaid_cycles or not self.datasets or ds_idx >= len(self.datasets):
+            return []
+        ds = self.datasets[ds_idx]
+        ad = ds.get('angle_data')
+        if ad is None or ad.empty:
+            return []
+        active = np.zeros(len(ad), dtype=bool)
+        for joint in JOINT_COLORS_MPL.keys():
+            if joint not in ad.columns:
+                continue
+            vals = _suppress_short_valid_runs(ad[joint].values.astype(float), max_run_len=5)
+            active |= np.isfinite(vals)
+        return np.flatnonzero(active).tolist()
+
+    def _analysis_nearest_visible_frame_idx_for_ds(self, idx, ds_idx):
+        """snap frame index to nearest visible frame for a specific dataset"""
+        if self.show_overlaid_cycles or not self.datasets or ds_idx >= len(self.datasets):
+            return max(0, idx)
+        ds = self.datasets[ds_idx]
+        ad = ds.get('angle_data')
+        if ad is None or ad.empty:
+            return max(0, idx)
+        idx = max(0, min(int(idx), len(ad) - 1))
+        active = self._analysis_active_frame_indices_for_ds(ds_idx)
+        if not active:
+            return idx
+        if idx in active:
+            return idx
+        pos = int(np.searchsorted(active, idx))
+        if pos <= 0:
+            return int(active[0])
+        if pos >= len(active):
+            return int(active[-1])
+        before = int(active[pos - 1])
+        after = int(active[pos])
+        return before if (idx - before) <= (after - idx) else after
+
     def _region_crosses_exclusion(self, start_frame, end_frame, excluded_regions):
         for ex_start, ex_end in excluded_regions:
             if not (end_frame <= ex_start or start_frame >= ex_end):
@@ -4163,6 +4243,21 @@ class GaitAnalysisDashboard(tk.Tk):
             if not np.any(finite): return y
             return y - y[np.argmax(finite)]
 
+        def _suppress_short_valid_runs(values, max_run_len=5):
+            y = np.asarray(values, dtype=float).copy()
+            finite = np.isfinite(y)
+            if not np.any(finite):
+                return y
+            for start, end in _bool_runs(finite):
+                run_len = end - start + 1
+                if run_len > max_run_len:
+                    continue
+                left_gap = start > 0 and not finite[start - 1]
+                right_gap = end < len(y) - 1 and not finite[end + 1]
+                if left_gap or right_gap:
+                    y[start:end + 1] = np.nan
+            return y
+
         max_cycle_length = self.resample_length
         if self.show_overlaid_cycles:
             for ds in dfg:
@@ -4221,7 +4316,7 @@ class GaitAnalysisDashboard(tk.Tk):
                     if not self.joint_visibility.get(joint, True):
                         continue
                     if joint not in ad.columns: continue
-                    values = ad[joint].values.copy().astype(float)
+                    values = _suppress_short_valid_runs(ad[joint].values.copy().astype(float), max_run_len=5)
                     finite_vals = values[np.isfinite(values)]
                     if finite_vals.size:
                         continuous_y_vals.append(finite_vals)
@@ -4558,7 +4653,10 @@ class GaitAnalysisDashboard(tk.Tk):
             if self.show_overlaid_cycles and vi < len(self._cycle_frame_indices) and self._cycle_frame_indices[vi] is not None:
                 frame_idx = self._cycle_frame_indices[vi]
             else:
-                frame_idx = self.current_frame_idx
+                if vi < len(self.datasets):
+                    frame_idx = self._analysis_nearest_visible_frame_idx_for_ds(self.current_frame_idx, vi)
+                else:
+                    frame_idx = self._analysis_nearest_visible_frame_idx(self.current_frame_idx)
 
             # build display-cache key (includes all rendering params that affect appearance)
             sk = round(self.skeleton_thickness * 2) / 2  # quantise to 0.5 steps
@@ -4640,12 +4738,11 @@ class GaitAnalysisDashboard(tk.Tk):
         if self.show_overlaid_cycles:
             self._seek_cycle_by_pct(event.xdata)
         else:
-            ad = self._active_angle_data()
-            if ad is None or ad.empty:
+            if self.angle_data is None or self.angle_data.empty:
                 return
-            fn  = ad['frame_num'].to_numpy()
+            fn  = self.angle_data['frame_num'].to_numpy()
             idx = int(np.argmin(np.abs(fn - event.xdata)))
-            self.current_frame_idx = max(0, min(idx, len(ad)-1))
+            self.current_frame_idx = max(0, min(idx, len(self.angle_data)-1))
         # fast path: update video frames immediately
         self._show_video_frames()
         self._update_status()
@@ -5327,13 +5424,19 @@ class GaitAnalysisDashboard(tk.Tk):
 
     def _prev_frame(self):
         if self.playing: return
-        self.current_frame_idx = max(0, self.current_frame_idx - 1)
         if self._marking_phase:
+            active = self._markup_active_frame_indices()
+            if active:
+                prev = [idx for idx in active if idx < self.current_frame_idx]
+                self.current_frame_idx = prev[-1] if prev else active[0]
+            else:
+                self.current_frame_idx = max(0, self.current_frame_idx - 1)
             t = self.current_frame_idx / SLOWMO_FPS
             self._markup_frame_lbl.config(text=f"Frame {self.current_frame_idx + 1}  ({t:.2f} s)")
             self._markup_show_frames()
             self._redraw_markup_graph()
             return
+        self.current_frame_idx = max(0, self.current_frame_idx - 1)
         self._show_video_frames()
         self._update_status()
         self._update_cursor_blit()
@@ -5342,9 +5445,14 @@ class GaitAnalysisDashboard(tk.Tk):
         if self.playing: return
         if self._marking_phase:
             vi = self._marking_video_idx
-            max_idx = (len(self.datasets[vi].get('all_landmarks', [])) - 1
-                       if vi < len(self.datasets) else self._active_max_index())
-            self.current_frame_idx = min(max_idx, self.current_frame_idx + 1)
+            active = self._markup_active_frame_indices()
+            if active:
+                next_frames = [idx for idx in active if idx > self.current_frame_idx]
+                self.current_frame_idx = next_frames[0] if next_frames else active[-1]
+            else:
+                max_idx = (len(self.datasets[vi].get('all_landmarks', [])) - 1
+                           if vi < len(self.datasets) else self._active_max_index())
+                self.current_frame_idx = min(max_idx, self.current_frame_idx + 1)
             t = self.current_frame_idx / SLOWMO_FPS
             self._markup_frame_lbl.config(text=f"Frame {self.current_frame_idx + 1}  ({t:.2f} s)")
             self._markup_show_frames()
@@ -5514,7 +5622,7 @@ class GaitAnalysisDashboard(tk.Tk):
         elif show_v1:           self.graph_show_mode = 'v1'
         else:                   self.graph_show_mode = 'v2'
         for gi in range(3):
-            if self.graph_show_mode in self._ax_xlim_per_mode[gi]:
+            if self.graph_show_mode in self._ax_xlim_per_mode[gi] and self.show_overlaid_cycles:
                 self._ax_xlim_full[gi] = self._ax_xlim_per_mode[gi][self.graph_show_mode]
         self._update_video_btn_visuals()
         self._show_video_frames()
@@ -5540,7 +5648,7 @@ class GaitAnalysisDashboard(tk.Tk):
         modes  = ['both', 'v1', 'v2']
         self.graph_show_mode = modes[(modes.index(self.graph_show_mode)+1) % 3]
         for gi in range(3):
-            if self.graph_show_mode in self._ax_xlim_per_mode[gi]:
+            if self.graph_show_mode in self._ax_xlim_per_mode[gi] and self.show_overlaid_cycles:
                 self._ax_xlim_full[gi] = self._ax_xlim_per_mode[gi][self.graph_show_mode]
         self._update_video_btn_visuals()
         self._show_video_frames()
@@ -5878,9 +5986,9 @@ class GaitAnalysisDashboard(tk.Tk):
         self._marking_video_idx = video_idx
         if self._markup_frame is None:
             self._build_markup_screen()
-        self.current_frame_idx = 2
-        t0 = 2 / SLOWMO_FPS
-        self._markup_frame_lbl.config(text=f"Frame 3  ({t0:.2f} s)")
+        self.current_frame_idx = self._markup_nearest_visible_frame_idx(2)
+        t0 = self.current_frame_idx / SLOWMO_FPS
+        self._markup_frame_lbl.config(text=f"Frame {self.current_frame_idx + 1}  ({t0:.2f} s)")
         phase_order = [(s, vi) for s, vi in [('left', 0), ('left', 1), ('right', 0), ('right', 1)]
                        if self._dataset_needs_markup(vi)]
         phase_num = phase_order.index((side, video_idx)) + 1 if (side, video_idx) in phase_order else 1
@@ -5940,13 +6048,18 @@ class GaitAnalysisDashboard(tk.Tk):
         pixel_lm = None
         if vi < len(self.datasets):
             store = self.datasets[vi].get('all_landmarks', [])
-            if 0 <= self.current_frame_idx < len(store):
-                entry = store[self.current_frame_idx]
+            frame_idx = self._markup_nearest_visible_frame_idx(self.current_frame_idx)
+            if frame_idx != self.current_frame_idx:
+                self.current_frame_idx = frame_idx
+                t = self.current_frame_idx / SLOWMO_FPS
+                self._markup_frame_lbl.config(text=f"Frame {self.current_frame_idx + 1}  ({t:.2f} s)")
+            if 0 <= frame_idx < len(store):
+                entry = store[frame_idx]
                 if isinstance(entry, tuple):
-                    frame = self._cache.get(vi, self.current_frame_idx, store)
+                    frame = self._cache.get(vi, frame_idx, store)
                     pixel_lm = entry[1]
                 else:
-                    frame = self._cache.get(vi, self.current_frame_idx, store)
+                    frame = self._cache.get(vi, frame_idx, store)
         if frame is None or cw < 2 or ch < 2:
             if cw >= 2 and ch >= 2:
                 canvas.create_text(cw // 2, ch // 2, text="No frame", fill=SUBTEXT, font=("Helvetica", 10))
@@ -5977,6 +6090,7 @@ class GaitAnalysisDashboard(tk.Tk):
         for spine in ax.spines.values():
             spine.set_color(BG2)
         ax.tick_params(colors=SUBTEXT, labelsize=7)
+
         vi = self._marking_video_idx
         if not self.datasets or vi >= len(self.datasets):
             self._markup_mpl_canvas.draw_idle()
@@ -5995,7 +6109,7 @@ class GaitAnalysisDashboard(tk.Tk):
             ax.axvspan(s, e, alpha=0.18, color='#6e6e6e', zorder=1)
         for joint, col in JOINT_COLORS_MPL.items():
             if joint not in ad.columns: continue
-            vals = ad[joint].values.astype(float)
+            vals = _suppress_short_valid_runs(ad[joint].values.astype(float), max_run_len=5)
             if excluded:
                 # plot excluded regions as continuous gray line
                 gray_vals = vals.copy(); gray_vals[~excl_mask] = np.nan
@@ -6041,11 +6155,49 @@ class GaitAnalysisDashboard(tk.Tk):
         if ad is None or ad.empty: return
         fn  = ad['frame_num'].to_numpy()
         idx = int(np.argmin(np.abs(fn - event.xdata)))
-        self.current_frame_idx = max(0, min(idx, len(ad) - 1))
+        self.current_frame_idx = self._markup_nearest_visible_frame_idx(max(0, min(idx, len(ad) - 1)))
         t = self.current_frame_idx / SLOWMO_FPS
         self._markup_frame_lbl.config(text=f"Frame {self.current_frame_idx + 1}  ({t:.2f} s)")
         self._markup_show_frames()
         self._redraw_markup_graph()
+
+    def _markup_active_frame_indices(self):
+        vi = self._marking_video_idx
+        if not self.datasets or vi >= len(self.datasets):
+            return []
+        ds = self.datasets[vi]
+        ad = ds.get('angle_data')
+        if ad is None or ad.empty:
+            return []
+        active = np.zeros(len(ad), dtype=bool)
+        for joint in JOINT_COLORS_MPL.keys():
+            if joint not in ad.columns:
+                continue
+            vals = _suppress_short_valid_runs(ad[joint].values.astype(float), max_run_len=5)
+            active |= np.isfinite(vals)
+        return np.flatnonzero(active).tolist()
+
+    def _markup_nearest_visible_frame_idx(self, idx):
+        vi = self._marking_video_idx
+        if not self.datasets or vi >= len(self.datasets):
+            return max(0, idx)
+        ad = self.datasets[vi].get('angle_data')
+        if ad is None or ad.empty:
+            return max(0, idx)
+        idx = max(0, min(int(idx), len(ad) - 1))
+        active = self._markup_active_frame_indices()
+        if not active:
+            return idx
+        if idx in active:
+            return idx
+        pos = int(np.searchsorted(active, idx))
+        if pos <= 0:
+            return int(active[0])
+        if pos >= len(active):
+            return int(active[-1])
+        before = int(active[pos - 1])
+        after = int(active[pos])
+        return before if (idx - before) <= (after - idx) else after
 
     def _markup_add_step(self):
         side = self._marking_phase
