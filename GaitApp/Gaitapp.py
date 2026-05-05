@@ -101,6 +101,71 @@ def resource_path(filename):
 
 pyglet.font.add_file(resource_path('Coiny-Cyrillic.ttf'))
 
+# ---------------------------------------------------------------------------
+# Register brand fonts with the OS so Tkinter can use them.
+# The PDF code uses _find_font() + resource_path() — we mirror that here and
+# then register with the OS GDI/CoreText/fontconfig directly (NOT via pyglet,
+# which only registers fonts for pyglet's own renderer, not for Tkinter).
+# ---------------------------------------------------------------------------
+
+def _find_font(filename):
+    """Mirror the PDF _find_font: check next to the app and common sub-folders."""
+    for candidate in [
+        resource_path(filename),
+        resource_path(os.path.join('static', filename)),
+        resource_path(os.path.join('Raleway', filename)),
+        resource_path(os.path.join('Raleway', 'static', filename)),
+    ]:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _register_font_with_os(font_path):
+    """Register a TTF with the OS font system so Tkinter can use it."""
+    if not font_path or not os.path.exists(font_path):
+        return False
+    try:
+        if sys.platform == 'win32':
+            import ctypes
+            FR_PRIVATE = 0x10
+            added = ctypes.windll.gdi32.AddFontResourceExW(font_path, FR_PRIVATE, 0)
+            return added > 0
+        elif sys.platform == 'darwin':
+            import ctypes, ctypes.util
+            ct = ctypes.cdll.LoadLibrary(ctypes.util.find_library('CoreText'))
+            cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library('CoreFoundation'))
+            enc = font_path.encode('utf-8')
+            url = cf.CFURLCreateFromFileSystemRepresentation(None, enc, len(enc), False)
+            ct.CTFontManagerRegisterFontsForURL(url, 1, None)
+            cf.CFRelease(url)
+            return True
+        else:
+            import shutil
+            font_dir = os.path.expanduser('~/.fonts')
+            os.makedirs(font_dir, exist_ok=True)
+            dest = os.path.join(font_dir, os.path.basename(font_path))
+            if not os.path.exists(dest):
+                shutil.copy2(font_path, dest)
+                os.system('fc-cache -f ' + font_dir)
+            return True
+    except Exception as _fe:
+        print(f"Font registration failed ({font_path}): {_fe}")
+        return False
+
+
+_raleway_loaded = False
+for _fname in ('Raleway-Regular.ttf', 'Raleway-Bold.ttf'):
+    _fp = _find_font(_fname)
+    if _fp and _register_font_with_os(_fp):
+        _raleway_loaded = True
+        print(f"Raleway font registered with OS: {_fp}")
+    else:
+        print(f"Raleway not found/registered: {_fname}")
+
+# UI_FONT: Raleway if successfully registered, else system default
+UI_FONT = "Raleway" if _raleway_loaded else "TkDefaultFont"
+
 # analysis settings
 SLOWMO_FPS    = 240
 FILTER_CUTOFF = 6
@@ -116,7 +181,7 @@ DEBUG_DIRECTION_DIAGNOSTICS = False
 DEBUG_LOG_JITTER = False
 DEBUG_SKELETON_WIDTH = True
 DEBUG_SKELETON_BASE_THICKNESS = 8.0
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 # pose model path
 MODEL_PATH = resource_path("pose_landmarker_full.task")
@@ -544,24 +609,24 @@ JOINT_COLORS_BGR = {k: hex_to_bgr(v) for k, v in JOINT_COLORS_MPL.items()}
 C_RIGHT = '#4a90d9'
 C_LEFT  = '#e8913a'
 
-BG      = "#f0f0f0"
-BG2     = "#d6d6d6"
-BG3     = "#c8c8c8"
-BG_VID  = "#d8d8d8"
-BG_PLOT = "#dbdbdb"
-BG_INIT = "#c0c0c0"
+BG      = "#f7f3f7"   # very pale purple tint — Novita brand light
+BG2     = "#ede5ed"   # slightly deeper pale purple
+BG3     = "#ddd0dd"   # muted purple for pressed/active states
+BG_VID  = "#e8dde8"   # video panel background
+BG_PLOT = "#f0eaf0"   # graph plot area background
+BG_INIT = "#c8b8c8"   # initial/loading state
 
-ACCENT  = "#3a083a"
-TEXT    = "#1a1a1a"
-SUBTEXT = "#4a4a4a"
-GREEN   = '#27ae60'
+ACCENT  = "#411540"   # Novita deep purple (PANTONE 518C)
+TEXT    = "#1a0a1a"   # near-black with purple tint
+SUBTEXT = "#5a3a5a"   # muted purple-grey for secondary text
+GREEN   = '#1a7a3c'   # improvement green — consistent with PDF
 RED     = '#c0392b'
 
-C_V1      = "#4a1a44"
-C_V2      = "#2e6b40"
-C_CURSOR  = '#ff4444'
-C_OUTLIER = '#555555'
-C_NORM    = '#888888'
+C_V1      = "#411540"   # Novita deep purple for V1
+C_V2      = "#ed185e"   # Novita pink for V2 (PANTONE 1925C)
+C_CURSOR  = '#ed185e'   # Novita pink for cursor
+C_OUTLIER = '#77C5D5'   # Novita cyan for outlier markers
+C_NORM    = '#77C5D5'   # Novita cyan for normative band
 
 NORMATIVE_GAIT = {
     "hip": {"mean": np.array([
@@ -914,6 +979,23 @@ def detect_steps_robust(angle_df, depth_df=None, fps=240.0):
 
     df = angle_df.copy()
     frame_nums = df['frame_num'].to_numpy(dtype=int)
+
+    # --- Detect missing-skeleton gaps BEFORE ffill/bfill fills them in.
+    # Any run of NaN in either hip column (>= MIN_NAN_GAP_FRAMES) is treated
+    # as a hard exclusion regardless of the kinematic quality checks below.
+    # This catches clean cuts / subject-absent periods that ffill would otherwise
+    # make look like valid data.
+    MIN_NAN_GAP_FRAMES = 5   # frames; ~0.02 s at 240 fps — catches even very short cuts
+    NAN_PAD_FRAMES     = max(5, int(0.08 * fps))   # pad each side by ~0.08 s
+    nan_mask = df['left_hip'].isna() | df['right_hip'].isna()
+    nan_exclusions = []
+    for s, e in _bool_runs(nan_mask.to_numpy()):
+        if (e - s + 1) < MIN_NAN_GAP_FRAMES:
+            continue
+        s2 = max(0, s - NAN_PAD_FRAMES)
+        e2 = min(len(frame_nums) - 1, e + NAN_PAD_FRAMES)
+        nan_exclusions.append((int(frame_nums[s2]), int(frame_nums[e2])))
+
     left_vals = df['left_hip'].ffill().bfill().to_numpy(dtype=float)
     right_vals = df['right_hip'].ffill().bfill().to_numpy(dtype=float)
     hip_mean = 0.5 * (left_vals + right_vals)
@@ -970,6 +1052,10 @@ def detect_steps_robust(angle_df, depth_df=None, fps=240.0):
         e2 = min(len(frame_nums) - 1, e + pad_frames)
         exclusion_regions.append((int(frame_nums[s2]), int(frame_nums[e2])))
 
+    # Merge NaN-gap exclusions (hard) with kinematic exclusions (soft) before
+    # anything else uses the exclusion list, so the gap is reflected everywhere.
+    exclusion_regions = exclusion_regions + nan_exclusions
+
     if len(exclusion_regions) > 1:
         exclusion_regions.sort()
         merged = [exclusion_regions[0]]
@@ -1022,7 +1108,7 @@ def detect_steps_robust(angle_df, depth_df=None, fps=240.0):
             candidates.append((gidx, 'right', pr_scores.get(int(p), 0.0)))
 
     if not candidates:
-        return [], exclusion_regions, []
+        return [], exclusion_regions + nan_exclusions, []
 
     candidates.sort(key=lambda x: x[0])
 
@@ -1059,7 +1145,7 @@ def detect_steps_robust(angle_df, depth_df=None, fps=240.0):
             accepted.append(c)
 
     if len(accepted) < 2:
-        return [], exclusion_regions, []
+        return [], exclusion_regions + nan_exclusions, []
 
     intervals = np.diff([a[0] for a in accepted])
     med_int = float(np.median(intervals)) if len(intervals) else float(max(min_step_frames, 1))
@@ -1467,6 +1553,77 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
             if col not in ('frame_num', '_direction'):
                 df[col] = df[col].astype(np.float32)
 
+    # --- Direction-transition exclusion ---
+    # Most clinical captures have the subject walk one way, turn, and walk back.
+    # The per-frame _direction label already flips the angle calculation correctly,
+    # but the Butterworth filter and step detection have no knowledge of direction
+    # changes — the filter smears across the transition, and steps from both
+    # directions get pooled.  The fix:
+    #   1. Find all contiguous same-direction runs.
+    #   2. Keep only the single longest run (the dominant direction bout).
+    #   3. NaN-out angle columns for every other frame BEFORE filtering so the
+    #      low-pass filter never sees the discontinuity.
+    #   4. Record the excluded frame ranges so detect_steps_robust and
+    #      compute_metrics also ignore them.
+    direction_exclusion_regions = []
+    if '_direction' in df_p.columns:
+        fn_vals  = df_p['frame_num'].values
+        dir_vals = df_p['_direction'].fillna('').values
+
+        # --- Turnaround detection ---
+        # We only want to exclude the brief turnaround window, NOT the return
+        # bout.  The angle calculation already handles both directions correctly
+        # via calculate_angle — so the return-lap data is valid and should be
+        # kept.  What we DO need to exclude is the transition zone itself
+        # (subject turning, partially side-on) because those frames produce
+        # angle artifacts.
+        #
+        # Strategy: smooth the direction signal over a ~0.3s window.  Any
+        # region where the smoothed signal is neither clearly "left" nor clearly
+        # "right" (i.e. mixed) is the turnaround — exclude it with padding.
+        # If the video is a straight pass-through the signal stays constant and
+        # nothing is excluded.
+
+        left_mask  = (dir_vals == 'left').astype(float)
+        right_mask = (dir_vals == 'right').astype(float)
+
+        smooth_win = max(7, int(0.30 * fps))
+        if smooth_win % 2 == 0:
+            smooth_win += 1
+
+        left_smooth  = pd.Series(left_mask ).rolling(smooth_win, center=True, min_periods=3).mean().to_numpy()
+        right_smooth = pd.Series(right_mask).rolling(smooth_win, center=True, min_periods=3).mean().to_numpy()
+
+        # A frame is "mixed" (turnaround zone) when neither direction dominates
+        DOMINANCE = 0.70   # at least 70% of frames in the window must agree
+        mixed = (left_smooth < DOMINANCE) & (right_smooth < DOMINANCE)
+
+        # Only act if mixed region is between 2% and 40% of total frames
+        # (<2% = noise, >40% = probably a camera angle where direction is
+        # genuinely ambiguous — leave untouched)
+        mixed_frac = float(np.mean(mixed))
+        if 0.02 < mixed_frac < 0.40:
+            PAD = max(3, int(0.08 * fps))
+            for rs, re in _bool_runs(mixed):
+                f_s = int(fn_vals[max(0, rs - PAD)])
+                f_e = int(fn_vals[min(len(fn_vals) - 1, re + PAD)])
+                direction_exclusion_regions.append((f_s, f_e))
+
+            # NaN angle columns only within the turnaround zones (not the whole
+            # return bout) so the filter doesn't smear across the transition.
+            angle_joint_cols = [c for c in df_p.columns
+                                 if c not in ('frame_num', '_direction')
+                                 and not c.startswith('landmark_')]
+            turnaround_mask = np.zeros(len(df_p), dtype=bool)
+            for f_s, f_e in direction_exclusion_regions:
+                turnaround_mask |= (fn_vals >= f_s) & (fn_vals <= f_e)
+
+            for col in angle_joint_cols:
+                if col in df_p.columns:
+                    df_p.loc[turnaround_mask, col] = np.nan
+                if col in df_w.columns:
+                    df_w.loc[turnaround_mask, col] = np.nan
+
     jittery_frames = _detect_jittery_frames(landmarks, threshold=0.04)
 
     landmark_cols_w = [c for c in df_w.columns if c.startswith('landmark_') and c.endswith(('_x', '_y', '_z'))]
@@ -1542,23 +1699,25 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     gc.collect()
 
     result = {
-        'df_world':           df_w,
-        'df_pixel':           df_p,
-        'df_pixel_filtered':  df_p_filtered,
-        'angle_data':         ad,
-        'confidence_data':    df_confidence,
-        'step_frames':        [],
-        'excluded_regions':   [],
-        'all_landmarks':      landmarks,
-        'landmark_depths':    df_depths,
-        'jittery_frames':     jittery_frames,
-        'total_video_frames': total,
-        'needs_rotation':     needs_rotation,
-        '_cache_key':         cache_key,
-        '_cache_meta':        cache_meta or {},
-        '_cached_markup':     cached_markup,
-        '_fw_for_crop':       _fw_for_crop,
-        '_fh_for_crop':       _fh_for_crop,
+        'df_world':                  df_w,
+        'df_pixel':                  df_p,
+        'df_pixel_filtered':         df_p_filtered,
+        'angle_data':                ad,
+        'confidence_data':           df_confidence,
+        'step_frames':               [],
+        'excluded_regions':          list(direction_exclusion_regions),
+        'direction_exclusions':      list(direction_exclusion_regions),
+        'all_landmarks':             landmarks,
+        'landmark_depths':           df_depths,
+        'jittery_frames':            jittery_frames,
+        'total_video_frames':        total,
+        'video_fps':                 float(fps),
+        'needs_rotation':            needs_rotation,
+        '_cache_key':                cache_key,
+        '_cache_meta':               cache_meta or {},
+        '_cached_markup':            cached_markup,
+        '_fw_for_crop':              _fw_for_crop,
+        '_fh_for_crop':              _fh_for_crop,
     }
 
     _crop_sk = _crop_skeleton_stats(landmarks_for_crop)
@@ -1590,13 +1749,30 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
 
 
 # gait metrics
-def _step_times(step_frames, fps=SLOWMO_FPS):
-    if len(step_frames) < 2: return [], []
+def _step_times(step_frames, fps=SLOWMO_FPS, excluded_regions=None):
+    """Compute per-side step times, skipping any interval that:
+      - crosses an excluded region (subject absent / turning), or
+      - is implausibly long (> 2.5 s), which indicates a gap in detection.
+    """
+    if len(step_frames) < 2:
+        return [], []
+
+    excl = excluded_regions or []
+    MAX_STEP_S = 2.5  # seconds; real steps are <~1.5 s even for slow walkers
+
+    def _crosses_exclusion(f_start, f_end):
+        for ex_s, ex_e in excl:
+            # interval [f_start, f_end] overlaps exclusion [ex_s, ex_e]
+            if f_start < ex_e and f_end > ex_s:
+                return True
+        return False
+
     lt, rt = [], []
     pf, ps = step_frames[0]
     for f, s in step_frames[1:]:
         t = (f - pf) / fps
-        (lt if ps == 'left' else rt).append(t)
+        if t <= MAX_STEP_S and not _crosses_exclusion(pf, f):
+            (lt if ps == 'left' else rt).append(t)
         pf, ps = f, s
     return lt, rt
 
@@ -1611,26 +1787,49 @@ def _variability(lt, rt):
     return np.std(all_t) / np.mean(all_t) * 100 if len(all_t) >= 2 else 0
 
 
+def _filter_angle_data_by_exclusions(angle_data, excluded_regions):
+    """Return a copy of angle_data with rows inside any excluded region removed."""
+    if not excluded_regions or angle_data is None or angle_data.empty:
+        return angle_data
+    mask = pd.Series([True] * len(angle_data), index=angle_data.index)
+    for start_frame, end_frame in excluded_regions:
+        mask &= ~((angle_data['frame_num'] >= start_frame) & (angle_data['frame_num'] <= end_frame))
+    return angle_data[mask].reset_index(drop=True)
+
+
 def _joint_stats(ad, name):
-    if name not in ad: return 0, 0
+    """Mean and robust peak (95th percentile) for a joint angle column."""
+    if name not in ad:
+        return 0, 0
     a = ad[name].dropna()
-    return (float(np.mean(a)), float(np.max(a))) if len(a) else (0, 0)
+    if len(a) == 0:
+        return 0, 0
+    return (float(np.mean(a)), float(np.percentile(a, 95)))
 
 
 def _asymmetry(ad, base):
+    """Mean absolute ROM difference between left and right sides.
+    Uses per-side range (max-min) rather than raw mean so that mirrored
+    offsets don't cancel each other out.
+    """
     la = ad.get(f'left_{base}',  pd.Series()).dropna()
     ra = ad.get(f'right_{base}', pd.Series()).dropna()
-    return abs(float(np.mean(la)) - float(np.mean(ra))) if len(la) and len(ra) else 0
+    if len(la) == 0 or len(ra) == 0:
+        return 0
+    l_range = float(np.percentile(la, 95) - np.percentile(la, 5))
+    r_range = float(np.percentile(ra, 95) - np.percentile(ra, 5))
+    return abs(l_range - r_range)
+
 
 METRIC_LABELS = {
     'cadence':  ("Cadence",          "steps / min"),
-    'step_var': ("Step Variability", "L-R timing CV"),
-    'knee_mean':("Knee ROM (mean)",  "avg angle"),
-    'knee_peak':("Knee ROM (peak)",  "peak angle"),
-    'hip_mean': ("Hip ROM (mean)",   "avg angle"),
-    'hip_peak': ("Hip ROM (peak)",   "peak angle"),
-    'knee_sym': ("Knee Symmetry",    "L-R difference"),
-    'hip_sym':  ("Hip Symmetry",     "L-R difference"),
+    'step_var': ("Step Variability", "step timing CV"),
+    'knee_mean':("Knee ROM (mean)",  "avg angle, both sides"),
+    'knee_peak':("Knee ROM (peak)",  "95th pct angle"),
+    'hip_mean': ("Hip ROM (mean)",   "avg angle, both sides"),
+    'hip_peak': ("Hip ROM (peak)",   "95th pct angle"),
+    'knee_sym': ("Knee Symmetry",    "L-R ROM difference"),
+    'hip_sym':  ("Hip Symmetry",     "L-R ROM difference"),
 }
 METRIC_ORDER = [
     'cadence', 'step_var',
@@ -1645,19 +1844,42 @@ METRIC_HIB = {
     'knee_sym':  False, 'hip_sym':   False,
 }
 
+
 def compute_metrics(ds1, ds2):
-    l1, r1 = _step_times(ds1.get('step_frames', []))
-    l2, r2 = _step_times(ds2.get('step_frames', []))
-    a1, a2 = ds1['angle_data'], ds2['angle_data']
+    fps1 = ds1.get('video_fps', SLOWMO_FPS)
+    fps2 = ds2.get('video_fps', SLOWMO_FPS)
+    excl1 = ds1.get('excluded_regions', [])
+    excl2 = ds2.get('excluded_regions', [])
+
+    l1, r1 = _step_times(ds1.get('step_frames', []), fps=fps1, excluded_regions=excl1)
+    l2, r2 = _step_times(ds2.get('step_frames', []), fps=fps2, excluded_regions=excl2)
+
+    # Filter angle data so ROM/symmetry metrics only use frames inside valid
+    # walking bouts — excludes turns, subject-absent gaps, and the cross-gap
+    # step intervals that straddle those regions.
+    a1 = _filter_angle_data_by_exclusions(ds1['angle_data'], excl1)
+    a2 = _filter_angle_data_by_exclusions(ds2['angle_data'], excl2)
+
+    # Average left and right sides for ROM metrics so one dominant side
+    # doesn't silently skew the result.
+    def _bilateral_joint_stats(ad, base):
+        left_mean,  left_peak  = _joint_stats(ad, f'left_{base}')
+        right_mean, right_peak = _joint_stats(ad, f'right_{base}')
+        if left_mean == 0 and right_mean == 0:
+            return 0, 0
+        sides_mean = [v for v in (left_mean, right_mean) if v != 0]
+        sides_peak = [v for v in (left_peak, right_peak) if v != 0]
+        return float(np.mean(sides_mean)), float(np.mean(sides_peak))
+
     return {
         'cadence':   pct_change(_cadence(l2, r2),    _cadence(l1, r1)),
         'step_var':  pct_change(_variability(l2, r2), _variability(l1, r1)),
-        'knee_mean': pct_change(_joint_stats(a2,'right_knee')[0], _joint_stats(a1,'right_knee')[0]),
-        'knee_peak': pct_change(_joint_stats(a2,'right_knee')[1], _joint_stats(a1,'right_knee')[1]),
-        'hip_mean':  pct_change(_joint_stats(a2,'right_hip')[0],  _joint_stats(a1,'right_hip')[0]),
-        'hip_peak':  pct_change(_joint_stats(a2,'right_hip')[1],  _joint_stats(a1,'right_hip')[1]),
-        'knee_sym':  pct_change(_asymmetry(a2,'knee'), _asymmetry(a1,'knee')),
-        'hip_sym':   pct_change(_asymmetry(a2,'hip'),  _asymmetry(a1,'hip')),
+        'knee_mean': pct_change(_bilateral_joint_stats(a2, 'knee')[0], _bilateral_joint_stats(a1, 'knee')[0]),
+        'knee_peak': pct_change(_bilateral_joint_stats(a2, 'knee')[1], _bilateral_joint_stats(a1, 'knee')[1]),
+        'hip_mean':  pct_change(_bilateral_joint_stats(a2, 'hip')[0],  _bilateral_joint_stats(a1, 'hip')[0]),
+        'hip_peak':  pct_change(_bilateral_joint_stats(a2, 'hip')[1],  _bilateral_joint_stats(a1, 'hip')[1]),
+        'knee_sym':  pct_change(_asymmetry(a2, 'knee'), _asymmetry(a1, 'knee')),
+        'hip_sym':   pct_change(_asymmetry(a2, 'hip'),  _asymmetry(a1, 'hip')),
     }
 
 
@@ -2017,21 +2239,21 @@ class SpotlightTutorial:
 
         iw = W - 2 - pad * 2   # inner width for wraplength
 
-        self._step_lbl = tk.Label(inner, text="", font=("Helvetica", 8),
+        self._step_lbl = tk.Label(inner, text="", font=(UI_FONT, 8),
                                    bg=self._CARD_BG, fg="#999999", anchor="w")
         self._step_lbl.pack(fill="x")
 
-        self._title_lbl = tk.Label(inner, text="", font=("Helvetica", 12, "bold"),
+        self._title_lbl = tk.Label(inner, text="", font=(UI_FONT, 12, "bold"),
                                     bg=self._CARD_BG, fg=TEXT, anchor="w",
                                     wraplength=iw, justify="left")
         self._title_lbl.pack(fill="x", pady=(5, 0))
 
-        self._desc_lbl = tk.Label(inner, text="", font=("Helvetica", 10),
+        self._desc_lbl = tk.Label(inner, text="", font=(UI_FONT, 10),
                                    bg=self._CARD_BG, fg=SUBTEXT, anchor="nw",
                                    wraplength=iw, justify="left")
         self._desc_lbl.pack(fill="x", pady=(8, 0))
 
-        self._gate_lbl = tk.Label(inner, text="", font=("Helvetica", 9, "italic"),
+        self._gate_lbl = tk.Label(inner, text="", font=(UI_FONT, 9, "italic"),
                                    bg=self._CARD_BG, fg=self._ACCENT, anchor="w",
                                    wraplength=iw, justify="left")
         self._gate_lbl.pack(fill="x", pady=(6, 0))
@@ -2043,20 +2265,20 @@ class SpotlightTutorial:
         btns = tk.Frame(btn_area, bg=self._CARD_BG)
         btns.pack(fill="x", pady=(0, 2))
 
-        self._skip_btn = tk.Button(btns, text="Skip", font=("Helvetica", 9),
+        self._skip_btn = tk.Button(btns, text="Skip", font=(UI_FONT, 9),
                                     bg="#eeeeee", fg="#888888", relief="flat",
                                     padx=10, pady=5, cursor="hand2",
                                     command=self.close)
         self._skip_btn.pack(side="left")
 
         self._next_btn = tk.Button(btns, text="Next →",
-                                    font=("Helvetica", 9, "bold"),
+                                    font=(UI_FONT, 9, "bold"),
                                     bg=self._ACCENT, fg="white",
                                     relief="flat", padx=14, pady=5,
                                     cursor="hand2", command=self._next_step)
         self._next_btn.pack(side="right")
 
-        self._prev_btn = tk.Button(btns, text="← Prev", font=("Helvetica", 9),
+        self._prev_btn = tk.Button(btns, text="← Prev", font=(UI_FONT, 9),
                                     bg=BG3, fg=TEXT, relief="flat",
                                     padx=10, pady=5, cursor="hand2",
                                     command=self._prev_step)
@@ -2066,7 +2288,7 @@ class SpotlightTutorial:
         dots_frame.pack(fill="x", pady=(0, 6))
         self._dots = []
         for _ in TUTORIAL_STEPS:
-            lbl = tk.Label(dots_frame, text="●", font=("Helvetica", 9),
+            lbl = tk.Label(dots_frame, text="●", font=(UI_FONT, 9),
                            bg=self._CARD_BG, fg="#dddddd")
             lbl.pack(side="left", padx=2)
             self._dots.append(lbl)
@@ -2455,7 +2677,7 @@ class CacheManagerDialog(tk.Toplevel):
         bottom_frame = tk.Frame(self, bg=BG)
         bottom_frame.pack(fill='x', padx=10, pady=10)
         self.delete_btn = tk.Button(bottom_frame, text="Delete Selected",
-                                   font=("Helvetica", 10), bg='#e74c3c', fg='white',
+                                   font=(UI_FONT, 10), bg='#e74c3c', fg='white',
                                    command=self._delete_selected, state='disabled')
         self.delete_btn.pack(side='left')
 
@@ -2491,18 +2713,18 @@ class CacheManagerDialog(tk.Toplevel):
     def _scan_caches(self):
         if not os.path.exists(self.cache_root):
             tk.Label(self.scrollable_frame, text="No cache directory found",
-                    font=("Helvetica", 10), bg=BG, fg=SUBTEXT).pack(pady=20)
+                    font=(UI_FONT, 10), bg=BG, fg=SUBTEXT).pack(pady=20)
             return
         try:
             cache_dirs = [d for d in os.listdir(self.cache_root)
                          if os.path.isdir(os.path.join(self.cache_root, d))]
         except Exception as e:
             tk.Label(self.scrollable_frame, text=f"Error reading cache: {e}",
-                    font=("Helvetica", 10), bg=BG, fg='#e74c3c').pack(pady=20)
+                    font=(UI_FONT, 10), bg=BG, fg='#e74c3c').pack(pady=20)
             return
         if not cache_dirs:
             tk.Label(self.scrollable_frame, text="No cached videos found",
-                    font=("Helvetica", 10), bg=BG, fg=SUBTEXT).pack(pady=20)
+                    font=(UI_FONT, 10), bg=BG, fg=SUBTEXT).pack(pady=20)
             return
         for cache_key in sorted(cache_dirs):
             self._add_cache_entry(cache_key)
@@ -2539,13 +2761,13 @@ class CacheManagerDialog(tk.Toplevel):
         delete_whole_var = tk.BooleanVar(value=False)
         self.delete_whole_vars[cache_key] = (delete_whole_var, cache_path)
         delete_whole_cb = tk.Checkbutton(header_frame, text="", variable=delete_whole_var,
-                                        font=("Helvetica", 9), bg=BG2, fg=TEXT,
+                                        font=(UI_FONT, 9), bg=BG2, fg=TEXT,
                                         command=self._update_delete_button)
         delete_whole_cb.pack(side='right', padx=4)
         tk.Label(header_frame, text=f"📹 {video_name}",
-                font=("Helvetica", 10, "bold"), bg=BG2, fg=TEXT).pack(side='left', fill='x', expand=True)
+                font=(UI_FONT, 10, "bold"), bg=BG2, fg=TEXT).pack(side='left', fill='x', expand=True)
         tk.Label(header_frame, text=size_str,
-                font=("Helvetica", 8), bg=BG2, fg=SUBTEXT).pack(side='left', padx=4)
+                font=(UI_FONT, 8), bg=BG2, fg=SUBTEXT).pack(side='left', padx=4)
         data_items = []
         if has_result:
             data_items.append(('Coordinates & Angles', result_pkl))
@@ -2562,11 +2784,11 @@ class CacheManagerDialog(tk.Toplevel):
                 item_frame = tk.Frame(items_frame, bg=BG)
                 item_frame.pack(fill='x', pady=2)
                 checkbox = tk.Checkbutton(item_frame, text=item_name, variable=checkbox_var,
-                                         font=("Helvetica", 9), bg=BG, fg=TEXT,
+                                         font=(UI_FONT, 9), bg=BG, fg=TEXT,
                                          command=self._update_delete_button)
                 checkbox.pack(anchor='w')
         else:
-            tk.Label(entry_frame, text="(Empty cache)", font=("Helvetica", 9),
+            tk.Label(entry_frame, text="(Empty cache)", font=(UI_FONT, 9),
                     bg=BG, fg=SUBTEXT).pack(anchor='w', padx=8, pady=6)
 
     def _update_delete_button(self):
@@ -2618,20 +2840,20 @@ class SettingsDialog(tk.Toplevel):
         self.dashboard = dashboard
         self.configure(bg=BG)
         self._build_ui()
-        _apply_dynamic_window_size(self, preferred_width=550, preferred_height=700)
+        _apply_dynamic_window_size(self)
 
     def _build_ui(self):
         title_frame = tk.Frame(self, bg=BG2, height=50)
         title_frame.pack(fill='x', padx=0, pady=0)
         tk.Label(title_frame, text="Settings",
-                font=("Helvetica", 12, "bold"), bg=BG2, fg=TEXT).pack(side='left', padx=10, pady=8)
+                font=(UI_FONT, 12, "bold"), bg=BG2, fg=TEXT).pack(side='left', padx=10, pady=8)
         content = tk.Frame(self, bg=BG)
         content.pack(fill='both', expand=True, padx=20, pady=20)
 
         conf_frame = tk.Frame(content, bg=BG)
         conf_frame.pack(fill='x', pady=10)
-        tk.Label(conf_frame, text="Confidence Scores", font=("Helvetica", 10), bg=BG, fg=TEXT).pack(side='left')
-        tk.Label(conf_frame, text="Toggle with Alt+C", font=("Helvetica", 8), bg=BG, fg=SUBTEXT).pack(side='left', padx=(10, 0))
+        tk.Label(conf_frame, text="Confidence Scores", font=(UI_FONT, 10), bg=BG, fg=TEXT).pack(side='left')
+        tk.Label(conf_frame, text="Toggle with Alt+C", font=(UI_FONT, 8), bg=BG, fg=SUBTEXT).pack(side='left', padx=(10, 0))
         self.conf_var = tk.BooleanVar(value=self.dashboard.show_confidence)
         tk.Checkbutton(conf_frame, text="Show confidence scores on graph",
                        variable=self.conf_var, bg=BG, fg=TEXT,
@@ -2642,8 +2864,8 @@ class SettingsDialog(tk.Toplevel):
 
         rmse_frame = tk.Frame(content, bg=BG)
         rmse_frame.pack(fill='x', pady=10)
-        tk.Label(rmse_frame, text="RMSE Threshold (%)", font=("Helvetica", 10), bg=BG, fg=TEXT).pack(side='left')
-        tk.Label(rmse_frame, text="Lower = stricter filtering", font=("Helvetica", 8), bg=BG, fg=SUBTEXT).pack(side='left', padx=(10, 0))
+        tk.Label(rmse_frame, text="RMSE Threshold (%)", font=(UI_FONT, 10), bg=BG, fg=TEXT).pack(side='left')
+        tk.Label(rmse_frame, text="Lower = stricter filtering", font=(UI_FONT, 8), bg=BG, fg=SUBTEXT).pack(side='left', padx=(10, 0))
         self.rmse_var = tk.DoubleVar(value=self.dashboard.rmse_threshold)
         self.rmse_slider = tk.Scale(rmse_frame, from_=0.0, to=100.0, resolution=0.5,
                                     variable=self.rmse_var, orient='horizontal',
@@ -2655,25 +2877,16 @@ class SettingsDialog(tk.Toplevel):
 
         cache_frame = tk.Frame(content, bg=BG)
         cache_frame.pack(fill='x', pady=10)
-        tk.Label(cache_frame, text="Cache Management", font=("Helvetica", 10), bg=BG, fg=TEXT).pack(side='left')
-        tk.Button(cache_frame, text="Manage Cache", font=("Helvetica", 9),
+        tk.Label(cache_frame, text="Cache Management", font=(UI_FONT, 10), bg=BG, fg=TEXT).pack(side='left')
+        tk.Button(cache_frame, text="Manage Cache", font=(UI_FONT, 9),
                  bg=BG3, fg=TEXT, relief='flat', padx=8,
                  command=self._open_cache_manager).pack(side='right')
 
         tk.Frame(content, bg=BG2, height=1).pack(fill='x', pady=10)
 
-        export_frame = tk.Frame(content, bg=BG)
-        export_frame.pack(fill='x', pady=10)
-        tk.Label(export_frame, text="Export Report", font=("Helvetica", 10), bg=BG, fg=TEXT).pack(side='left')
-        tk.Button(export_frame, text="Print to PDF", font=("Helvetica", 9),
-                 bg='#27ae60', fg=TEXT, relief='flat', padx=8,
-                 command=self._open_pdf_export).pack(side='right')
-
-        tk.Frame(content, bg=BG2, height=1).pack(fill='x', pady=10)
-
         jitter_frame = tk.Frame(content, bg=BG)
         jitter_frame.pack(fill='x', pady=10)
-        tk.Label(jitter_frame, text="Jitter Frames", font=("Helvetica", 10, "bold"), bg=BG, fg=TEXT).pack(side='left')
+        tk.Label(jitter_frame, text="Jitter Frames", font=(UI_FONT, 10, "bold"), bg=BG, fg=TEXT).pack(side='left')
         self.remove_jitter_var = tk.BooleanVar(value=self.dashboard.remove_jitter_frames)
         tk.Checkbutton(content, text="Remove jitter frames",
                        variable=self.remove_jitter_var, bg=BG, fg=TEXT,
@@ -2689,8 +2902,8 @@ class SettingsDialog(tk.Toplevel):
 
         graph_frame = tk.Frame(content, bg=BG)
         graph_frame.pack(fill='x', pady=10)
-        tk.Label(graph_frame, text="Graph Display", font=("Helvetica", 10), bg=BG, fg=TEXT).pack(side='left')
-        self._graph_display_btn = tk.Button(graph_frame, font=("Helvetica", 9),
+        tk.Label(graph_frame, text="Graph Display", font=(UI_FONT, 10), bg=BG, fg=TEXT).pack(side='left')
+        self._graph_display_btn = tk.Button(graph_frame, font=(UI_FONT, 9),
                  bg=BG3, fg=TEXT, relief='flat', padx=8,
                  command=self._toggle_graph_display_mode)
         self._graph_display_btn.pack(side='right')
@@ -2698,7 +2911,7 @@ class SettingsDialog(tk.Toplevel):
 
         btn_frame = tk.Frame(self, bg=BG)
         btn_frame.pack(fill='x', padx=20, pady=15)
-        tk.Button(btn_frame, text="Close", font=("Helvetica", 10),
+        tk.Button(btn_frame, text="Close", font=(UI_FONT, 10),
                  bg=BG3, fg=TEXT, relief='flat', padx=12, pady=6,
                  command=self.destroy).pack(side='right')
 
@@ -2768,113 +2981,166 @@ class SettingsDialog(tk.Toplevel):
 
 
 class PDFExportDialog(tk.Toplevel):
+    # Friendly display labels for outcome measures (no "(% change)" clutter — handled in the PDF)
     OUTCOME_MEASURES = {
-        'cadence': 'Cadence (% change)',
-        'step_var': 'Step Variability (% change)',
-        'knee_mean': 'Knee Angle Mean (% change)',
-        'knee_peak': 'Knee Angle Peak (% change)',
-        'hip_mean': 'Hip Angle Mean (% change)',
-        'hip_peak': 'Hip Angle Peak (% change)',
-        'knee_sym': 'Knee Symmetry (% change)',
-        'hip_sym': 'Hip Symmetry (% change)',
+        'cadence':   'Cadence',
+        'step_var':  'Step Variability',
+        'knee_mean': 'Knee Angle — Mean',
+        'knee_peak': 'Knee Angle — Peak',
+        'hip_mean':  'Hip Angle — Mean',
+        'hip_peak':  'Hip Angle — Peak',
+        'knee_sym':  'Knee Symmetry',
+        'hip_sym':   'Hip Symmetry',
     }
+
+    # Novita brand colours (used as accent in the dialog header)
+    _HDR_BG  = '#411540'
+    _HDR_FG  = '#ffffff'
+    _ACCENT  = '#ed185e'
 
     def __init__(self, parent, dashboard):
         super().__init__(parent)
-        self.title("Export to PDF")
+        self.title("Export Gait Analysis Report")
         self.dashboard = dashboard
         self.configure(bg=BG)
+        self.resizable(False, False)
         self._build_ui()
-        _apply_dynamic_window_size(self, preferred_width=550, preferred_height=900)
+        _apply_dynamic_window_size(self, preferred_width=480, preferred_height=700)
 
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
     def _build_ui(self):
-        title_frame = tk.Frame(self, bg=BG2, height=50)
-        title_frame.pack(fill='x', padx=0, pady=0)
-        tk.Label(title_frame, text="Export Gait Analysis Report",
-                font=("Helvetica", 12, "bold"), bg=BG2, fg=TEXT).pack(side='left', padx=10, pady=8)
+        # ── Header bar ──────────────────────────────────────────────
+        hdr = tk.Frame(self, bg=self._HDR_BG)
+        hdr.pack(fill='x')
+        tk.Label(hdr, text="Export Gait Analysis Report",
+                 font=(UI_FONT, 13, "bold"),
+                 bg=self._HDR_BG, fg=self._HDR_FG,
+                 padx=16, pady=12).pack(side='left')
+        tk.Label(hdr, text="Normalised Gait Cycles  •  All 3 Joints",
+                 font=(UI_FONT, 9),
+                 bg=self._HDR_BG, fg='#c8a8c8',
+                 padx=16, pady=12).pack(side='right')
 
-        canvas_frame = tk.Frame(self, bg=BG)
-        canvas_frame.pack(fill='both', expand=True, padx=10, pady=10)
-        canvas = tk.Canvas(canvas_frame, bg=BG, highlightthickness=0)
-        scrollbar = tk.Scrollbar(canvas_frame, orient='vertical', command=canvas.yview)
-        scrollable = tk.Frame(canvas, bg=BG)
-        scrollable.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.create_window((0, 0), window=scrollable, anchor='nw')
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side='left', fill='both', expand=True)
-        scrollbar.pack(side='right', fill='y')
+        # ── Scrollable body ─────────────────────────────────────────
+        body_wrap = tk.Frame(self, bg=BG)
+        body_wrap.pack(fill='both', expand=True, padx=12, pady=10)
+        cv = tk.Canvas(body_wrap, bg=BG, highlightthickness=0)
+        sb = tk.Scrollbar(body_wrap, orient='vertical', command=cv.yview)
+        self._scroll_body = tk.Frame(cv, bg=BG)
+        self._scroll_body.bind('<Configure>',
+                               lambda e: cv.configure(scrollregion=cv.bbox('all')))
+        cv.create_window((0, 0), window=self._scroll_body, anchor='nw')
+        cv.configure(yscrollcommand=sb.set)
+        cv.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
 
-        graphs_frame = tk.LabelFrame(scrollable, text="Select Graphs & Options", bg=BG, fg=TEXT,
-                                    font=("Helvetica", 10, "bold"))
-        graphs_frame.pack(fill='x', pady=(10, 5))
-        self.graph_vars = {}
-        self.graph_vars['continuous'] = tk.BooleanVar(value=True)
-        self.graph_vars['cycles'] = tk.BooleanVar(value=True)
-        self.graph_options = {}
-        tk.Checkbutton(graphs_frame, text="Continuous View (Raw angle data)",
-                      variable=self.graph_vars['continuous'], bg=BG, fg=TEXT,
-                      activebackground=BG, activeforeground=TEXT).pack(anchor='w', padx=10, pady=4)
-        self.graph_options['continuous'] = self._create_graph_options_frame(graphs_frame, 'continuous')
-        tk.Checkbutton(graphs_frame, text="Overlaid Cycles (Normalized gait cycles)",
-                      variable=self.graph_vars['cycles'], bg=BG, fg=TEXT,
-                      activebackground=BG, activeforeground=TEXT).pack(anchor='w', padx=10, pady=4)
-        self.graph_options['cycles'] = self._create_graph_options_frame(graphs_frame, 'cycles')
+        self._build_graph_section()
+        self._build_limbs_section()
+        self._build_measures_section()
 
-        limbs_frame = tk.LabelFrame(scrollable, text="Select Limbs", bg=BG, fg=TEXT,
-                                   font=("Helvetica", 10, "bold"))
-        limbs_frame.pack(fill='x', pady=5)
+        tk.Label(self._scroll_body,
+                 text="Report will include overlaid normalised gait cycles for Hip, Knee and Ankle.",
+                 font=(UI_FONT, 8), bg=BG, fg=SUBTEXT,
+                 wraplength=420, justify='left').pack(anchor='w', padx=8, pady=(8, 2))
+
+        # ── Footer buttons ───────────────────────────────────────────
+        footer = tk.Frame(self, bg=BG2)
+        footer.pack(fill='x', padx=0, pady=0)
+        tk.Button(footer, text="Cancel",
+                  font=(UI_FONT, 10), bg=BG3, fg=TEXT,
+                  relief='flat', padx=12, pady=7,
+                  command=self.destroy).pack(side='right', padx=(4, 12), pady=10)
+        tk.Button(footer, text="Export PDF",
+                  font=(UI_FONT, 11, "bold"),
+                  bg=self._ACCENT, fg='white',
+                  relief='flat', padx=18, pady=7,
+                  cursor='hand2',
+                  command=self._export_pdf).pack(side='right', padx=4, pady=10)
+
+    def _section(self, title):
+        """Create a titled section frame inside the scrollable body."""
+        outer = tk.Frame(self._scroll_body, bg=BG)
+        outer.pack(fill='x', pady=(10, 2))
+        lbl_row = tk.Frame(outer, bg=BG)
+        lbl_row.pack(fill='x')
+        tk.Label(lbl_row, text=title,
+                 font=(UI_FONT, 10, "bold"), bg=BG, fg=self._HDR_BG).pack(side='left')
+        tk.Frame(lbl_row, bg=BG3, height=1).pack(side='left', fill='x', expand=True, padx=(8, 0), pady=6)
+        inner = tk.Frame(outer, bg=BG)
+        inner.pack(fill='x', padx=4)
+        return inner
+
+    def _build_graph_section(self):
+        sec = self._section("Graph Options")
+
+        # Show versions
+        row = tk.Frame(sec, bg=BG)
+        row.pack(fill='x', pady=4)
+        tk.Label(row, text="Show versions:", font=(UI_FONT, 9), bg=BG, fg=TEXT,
+                 width=16, anchor='w').pack(side='left')
+        self._version_var = tk.StringVar(value='both')
+        for val, lbl in [('v1', 'Video 1 only'), ('v2', 'Video 2 only'), ('both', 'Both')]:
+            tk.Radiobutton(row, text=lbl, variable=self._version_var, value=val,
+                           bg=BG, fg=TEXT, activebackground=BG,
+                           font=(UI_FONT, 9)).pack(side='left', padx=4)
+
+        # Show excluded regions
+        self._excl_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(sec, text="Highlight excluded / low-quality regions",
+                       variable=self._excl_var,
+                       bg=BG, fg=TEXT, activebackground=BG,
+                       font=(UI_FONT, 9)).pack(anchor='w', pady=2)
+
+    def _build_limbs_section(self):
+        sec = self._section("Include Joints")
         self.limb_vars = {}
-        limbs = [('left_hip', 'Left Hip'), ('left_knee', 'Left Knee'), ('left_ankle', 'Left Ankle'),
-                 ('right_hip', 'Right Hip'), ('right_knee', 'Right Knee'), ('right_ankle', 'Right Ankle')]
-        for key, label in limbs:
+        limbs = [
+            ('left_hip',   'Left Hip'),   ('right_hip',   'Right Hip'),
+            ('left_knee',  'Left Knee'),  ('right_knee',  'Right Knee'),
+            ('left_ankle', 'Left Ankle'), ('right_ankle', 'Right Ankle'),
+        ]
+        grid = tk.Frame(sec, bg=BG)
+        grid.pack(fill='x')
+        for i, (key, label) in enumerate(limbs):
             self.limb_vars[key] = tk.BooleanVar(value=True)
-            tk.Checkbutton(limbs_frame, text=label, variable=self.limb_vars[key], bg=BG, fg=TEXT,
-                          activebackground=BG, activeforeground=TEXT).pack(anchor='w', padx=10, pady=2)
+            col, row = i % 2, i // 2
+            tk.Checkbutton(grid, text=label, variable=self.limb_vars[key],
+                           bg=BG, fg=TEXT, activebackground=BG,
+                           font=(UI_FONT, 9)).grid(row=row, column=col,
+                                                        sticky='w', padx=8, pady=2)
 
-        measures_frame = tk.LabelFrame(scrollable, text="Outcome Measures", bg=BG, fg=TEXT,
-                                      font=("Helvetica", 10, "bold"))
-        measures_frame.pack(fill='x', pady=5)
+    def _build_measures_section(self):
+        sec = self._section("Outcome Measures  (% change V1 → V2)")
         self.measure_vars = {}
+        # Select all / none helpers
+        ctrl_row = tk.Frame(sec, bg=BG)
+        ctrl_row.pack(anchor='w', pady=(0, 4))
+        tk.Button(ctrl_row, text="All", font=(UI_FONT, 8), bg=BG3, fg=TEXT,
+                  relief='flat', padx=6, pady=2,
+                  command=lambda: [v.set(True)  for v in self.measure_vars.values()]).pack(side='left', padx=2)
+        tk.Button(ctrl_row, text="None", font=(UI_FONT, 8), bg=BG3, fg=TEXT,
+                  relief='flat', padx=6, pady=2,
+                  command=lambda: [v.set(False) for v in self.measure_vars.values()]).pack(side='left', padx=2)
         for key, label in self.OUTCOME_MEASURES.items():
             self.measure_vars[key] = tk.BooleanVar(value=True)
-            tk.Checkbutton(measures_frame, text=label, variable=self.measure_vars[key], bg=BG, fg=TEXT,
-                          activebackground=BG, activeforeground=TEXT).pack(anchor='w', padx=10, pady=2)
+            tk.Checkbutton(sec, text=label, variable=self.measure_vars[key],
+                           bg=BG, fg=TEXT, activebackground=BG,
+                           font=(UI_FONT, 9)).pack(anchor='w', pady=1)
 
-        tk.Label(scrollable, text="Note: PDF will be generated for currently loaded video pair.",
-                font=("Helvetica", 9), bg=BG, fg=SUBTEXT, wraplength=400, justify='left').pack(anchor='w', padx=10, pady=10)
-
-        btn_frame = tk.Frame(self, bg=BG)
-        btn_frame.pack(fill='x', padx=10, pady=15)
-        tk.Button(btn_frame, text="Print to PDF", font=("Helvetica", 11),
-                 bg='#27ae60', fg=TEXT, relief='flat', padx=15, pady=8,
-                 command=self._export_pdf).pack(side='right', padx=4)
-        tk.Button(btn_frame, text="Cancel", font=("Helvetica", 10),
-                 bg=BG3, fg=TEXT, relief='flat', padx=12, pady=6,
-                 command=self.destroy).pack(side='right', padx=4)
-
-    def _create_graph_options_frame(self, parent, graph_type):
-        options_frame = tk.Frame(parent, bg=BG)
-        options_frame.pack(fill='x', padx=30, pady=2)
-        version_var = tk.StringVar(value='both')
-        self.graph_options[f'{graph_type}_version'] = version_var
-        tk.Label(options_frame, text="Show:", bg=BG, fg=TEXT, font=("Helvetica", 9)).pack(side='left', padx=(0, 5))
-        for v, t in [('v1', 'V1'), ('v2', 'V2'), ('both', 'Both')]:
-            tk.Radiobutton(options_frame, text=t, variable=version_var, value=v,
-                          bg=BG, fg=TEXT, activebackground=BG, activeforeground=TEXT).pack(side='left', padx=3)
-        excluded_var = tk.BooleanVar(value=True)
-        self.graph_options[f'{graph_type}_excluded'] = excluded_var
-        tk.Checkbutton(options_frame, text="Show excluded areas", variable=excluded_var,
-                      bg=BG, fg=TEXT, activebackground=BG, activeforeground=TEXT,
-                      font=("Helvetica", 9)).pack(side='left', padx=10)
-        return options_frame
-
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
     def _export_pdf(self):
         if not HAS_REPORTLAB:
             messagebox.showerror("Missing Dependency",
-                               "reportlab is required for PDF export.\n\nInstall with: pip install reportlab")
+                                 "reportlab is required for PDF export.\n\n"
+                                 "Install with:  pip install reportlab")
             return
         if len(self.dashboard.datasets) < 2:
-            messagebox.showwarning("Not Enough Videos", "Comparison reports require 2 videos.")
+            messagebox.showwarning("Not Enough Videos",
+                                   "Comparison reports require 2 videos to be loaded.")
             return
         file_path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
@@ -2882,21 +3148,21 @@ class PDFExportDialog(tk.Toplevel):
             initialfile=f"gait_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
         if not file_path:
             return
+        graph_options = {
+            'show_versions':    self._version_var.get(),
+            'include_excluded': self._excl_var.get(),
+        }
+        limbs    = {k: v.get() for k, v in self.limb_vars.items()}
+        measures = {k: v.get() for k, v in self.measure_vars.items()}
         try:
-            graphs = {}
-            for graph_type in ['continuous', 'cycles']:
-                if self.graph_vars[graph_type].get():
-                    graphs[graph_type] = {
-                        'show_versions': self.graph_options[f'{graph_type}_version'].get(),
-                        'include_excluded': self.graph_options[f'{graph_type}_excluded'].get(),
-                    }
-            limbs = {k: v.get() for k, v in self.limb_vars.items()}
-            self.dashboard._generate_pdf(file_path, graphs=graphs, limbs=limbs,
-                                         measures={k: v.get() for k, v in self.measure_vars.items()})
-            messagebox.showinfo("Success", f"PDF exported to:\n{file_path}")
+            self.dashboard._generate_pdf(file_path,
+                                          graph_options=graph_options,
+                                          limbs=limbs,
+                                          measures=measures)
+            messagebox.showinfo("Export Complete", f"PDF saved to:\n{file_path}")
             self.destroy()
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to generate PDF:\n{str(e)}")
+            messagebox.showerror("Export Failed", f"Could not generate PDF:\n{str(e)})")
 
 
 # main dashboard
@@ -3012,37 +3278,64 @@ class GaitAnalysisDashboard(tk.Tk):
 
     def _build_ui(self):
         # header
-        hdr = tk.Frame(self, bg=BG2, height=44)
+        hdr = tk.Frame(self, bg=ACCENT, height=60)
         hdr.pack(fill='x', side='top')
         hdr.pack_propagate(False)
 
         try:
-            _img = Image.open(resource_path("novita.png"))
-            _img.thumbnail((38, 36), Image.LANCZOS)
-            self._logo_img = ImageTk.PhotoImage(_img)
-            tk.Label(hdr, image=self._logo_img, bg=BG2).pack(side='left', padx=4)
-        except FileNotFoundError:
-            pass
+            # Use the same path resolution the PDF uses: resource_path()
+            _logo_path = resource_path("novita_customer_horizontal_white.png")
+            if not os.path.exists(_logo_path):
+                raise FileNotFoundError(_logo_path)
+            # Open with full alpha channel preserved
+            _img = Image.open(_logo_path).convert("RGBA")
+            _hr = int(ACCENT[1:3], 16)
+            _hg = int(ACCENT[3:5], 16)
+            _hb = int(ACCENT[5:7], 16)
+            # Composite white logo over solid header-colour background using true alpha
+            _bg = Image.new("RGBA", _img.size, (_hr, _hg, _hb, 255))
+            _composited = Image.alpha_composite(_bg, _img).convert("RGB")
+            # Larger target height = less downscaling = sharper result
+            _src_w, _src_h = _composited.size
+            _target_h = 42
+            _target_w = max(1, int(round(_target_h * _src_w / _src_h)))
+            _composited = _composited.resize((_target_w, _target_h), Image.LANCZOS)
+            self._logo_img = ImageTk.PhotoImage(_composited)
+            tk.Label(hdr, image=self._logo_img, bg=ACCENT).pack(side='left', padx=12, pady=6)
+        except Exception as _logo_err:
+            print(f"Logo load failed: {_logo_err}")
+            tk.Label(hdr, text="novita", font=("Coiny Cyrillic", 17),
+                     bg=ACCENT, fg="#ffffff").pack(side='left', padx=10)
 
-        title_label = tk.Label(hdr, text="novita gait analysis",
-                 font=("Coiny Cyrillic", 17), bg=BG2, fg=ACCENT, cursor="hand2")
-        title_label.pack(side='left', pady=(6, 0))
+        title_label = tk.Label(hdr, text="Gait Analysis",
+                 font=(UI_FONT, 13, "bold"),
+                 bg=ACCENT, fg="#c8a8c8", cursor="hand2")
+        title_label.pack(side='left', padx=(4, 0), pady=0)
         title_label.bind('<Button-1>', lambda e: self._open_settings())
 
-        self._help_btn = tk.Button(hdr, text="Help", font=("Helvetica", 9),
-              bg=BG3, fg=TEXT, relief='flat', padx=8,
+        self._pdf_btn = tk.Button(hdr, text="Print to PDF", font=(UI_FONT, 9),
+              bg="#ed185e", fg="#ffffff", relief='flat', padx=10,
+              activebackground="#c01050", activeforeground="#ffffff",
+              command=self._open_pdf_export)
+        self._pdf_btn.pack(side='right', padx=8, pady=10)
+
+        self._help_btn = tk.Button(hdr, text="Help", font=(UI_FONT, 9),
+              bg="#5a2a6e", fg="#ffffff", relief='flat', padx=10,
+              activebackground="#ed185e", activeforeground="#ffffff",
               command=self._toggle_tutorial_overlay)
-        self._help_btn.pack(side='right', padx=8, pady=8)
+        self._help_btn.pack(side='right', padx=8, pady=10)
 
-        self._remark_btn = tk.Button(hdr, text="Re-mark", font=("Helvetica", 9),
-              bg=BG3, fg=TEXT, relief='flat', padx=8,
+        self._remark_btn = tk.Button(hdr, text="Re-mark", font=(UI_FONT, 9),
+              bg="#5a2a6e", fg="#ffffff", relief='flat', padx=10,
+              activebackground="#ed185e", activeforeground="#ffffff",
               command=self._restart_marking_wizard)
-        self._remark_btn.pack(side='right', padx=8, pady=8)
+        self._remark_btn.pack(side='right', padx=8, pady=10)
 
-        self._select_btn = tk.Button(hdr, text="Upload", font=("Helvetica", 9),
-                  bg=BG3, fg=TEXT, relief='flat', padx=8,
+        self._select_btn = tk.Button(hdr, text="Upload", font=(UI_FONT, 9, "bold"),
+                  bg="#ed185e", fg="#ffffff", relief='flat', padx=10,
+                  activebackground="#c01050", activeforeground="#ffffff",
                   command=self.find_videos)
-        self._select_btn.pack(side='right', padx=8, pady=8)
+        self._select_btn.pack(side='right', padx=8, pady=10)
 
         # main content area
         main = tk.Frame(self, bg=BG)
@@ -3141,7 +3434,7 @@ class GaitAnalysisDashboard(tk.Tk):
         vid1_outer = tk.Frame(vid1_row, bg=BG2)
         vid1_outer.grid(row=0, column=0, columnspan=2, sticky='nsew')
         self._vid1_lbl = tk.Label(vid1_outer, text="VIDEO 1",
-                      font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V1, anchor='w')
+                      font=(UI_FONT, 8, "bold"), bg=BG2, fg=ACCENT, anchor='w')
         self._vid1_lbl.pack(fill='x', padx=4, pady=(2, 0))
         self._vid_canvas1 = tk.Canvas(vid1_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas1.pack(fill='both', expand=True)
@@ -3151,7 +3444,7 @@ class GaitAnalysisDashboard(tk.Tk):
         vid1L_outer = tk.Frame(vid1_row, bg=BG2)
         vid1L_outer.grid(row=0, column=0, sticky='nsew')
         self._vid1L_lbl = tk.Label(vid1L_outer, text="V1  LEFT",
-                      font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V1, anchor='w')
+                      font=(UI_FONT, 8, "bold"), bg=BG2, fg=C_V1, anchor='w')
         self._vid1L_lbl.pack(fill='x', padx=4, pady=(2, 0))
         self._vid_canvas1L = tk.Canvas(vid1L_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas1L.pack(fill='both', expand=True)
@@ -3161,7 +3454,7 @@ class GaitAnalysisDashboard(tk.Tk):
         vid1R_outer = tk.Frame(vid1_row, bg=BG2)
         vid1R_outer.grid(row=0, column=1, sticky='nsew')
         self._vid1R_lbl = tk.Label(vid1R_outer, text="V1  RIGHT",
-                      font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V1, anchor='w')
+                      font=(UI_FONT, 8, "bold"), bg=BG2, fg=C_V1, anchor='w')
         self._vid1R_lbl.pack(fill='x', padx=4, pady=(2, 0))
         self._vid_canvas1R = tk.Canvas(vid1R_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas1R.pack(fill='both', expand=True)
@@ -3176,12 +3469,12 @@ class GaitAnalysisDashboard(tk.Tk):
         vid_ctrl_outer.grid(row=1, column=0, sticky='ew', padx=0, pady=(2, 2))
         vid_ctrl_frame = tk.Frame(vid_ctrl_outer, bg=BG2)
         vid_ctrl_frame.pack(anchor='center')
-        _ctrl_colors = {'Prev': '#4a6fa5', 'Next': '#4a6fa5', 'Play': '#2e7d4f'}
+        _ctrl_colors = {'Prev': ACCENT, 'Next': ACCENT, 'Play': '#ed185e'}
         for txt, cmd in [("Prev", self._prev_frame), ("Play", self._toggle_play), ("Next", self._next_frame)]:
             _fg = _ctrl_colors[txt]
             _pbtn_cfg = dict(
                 bg=BG3, fg=_fg, relief='flat',
-                font=("Helvetica", 9, "bold"), padx=10, pady=1,
+                font=(UI_FONT, 9, "bold"), padx=10, pady=1,
                 cursor='hand2', width=5,
                 activebackground=_fg, activeforeground='white',
                 highlightthickness=1, highlightbackground=BG2, highlightcolor=BG2,
@@ -3211,7 +3504,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._vid_canvas2 = tk.Canvas(vid2_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas2.pack(fill='both', expand=True)
         self._vid2_lbl = tk.Label(vid2_outer, text="VIDEO 2",
-                      font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
+                      font=(UI_FONT, 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
         self._vid2_lbl.pack(fill='x', padx=4, pady=(0, 2))
         self._vid2_outer = vid2_outer
 
@@ -3219,7 +3512,7 @@ class GaitAnalysisDashboard(tk.Tk):
         vid2L_outer = tk.Frame(vid2_row, bg=BG2)
         vid2L_outer.grid(row=0, column=0, sticky='nsew')
         self._vid2L_lbl = tk.Label(vid2L_outer, text="V2  LEFT",
-                      font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
+                      font=(UI_FONT, 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
         self._vid2L_lbl.pack(fill='x', padx=4, pady=(2, 0))
         self._vid_canvas2L = tk.Canvas(vid2L_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas2L.pack(fill='both', expand=True)
@@ -3229,7 +3522,7 @@ class GaitAnalysisDashboard(tk.Tk):
         vid2R_outer = tk.Frame(vid2_row, bg=BG2)
         vid2R_outer.grid(row=0, column=1, sticky='nsew')
         self._vid2R_lbl = tk.Label(vid2R_outer, text="V2  RIGHT",
-                      font=("Helvetica", 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
+                      font=(UI_FONT, 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
         self._vid2R_lbl.pack(fill='x', padx=4, pady=(2, 0))
         self._vid_canvas2R = tk.Canvas(vid2R_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas2R.pack(fill='both', expand=True)
@@ -3275,11 +3568,11 @@ class GaitAnalysisDashboard(tk.Tk):
         bar.pack(fill='x', expand=True, padx=6)
 
         self._frame_lbl = tk.Label(bar, text="Frame: —",
-                                   font=("Helvetica", 8), bg=BG2, fg=SUBTEXT)
+                                   font=(UI_FONT, 8), bg=BG2, fg=SUBTEXT)
         self._frame_lbl.pack(side='right', padx=8)
 
         tk.Label(bar, textvariable=self._status_msg,
-                 font=("Helvetica", 8), bg=BG2, fg=TEXT, anchor='w'
+                 font=(UI_FONT, 8), bg=BG2, fg=TEXT, anchor='w'
                  ).pack(side='left', padx=8)
 
     def _style_ax(self, ax, fig):
@@ -3292,6 +3585,12 @@ class GaitAnalysisDashboard(tk.Tk):
         ax.tick_params(colors=SUBTEXT, labelsize=7, length=0)
         ax.xaxis.label.set_color(SUBTEXT)
         ax.yaxis.label.set_color(SUBTEXT)
+        # Apply Raleway font to tick labels if available
+        try:
+            for lbl in ax.get_xticklabels() + ax.get_yticklabels():
+                lbl.set_fontfamily('Raleway')
+        except Exception:
+            pass
         fig.subplots_adjust(left=0.02, right=0.98, top=0.97, bottom=0.08)
 
     def _build_graph_limb_header(self, parent, left_joint, right_joint):
@@ -3320,7 +3619,7 @@ class GaitAnalysisDashboard(tk.Tk):
         label = tk.Label(
             frame,
             text=label_text,
-            font=("Helvetica", 9, "bold"),
+            font=(UI_FONT, 9, "bold"),
             bg=frame['bg'],
             fg=TEXT,
             padx=1,
@@ -3423,10 +3722,10 @@ class GaitAnalysisDashboard(tk.Tk):
 
     def _build_buttons_panel(self, parent):
         """Build the top-right buttons panel."""
-        tk.Label(parent, text="DISPLAY", font=("Helvetica", 8, "bold"),
+        tk.Label(parent, text="DISPLAY", font=(UI_FONT, 8, "bold"),
                  bg=BG2, fg=ACCENT).pack(pady=(10, 4), padx=6)
 
-        btn_cfg = dict(bg=BG3, fg=TEXT, relief='flat', font=("Helvetica", 8, "bold"),
+        btn_cfg = dict(bg="#ed185e", fg="#ffffff", relief='flat', font=(UI_FONT, 8, "bold"),
                    padx=5, pady=1, cursor='hand2', width=10,
                        activebackground=ACCENT, activeforeground='white')
 
@@ -3439,7 +3738,7 @@ class GaitAnalysisDashboard(tk.Tk):
         c1 = tk.Canvas(v1_f, width=20, height=12, bg=BG3, highlightthickness=0)
         c1.pack(side='left', padx=(3, 1), pady=2)
         c1.create_line(1, 6, 19, 6, fill=C_V1, dash=(4, 3), width=2)
-        self._v1_toggle_lbl = tk.Label(v1_f, text="V1", font=("Helvetica", 8, "bold"),
+        self._v1_toggle_lbl = tk.Label(v1_f, text="V1", font=(UI_FONT, 8, "bold"),
                                         bg=BG3, fg=C_V1)
         self._v1_toggle_lbl.pack(side='left', padx=(1, 3))
         self._v1_btn_frame = v1_f
@@ -3452,7 +3751,7 @@ class GaitAnalysisDashboard(tk.Tk):
         c2 = tk.Canvas(v2_f, width=20, height=12, bg=BG3, highlightthickness=0)
         c2.pack(side='left', padx=(3, 1), pady=2)
         c2.create_line(1, 6, 19, 6, fill=C_V2, width=2)
-        self._v2_toggle_lbl = tk.Label(v2_f, text="V2", font=("Helvetica", 8, "bold"),
+        self._v2_toggle_lbl = tk.Label(v2_f, text="V2", font=(UI_FONT, 8, "bold"),
                                         bg=BG3, fg=C_V2)
         self._v2_toggle_lbl.pack(side='left', padx=(1, 3))
         self._v2_btn_frame = v2_f
@@ -3463,10 +3762,10 @@ class GaitAnalysisDashboard(tk.Tk):
         tk.Frame(parent, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
 
         badge_styles = {
-            'Ankle': {'bg': '#dbeeff', 'fg': '#1f4f7a'},
-            'Hip':   {'bg': '#ffe7cc', 'fg': '#8a4b08'},
-            'Knee':  {'bg': '#dff3df', 'fg': '#1f6b2f'},
-            'All':   {'bg': '#f5e6ff', 'fg': '#5a2a6e'},
+            'Ankle': {'bg': '#d6eef5', 'fg': '#411540'},
+            'Hip':   {'bg': '#fde8f0', 'fg': '#411540'},
+            'Knee':  {'bg': '#e8f5d6', 'fg': '#411540'},
+            'All':   {'bg': '#411540', 'fg': '#ffffff'},
         }
 
         joint_frame = tk.Frame(parent, bg=BG2)
@@ -3475,7 +3774,7 @@ class GaitAnalysisDashboard(tk.Tk):
         # header row: toggle-all buttons for left/right columns
         hdr_row = tk.Frame(joint_frame, bg=BG2)
         hdr_row.pack(fill='x', padx=6, pady=(2, 2))
-        all_badge = tk.Label(hdr_row, text='All', font=("Helvetica", 8, "bold"),
+        all_badge = tk.Label(hdr_row, text='All', font=(UI_FONT, 8, "bold"),
                              bg=badge_styles['All']['bg'], fg=badge_styles['All']['fg'], padx=4, pady=2, width=5)
         all_badge.pack(side='left', padx=(0, 4))
         # left control: combined swatch + label in a single clickable frame (match other toggle style)
@@ -3487,7 +3786,7 @@ class GaitAnalysisDashboard(tk.Tk):
         l_swatch.pack(side='left', padx=(5, 3), pady=2)
         l_swatch.create_line(1, 8, 13, 8, fill='black', dash=(4, 3), width=2)
         l_swatch.create_line(18, 8, 35, 8, fill='black', width=2)
-        l_label = tk.Label(left_ctrl, text='Left', font=("Helvetica", 9, "bold"), bg=left_ctrl['bg'], fg=TEXT,
+        l_label = tk.Label(left_ctrl, text='Left', font=(UI_FONT, 9, "bold"), bg=left_ctrl['bg'], fg=TEXT,
                    padx=1, pady=2)
         l_label.pack(side='left', padx=(0, 5))
         for w in (left_ctrl, l_swatch, l_label):
@@ -3504,7 +3803,7 @@ class GaitAnalysisDashboard(tk.Tk):
         r_swatch.pack(side='left', padx=(5, 3), pady=2)
         r_swatch.create_line(1, 8, 13, 8, fill='black', dash=(4, 3), width=2)
         r_swatch.create_line(18, 8, 35, 8, fill='black', width=2)
-        r_label = tk.Label(right_ctrl, text='Right', font=("Helvetica", 9, "bold"), bg=right_ctrl['bg'], fg=TEXT,
+        r_label = tk.Label(right_ctrl, text='Right', font=(UI_FONT, 9, "bold"), bg=right_ctrl['bg'], fg=TEXT,
                    padx=1, pady=2)
         r_label.pack(side='left', padx=(0, 5))
         for w in (right_ctrl, r_swatch, r_label):
@@ -3519,7 +3818,7 @@ class GaitAnalysisDashboard(tk.Tk):
             row = tk.Frame(joint_frame, bg=BG2)
             row.pack(fill='x', padx=6, pady=1)
             style = badge_styles.get(group_label, {'bg': BG2, 'fg': SUBTEXT})
-            badge = tk.Label(row, text=group_label, font=("Helvetica", 8, "bold"),
+            badge = tk.Label(row, text=group_label, font=(UI_FONT, 8, "bold"),
                              bg=style['bg'], fg=style['fg'], padx=4, pady=2, width=5)
             badge.pack(side='left', padx=(0, 4))
             for joint in group_joints:
@@ -3573,7 +3872,7 @@ class GaitAnalysisDashboard(tk.Tk):
     def _build_metrics_panel(self, parent):
         """Build the bottom-right metrics panel."""
         tk.Label(parent, text="METRICS",
-                 font=("Helvetica", 9, "bold"), bg=BG2, fg=ACCENT
+                 font=(UI_FONT, 9, "bold"), bg=BG2, fg=ACCENT
                  ).pack(pady=(8, 4), padx=6, anchor='w')
 
         self._metrics_canvas = tk.Canvas(parent, bg=BG2, highlightthickness=0)
@@ -3588,13 +3887,14 @@ class GaitAnalysisDashboard(tk.Tk):
         self._metric_value_lbls = {}
         for key in METRIC_ORDER:
             label, sub = METRIC_LABELS[key]
-            card = tk.Frame(self._metrics_scrollable, bg=BG3, padx=6, pady=3)
+            card = tk.Frame(self._metrics_scrollable, bg="#ffffff", padx=6, pady=4,
+                            highlightbackground=BG3, highlightthickness=1)
             card.pack(fill='x', padx=6, pady=2)
-            title_lbl = tk.Label(card, text=label, font=("Helvetica", 8, "bold"), bg=BG3, fg=TEXT)
+            title_lbl = tk.Label(card, text=label, font=(UI_FONT, 8, "bold"), bg="#ffffff", fg=ACCENT)
             title_lbl.pack(anchor='w')
-            sub_lbl = tk.Label(card, text=sub, font=("Helvetica", 6), bg=BG3, fg=SUBTEXT)
+            sub_lbl = tk.Label(card, text=sub, font=(UI_FONT, 6), bg="#ffffff", fg=SUBTEXT)
             sub_lbl.pack(anchor='w')
-            val_lbl = tk.Label(card, text="—", font=("Helvetica", 11, "bold"), bg=BG3, fg=SUBTEXT)
+            val_lbl = tk.Label(card, text="—", font=(UI_FONT, 11, "bold"), bg="#ffffff", fg=SUBTEXT)
             val_lbl.pack(anchor='w', pady=(1, 0))
             self._metric_value_lbls[key] = val_lbl
             for widget in (card, title_lbl, sub_lbl, val_lbl):
@@ -3848,8 +4148,6 @@ class GaitAnalysisDashboard(tk.Tk):
 
     def _bind_keys(self):
         shortcuts = {
-            '<Key-1>': self._prev_frame,
-            '<Key-2>': self._next_frame,
             '<Key-9>': self._toggle_play,
             '<q>': self._on_close,
             '<w>': self._toggle_world,
@@ -3881,6 +4179,12 @@ class GaitAnalysisDashboard(tk.Tk):
             if len(seq) == 3 and seq.startswith('<') and seq.endswith('>') and seq[1].isalpha():
                 upper_seq = f"<{seq[1].upper()}>"
                 self.bind_all(upper_seq, lambda e, _fn=fn: _fn())
+
+        # bind keys 1 and 2 for scrubbing with press/release handling
+        self.bind_all('<KeyPress-1>', lambda e: self._on_scrub_key_press('1'))
+        self.bind_all('<KeyRelease-1>', lambda e: self._on_scrub_key_release('1'))
+        self.bind_all('<KeyPress-2>', lambda e: self._on_scrub_key_press('2'))
+        self.bind_all('<KeyRelease-2>', lambda e: self._on_scrub_key_release('2'))
 
     # prefetch worker for frame caching
 
@@ -3981,7 +4285,8 @@ class GaitAnalysisDashboard(tk.Tk):
             ad = ds.get('angle_data', pd.DataFrame())
             depths = ds.get('landmark_depths', pd.DataFrame())
             _, auto_excl, _ = detect_steps_robust(ad, depth_df=depths, fps=SLOWMO_FPS)
-            ds['excluded_regions'] = self._merge_exclusion_regions(list(auto_excl))
+            dir_excl = ds.get('direction_exclusions', [])
+            ds['excluded_regions'] = self._merge_exclusion_regions(list(auto_excl) + list(dir_excl))
             ds['suggested_step_frames'] = []
             ds['suggested_step_meta'] = []
             total += len(ds.get('excluded_regions', []))
@@ -4614,7 +4919,7 @@ class GaitAnalysisDashboard(tk.Tk):
                     if vi >= len(self.datasets):
                         canvas.delete('all')
                         canvas.create_text(cw // 2, ch // 2, text="No frame",
-                                           fill=SUBTEXT, font=("Helvetica", 10))
+                                           fill=SUBTEXT, font=(UI_FONT, 10))
                         self._canvas_image_ids[slot] = None
                         continue
                     # determine which side this cycle slot represents so we can focus colouring
@@ -4623,7 +4928,7 @@ class GaitAnalysisDashboard(tk.Tk):
                     if result is None:
                         canvas.delete('all')
                         canvas.create_text(cw // 2, ch // 2, text="No frame",
-                                           fill=SUBTEXT, font=("Helvetica", 10))
+                                           fill=SUBTEXT, font=(UI_FONT, 10))
                         self._canvas_image_ids[slot] = None
                         continue
                     self._display_cache.put(dc_key, result)
@@ -4667,13 +4972,13 @@ class GaitAnalysisDashboard(tk.Tk):
             if result is None:
                 if vi >= len(self.datasets):
                     canvas.delete('all')
-                    canvas.create_text(cw // 2, ch // 2, text="No frame", fill=SUBTEXT, font=("Helvetica", 10))
+                    canvas.create_text(cw // 2, ch // 2, text="No frame", fill=SUBTEXT, font=(UI_FONT, 10))
                     self._canvas_image_ids[vi] = None
                     continue
                 result = self._render_video_frame(vi, frame_idx, cw, ch)
                 if result is None:
                     canvas.delete('all')
-                    canvas.create_text(cw // 2, ch // 2, text="No frame", fill=SUBTEXT, font=("Helvetica", 10))
+                    canvas.create_text(cw // 2, ch // 2, text="No frame", fill=SUBTEXT, font=(UI_FONT, 10))
                     self._canvas_image_ids[vi] = None
                     continue
                 self._display_cache.put(dc_key, result)
@@ -4711,7 +5016,7 @@ class GaitAnalysisDashboard(tk.Tk):
         W = self._prog_canvas.winfo_width()
         if W > 1 and n > 0:
             pw = int(W * self.progress)
-            self._prog_canvas.create_rectangle(0, 0, pw, 4, fill=ACCENT, outline='')
+            self._prog_canvas.create_rectangle(0, 0, pw, 4, fill='#ed185e', outline='')
 
     def _update_metrics_panel(self):
         if len(self.datasets) < 2:
@@ -5420,6 +5725,40 @@ class GaitAnalysisDashboard(tk.Tk):
         """Fast path: move the cursor using blit. Falls back to full redraw if blit cache is cold."""
         self._update_cursor_blit()
 
+    def _on_scrub_key_press(self, key):
+        """Handle key press for scrubbing (key 1 = prev, key 2 = next)."""
+        if self.playing:
+            return
+        # start scrubbing immediately on first press
+        if self._btn_held != key:
+            self._btn_held = key
+            if self._btn_hold_after_id:
+                self.after_cancel(self._btn_hold_after_id)
+            self._scrub_loop(key)
+
+    def _on_scrub_key_release(self, key):
+        """Handle key release to stop scrubbing."""
+        if self._btn_held == key:
+            self._btn_held = None
+            if self._btn_hold_after_id:
+                self.after_cancel(self._btn_hold_after_id)
+                self._btn_hold_after_id = None
+
+    def _scrub_loop(self, key):
+        """Continuously scrub frames while the key is held."""
+        if self._btn_held != key:
+            # key was released, stop the loop
+            return
+        
+        # advance the frame in the direction of the held key
+        if key == '1':
+            self._prev_frame()
+        elif key == '2':
+            self._next_frame()
+        
+        # schedule the next frame advance at ~30 fps (33ms)
+        self._btn_hold_after_id = self.after(33, self._scrub_loop, key)
+
     # ui controls and event handlers
 
     def _prev_frame(self):
@@ -5814,7 +6153,9 @@ class GaitAnalysisDashboard(tk.Tk):
         if not self.datasets: return
         for ds in self.datasets:
             if ds:
-                ds['excluded_regions'] = []
+                # Preserve direction exclusions — those come from processing
+                # and can't be manually restored. Only clear kinematic exclusions.
+                ds['excluded_regions'] = list(ds.get('direction_exclusions', []))
                 self._persist_dataset_markup(ds)
         self._status_msg.set("All exclusions cleared")
         self.redraw_graphs()
@@ -5828,7 +6169,8 @@ class GaitAnalysisDashboard(tk.Tk):
                 suggested, auto_excl, step_meta = detect_steps_robust(ad, depth_df=depths, fps=SLOWMO_FPS)
                 ds['suggested_step_frames'] = suggested
                 ds['suggested_step_meta'] = step_meta
-                ds['excluded_regions'] = self._merge_exclusion_regions(list(auto_excl))
+                dir_excl = ds.get('direction_exclusions', [])
+                ds['excluded_regions'] = self._merge_exclusion_regions(list(auto_excl) + list(dir_excl))
                 self._persist_dataset_markup(ds)
         self._status_msg.set("Auto steps recomputed")
         self._update_metrics_panel()
@@ -5844,6 +6186,17 @@ class GaitAnalysisDashboard(tk.Tk):
                 self._settings_dialog = None
                 dialog.destroy()
             self._settings_dialog.protocol("WM_DELETE_WINDOW", on_close)
+
+    def _open_pdf_export(self):
+        if self._pdf_export_dialog is not None and self._pdf_export_dialog.winfo_exists():
+            self._pdf_export_dialog.lift(); self._pdf_export_dialog.focus()
+        else:
+            self._pdf_export_dialog = PDFExportDialog(self, self)
+            dialog = self._pdf_export_dialog
+            def on_close():
+                self._pdf_export_dialog = None
+                dialog.destroy()
+            self._pdf_export_dialog.protocol("WM_DELETE_WINDOW", on_close)
 
     def _restart_marking_wizard(self):
         if len(self.datasets) < 2:
@@ -5915,13 +6268,13 @@ class GaitAnalysisDashboard(tk.Tk):
         top_row = tk.Frame(self._markup_banner_area, bg=BG2)
         top_row.pack(fill='x', padx=20, pady=(10, 0))
         self._markup_step_lbl = tk.Label(top_row, text="STEP  1  OF  4",
-            font=("Helvetica", 9, "bold"), bg=BG2, fg=SUBTEXT, anchor='w')
+            font=(UI_FONT, 9, "bold"), bg=BG2, fg=SUBTEXT, anchor='w')
         self._markup_step_lbl.pack(side='left')
         self._markup_side_badge = tk.Label(top_row, text=" LEFT ",
-            font=("Helvetica", 9, "bold"), bg=C_LEFT, fg='white', padx=6, pady=1)
+            font=(UI_FONT, 9, "bold"), bg=C_LEFT, fg='white', padx=6, pady=1)
         self._markup_side_badge.pack(side='left', padx=(10, 0))
         self._markup_count_lbl = tk.Label(top_row, text="0 steps marked",
-            font=("Helvetica", 10, "bold"), bg=BG2, fg=C_LEFT, anchor='e')
+            font=(UI_FONT, 10, "bold"), bg=BG2, fg=C_LEFT, anchor='e')
         self._markup_count_lbl.pack(side='right')
         title_row = tk.Frame(self._markup_banner_area, bg=BG2)
         title_row.pack(fill='x', padx=20, pady=(2, 4))
@@ -5931,7 +6284,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._markup_banner_lbl.pack(side='left')
         self._markup_sub_lbl = tk.Label(title_row,
             text="· press  SPACE  to mark each LEFT foot strike",
-            font=("Helvetica", 9), bg=BG2, fg=SUBTEXT, anchor='w')
+            font=(UI_FONT, 9), bg=BG2, fg=SUBTEXT, anchor='w')
         self._markup_sub_lbl.pack(side='left', padx=(12, 0))
         tk.Frame(self._markup_banner_area, bg=BG3, height=1).pack(fill='x')
         vid_area = tk.Frame(self._markup_frame, bg=BG)
@@ -5939,7 +6292,7 @@ class GaitAnalysisDashboard(tk.Tk):
         vf = tk.Frame(vid_area, bg=BG2, bd=1, relief='flat')
         vf.pack(fill='both', expand=True)
         self._markup_vid_lbl = tk.Label(vf, text="VIDEO 1",
-            font=("Helvetica", 9, "bold"), bg=BG2, fg=C_V1, anchor='w')
+            font=(UI_FONT, 9, "bold"), bg=BG2, fg=C_V1, anchor='w')
         self._markup_vid_lbl.pack(fill='x', padx=6, pady=(3, 0))
         self._markup_canvas = tk.Canvas(vf, bg=BG_VID, highlightthickness=0)
         self._markup_canvas.pack(fill='both', expand=True)
@@ -5965,21 +6318,22 @@ class GaitAnalysisDashboard(tk.Tk):
         ctrl_row = tk.Frame(self._markup_frame, bg=BG2, height=52)
         ctrl_row.pack(fill='x', side='bottom')
         ctrl_row.pack_propagate(False)
-        self._markup_undo_btn = tk.Button(ctrl_row, text="⌫  Undo Last Step",
-            font=("Helvetica", 9), bg=BG3, fg=TEXT, relief='flat', padx=12, cursor='hand2',
+        self._markup_undo_btn = tk.Button(ctrl_row, text="Undo Last Step",
+            font=(UI_FONT, 9), bg="#5a2a6e", fg="#ffffff", relief='flat', padx=12, cursor='hand2',
+            activebackground=ACCENT, activeforeground='white',
             command=self._markup_remove_last)
         self._markup_undo_btn.pack(side='left', padx=16, pady=10)
         self._markup_frame_lbl = tk.Label(ctrl_row, text="Frame 3  (0.01 s)",
-            font=("Helvetica", 9, "bold"), bg=BG2, fg=TEXT)
+            font=(UI_FONT, 9, "bold"), bg=BG2, fg=TEXT)
         self._markup_frame_lbl.pack(side='left', padx=(0, 16))
         self._markup_continue_btn = tk.Button(ctrl_row, text="Done  →  Next",
-            font=("Helvetica", 11, "bold"),
+            font=(UI_FONT, 11, "bold"),
             bg=ACCENT, fg='white', relief='flat', padx=20, cursor='hand2',
-            activebackground='#5a186a', activeforeground='white')
+            activebackground='#ed185e', activeforeground='white')
         self._markup_continue_btn.pack(side='right', padx=20, pady=10)
         tk.Label(ctrl_row,
             text="Click graph to seek  ·  SPACE = mark step  ·  1/2 = frame by frame",
-            font=("Helvetica", 8), bg=BG2, fg=SUBTEXT).pack(side='left', padx=8)
+            font=(UI_FONT, 8), bg=BG2, fg=SUBTEXT).pack(side='left', padx=8)
 
     def _enter_marking_phase(self, side, video_idx):
         self._marking_phase = side
@@ -6002,7 +6356,7 @@ class GaitAnalysisDashboard(tk.Tk):
         if next_phase is not None:
             next_side, next_video_idx = next_phase
             next_side_label = "LEFT" if next_side == 'left' else "RIGHT"
-            continue_txt = f"Done  →  Mark {next_side_label} steps on Video {next_video_idx + 1}"
+            continue_txt = f"Mark {next_side_label} steps on Video {next_video_idx + 1}"
             continue_cmd = lambda s=next_side, vi=next_video_idx: self._enter_marking_phase(s, vi)
         else:
             continue_txt = "Finish  →  View Gait Analysis"
@@ -6062,7 +6416,7 @@ class GaitAnalysisDashboard(tk.Tk):
                     frame = self._cache.get(vi, frame_idx, store)
         if frame is None or cw < 2 or ch < 2:
             if cw >= 2 and ch >= 2:
-                canvas.create_text(cw // 2, ch // 2, text="No frame", fill=SUBTEXT, font=("Helvetica", 10))
+                canvas.create_text(cw // 2, ch // 2, text="No frame", fill=SUBTEXT, font=(UI_FONT, 10))
             return
         if pixel_lm is not None:
             jittery_frames = self.datasets[vi].get('jittery_frames', set()) if self.remove_jitter_frames else set()
@@ -6243,88 +6597,786 @@ class GaitAnalysisDashboard(tk.Tk):
 
     # pdf export dialog
 
-    def _generate_pdf(self, output_path, graphs, limbs, measures):
-        from reportlab.lib.pagesizes import letter
+    def _generate_pdf(self, output_path, graph_options=None, limbs=None, measures=None):
+        """Generate a Novita-branded gait analysis PDF using overlaid gait cycles for all 3 joints."""
+        from reportlab.lib.pagesizes import A4
         from reportlab.lib import colors
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.units import inch
-        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage, PageBreak
+        from reportlab.lib.units import mm, inch
+        from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
+                                        Paragraph, Spacer, Image as RLImage,
+                                        PageBreak, HRFlowable)
+        from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+
+        # ── Register Novita brand fonts (Coiny + Raleway) ──────────
+        _COINY_FONT   = 'Helvetica-Bold'   # fallback
+        _RALEWAY_FONT = 'Helvetica'         # fallback
+        _RALEWAY_BOLD = 'Helvetica-Bold'    # fallback
+
+        def _find_font(filename):
+            """Search next to the app, in a 'static' subfolder, and in a 'Raleway'
+            subfolder — covers flat extraction and zip-extracted folder layouts."""
+            for candidate in [
+                resource_path(filename),
+                resource_path(os.path.join('static', filename)),
+                resource_path(os.path.join('Raleway', filename)),
+                resource_path(os.path.join('Raleway', 'static', filename)),
+            ]:
+                if os.path.exists(candidate):
+                    return candidate
+            return None
+
+        try:
+            _coiny_path = resource_path('Coiny-Cyrillic.ttf')
+            if os.path.exists(_coiny_path):
+                pdfmetrics.registerFont(TTFont('Coiny', _coiny_path))
+                _COINY_FONT = 'Coiny'
+        except Exception as _fe:
+            print(f"Coiny font not loaded: {_fe}")
+        try:
+            _rp = _find_font('Raleway-Regular.ttf')
+            _rb = _find_font('Raleway-Bold.ttf')
+            if _rp:
+                pdfmetrics.registerFont(TTFont('Raleway', _rp))
+                _RALEWAY_FONT = 'Raleway'
+                print(f"Raleway loaded from: {_rp}")
+            else:
+                print("Raleway-Regular.ttf not found — falling back to Helvetica")
+            if _rb:
+                pdfmetrics.registerFont(TTFont('Raleway-Bold', _rb))
+                _RALEWAY_BOLD = 'Raleway-Bold'
+                print(f"Raleway-Bold loaded from: {_rb}")
+            else:
+                print("Raleway-Bold.ttf not found — falling back to Helvetica-Bold")
+        except Exception as _fe:
+            print(f"Raleway font not loaded: {_fe}")
+
+        if graph_options is None:
+            graph_options = {'show_versions': 'both', 'include_excluded': True}
+        if limbs is None:
+            limbs = {k: True for k in ('left_hip', 'right_hip', 'left_knee',
+                                        'right_knee', 'left_ankle', 'right_ankle')}
+        if measures is None:
+            measures = {k: True for k in PDFExportDialog.OUTCOME_MEASURES}
+
+        # ── Novita brand colours ────────────────────────────────────
+        C_PURPLE  = colors.HexColor('#411540')
+        C_PINK    = colors.HexColor('#ed185e')
+        C_CYAN    = colors.HexColor('#77C5D5')
+        C_YELLOW  = colors.HexColor('#EEDC00')
+        C_WHITE   = colors.white
+        C_LIGHT   = colors.HexColor('#f7f3f7')   # very pale purple tint
+        C_MID     = colors.HexColor('#e8dde8')   # light purple tint for alternating rows
+        C_SUBTEXT = colors.HexColor('#5a3a5a')
+
+        PAGE_W, PAGE_H = A4
+        MARGIN = 16 * mm
+        BODY_W = PAGE_W - 2 * MARGIN
+
+        # Graph dimensions are read from the actual saved PNG at build time so the
+        # aspect ratio is always correct regardless of canvas/window resize.
+        # Fallback if PIL is unavailable: use the known figsize ratio 5.5:2.6.
+        def _img_aspect(path, fallback=5.5/2.6):
+            try:
+                from PIL import Image as _PILImage
+                with _PILImage.open(path) as _im:
+                    w, h = _im.size
+                    return w / h if h else fallback
+            except Exception:
+                return fallback
+
+        # Page 2 graph height budget: A4 body ~267mm minus header ~22mm, footer ~12mm,
+        # 3 dividers ~9mm, inter-row spacers ~6mm, 3 description rows ~18mm → ~200mm / 3 = ~66mm each.
+        # Use 70mm as a safe cap so nothing overflows with full-width graphs.
+        GRAPH2_H_MAX = 70 * mm
+
         temp_images = []
         try:
-            doc = SimpleDocTemplate(output_path, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
-            story = []
+            doc = SimpleDocTemplate(
+                output_path, pagesize=A4,
+                leftMargin=MARGIN, rightMargin=MARGIN,
+                topMargin=MARGIN, bottomMargin=14 * mm)
+
+            # ── Style definitions ───────────────────────────────────
             styles = getSampleStyleSheet()
-            title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=24,
-                                         textColor=colors.HexColor('#2c3e50'), spaceAfter=6, alignment=1)
-            story.append(Paragraph("Gait Analysis Report", title_style))
-            story.append(Spacer(1, 0.1*inch))
-            subtitle_style = ParagraphStyle('Subtitle', parent=styles['Normal'], fontSize=11,
-                                            textColor=colors.HexColor('#7f8c8d'), alignment=1)
-            story.append(Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y at %H:%M')}", subtitle_style))
-            story.append(Spacer(1, 0.3*inch))
-            graph_height = 3.5*inch
-            graph_width = 6.5*inch
-            if 'continuous' in graphs:
-                story.append(Paragraph("Continuous View (Raw Angle Data)", styles['Heading2']))
-                img_path = self._capture_graph_image('continuous', graphs['continuous'], limbs)
-                if img_path:
-                    try:
-                        story.append(RLImage(img_path, width=graph_width, height=graph_height))
-                        story.append(Spacer(1, 0.2*inch))
-                        temp_images.append(img_path)
-                    except Exception as e:
-                        print(f"Error adding image: {e}")
-            if 'cycles' in graphs:
-                story.append(Paragraph("Overlaid Cycles (Normalized Gait Cycles)", styles['Heading2']))
-                img_path = self._capture_graph_image('cycles', graphs['cycles'], limbs)
-                if img_path:
-                    try:
-                        story.append(RLImage(img_path, width=graph_width, height=graph_height))
-                        story.append(Spacer(1, 0.2*inch))
-                        temp_images.append(img_path)
-                    except Exception as e:
-                        print(f"Error adding image: {e}")
-            if any(measures.values()) and len(self.datasets) >= 2:
-                story.append(PageBreak())
-                story.append(Paragraph("Outcome Measures", styles['Heading2']))
-                story.append(Spacer(1, 0.15*inch))
-                metrics = compute_metrics(self.datasets[0], self.datasets[1])
-                table_data = [['Measure', 'Change (%)']]
-                for key, label in PDFExportDialog.OUTCOME_MEASURES.items():
-                    if measures.get(key):
-                        value = metrics.get(key, 0)
-                        value_str = f"{value:+.1f}%" if isinstance(value, (int, float)) else "N/A"
-                        table_data.append([label, value_str])
-                if len(table_data) > 1:
-                    table = Table(table_data, colWidths=[4.5*inch, 1.5*inch])
-                    table.setStyle(TableStyle([
-                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#34495e')),
-                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                        ('FONTSIZE', (0, 0), (-1, 0), 11),
-                        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                        ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f5f5f5')]),
-                        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-                        ('FONTSIZE', (0, 1), (-1, -1), 10),
-                        ('TOPPADDING', (0, 1), (-1, -1), 8),
-                        ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
+
+            def _ps(name, **kw):
+                return ParagraphStyle(name, **kw)
+
+            # Novita headline: large Coiny for brand name
+            s_novita_headline = _ps('NovitaHeadline',
+                fontName=_COINY_FONT, fontSize=32,
+                textColor=C_WHITE, alignment=TA_LEFT,
+                spaceAfter=0, leading=36)
+            # Gait Analysis Report subheading: Raleway
+            s_report_sub_heading = _ps('ReportSubHeading',
+                fontName=_RALEWAY_BOLD, fontSize=14,
+                textColor=colors.HexColor('#c8a8c8'), alignment=TA_LEFT,
+                spaceAfter=2, leading=18)
+            s_report_date = _ps('ReportDate',
+                fontName=_RALEWAY_FONT, fontSize=9,
+                textColor=colors.HexColor('#c8a8c8'), alignment=TA_RIGHT)
+            s_section_head = _ps('SectionHead',
+                fontName=_RALEWAY_BOLD, fontSize=13,
+                textColor=C_PURPLE, spaceBefore=0, spaceAfter=3)
+            s_joint_label = _ps('JointLabel',
+                fontName=_RALEWAY_BOLD, fontSize=11,
+                textColor=C_PURPLE, spaceBefore=0, spaceAfter=3, leading=13)
+            s_joint_sub = _ps('JointSub',
+                fontName=_RALEWAY_FONT, fontSize=11,
+                textColor=C_SUBTEXT, leading=14, spaceAfter=3)
+            s_body = _ps('Body',
+                fontName=_RALEWAY_FONT, fontSize=9,
+                textColor=C_SUBTEXT, leading=13, spaceAfter=4)
+            s_caption = _ps('Caption',
+                fontName=_RALEWAY_FONT, fontSize=8,
+                textColor=C_SUBTEXT, alignment=TA_CENTER, spaceAfter=6)
+            s_metric_improve = _ps('MetricImprove',
+                fontName=_RALEWAY_BOLD, fontSize=10,
+                textColor=colors.HexColor('#1a7a3c'), alignment=TA_RIGHT)
+            s_metric_decline = _ps('MetricDecline',
+                fontName=_RALEWAY_BOLD, fontSize=10,
+                textColor=colors.HexColor('#c0392b'), alignment=TA_RIGHT)
+            s_metric_neutral = _ps('MetricNeutral',
+                fontName=_RALEWAY_BOLD, fontSize=10,
+                textColor=C_SUBTEXT, alignment=TA_RIGHT)
+
+            # ── Reusable banner builder ──────────────────────────────
+            def _banner(left_content, right_text, right_style,
+                        bg=C_PURPLE, pad_v=14, pad_h=16):
+                """left_content may be a Paragraph or a list of Paragraphs (stacked)."""
+                if isinstance(left_content, list):
+                    # Stack multiple paragraphs in a nested single-column table
+                    inner_rows = [[p] for p in left_content]
+                    inner = Table(inner_rows, colWidths=[BODY_W * 0.62])
+                    inner.setStyle(TableStyle([
+                        ('LEFTPADDING',   (0, 0), (-1, -1), 0),
+                        ('RIGHTPADDING',  (0, 0), (-1, -1), 0),
+                        ('TOPPADDING',    (0, 0), (-1, -1), 0),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
+                        ('BACKGROUND',    (0, 0), (-1, -1), bg),
                     ]))
-                    story.append(table)
+                    left_cell = inner
+                else:
+                    left_cell = left_content
+                t = Table([[left_cell,
+                             Paragraph(right_text, right_style)]],
+                          colWidths=[BODY_W * 0.62, BODY_W * 0.38])
+                t.setStyle(TableStyle([
+                    ('BACKGROUND',   (0, 0), (-1, -1), bg),
+                    ('VALIGN',       (0, 0), (-1, -1), 'MIDDLE'),
+                    ('LEFTPADDING',  (0, 0), (-1, -1), pad_h),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), pad_h),
+                    ('TOPPADDING',   (0, 0), (-1, -1), pad_v),
+                    ('BOTTOMPADDING',(0, 0), (-1, -1), pad_v),
+                    ('ALIGN',        (1, 0), (1, 0),   'RIGHT'),
+                ]))
+                return t
+
+            story = []
+
+            # ══════════════════════════════════════════════════════════
+            # PAGE 1  –  Header + descriptions + outcome measures
+            # ══════════════════════════════════════════════════════════
+            date_str = datetime.now().strftime('%d %B %Y')
+
+            # Header banner using logo image instead of text
+            _logo_path = resource_path('novita_customer_horizontal_white.png')
+            _logo_h    = 18 * mm   # rendered height in banner
+            _logo_w    = _logo_h * (1545 / 501)  # preserve aspect ratio (approx)
+            try:
+                from PIL import Image as _PILImg
+                with _PILImg.open(_logo_path) as _lim:
+                    _lw, _lh = _lim.size
+                    _logo_w = _logo_h * (_lw / _lh) if _lh else _logo_w
+            except Exception:
+                pass
+
+            if os.path.exists(_logo_path):
+                _logo_img = RLImage(_logo_path, width=_logo_w, height=_logo_h)
+            else:
+                _logo_img = Paragraph("novita", s_novita_headline)
+
+            _sub_para = Paragraph("Gait Analysis Report", s_report_sub_heading)
+            _logo_stack = Table(
+                [[_logo_img], [_sub_para]],
+                colWidths=[BODY_W * 0.62])
+            _logo_stack.setStyle(TableStyle([
+                ('LEFTPADDING',   (0, 0), (-1, -1), 0),
+                ('RIGHTPADDING',  (0, 0), (-1, -1), 0),
+                ('TOPPADDING',    (0, 0), (0, 0),   6),
+                ('TOPPADDING',    (1, 0), (1, 0),   0),
+                ('BOTTOMPADDING', (0, 0), (0, 0),   8),
+                ('BOTTOMPADDING', (1, 0), (1, 0),   0),
+                ('BACKGROUND',    (0, 0), (-1, -1), C_PURPLE),
+                ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+
+            header_banner = _banner(
+                _logo_stack,
+                f"Generated  {date_str}",
+                s_report_date)
+            story.append(header_banner)
+            story.append(HRFlowable(width=BODY_W, thickness=4,
+                                     color=C_PINK, spaceAfter=0))
+            story.append(Spacer(1, 7 * mm))
+
+            # ── Joint descriptions on page 1 ────────────────────────
+            story.append(Paragraph("Normalised Gait Cycles", s_section_head))
+            story.append(HRFlowable(width=BODY_W, thickness=1,
+                                     color=C_MID, spaceAfter=5))
+            story.append(Paragraph(
+                "This report compares Video 1 (V1) against Video 2 (V2) using overlaid normalised "
+                "gait cycles for three joints. Each curve represents one complete gait cycle, "
+                "allowing consistency and range of motion to be assessed at a glance. "
+                "The shaded band shows the normative reference range.",
+                s_body))
+            story.append(Spacer(1, 5 * mm))
+
+            long_desc = {
+                'hip':   ('Hip Flexion / Extension',
+                          'Measures the forward and backward swing of the hip joint. '
+                          'Reduced peak hip flexion may indicate hip flexor weakness or pain avoidance. '
+                          'Asymmetry between left and right can highlight compensatory strategies.'),
+                'knee':  ('Knee Flexion / Extension',
+                          'Captures how much the knee bends and straightens during a stride. '
+                          'Peak knee flexion in swing phase reflects foot clearance ability. '
+                          'Reduced flexion is commonly associated with stiff-knee gait patterns.'),
+                'ankle': ('Ankle Dorsi / Plantarflexion',
+                          'Reflects the ankle rocker mechanism — dorsiflexion in stance allows '
+                          'the tibia to advance, while plantarflexion at push-off generates propulsive force. '
+                          'Reduced push-off amplitude is a common finding in neurological gait disorders.'),
+            }
+
+            joint_info = [
+                ('hip',   'Hip Flexion / Extension',
+                 'Forward and backward swing of the hip through the gait cycle.'),
+                ('knee',  'Knee Flexion / Extension',
+                 'Bend and straightening of the knee — key for shock absorption and toe clearance.'),
+                ('ankle', 'Ankle Dorsi / Plantarflexion',
+                 'Push-off power and foot clearance during the gait cycle.'),
+            ]
+
+            # Three description blocks side by side — each is a padded card
+            # Gap between cards = 4mm; card inner padding = 7pt each side
+            CARD_GAP   = 4 * mm
+            CARD_PAD   = 7   # points of inner padding
+            desc_col_w = (BODY_W - 2 * CARD_GAP) / 3  # outer card width incl padding
+            # Inner content width = card width minus left+right padding
+            inner_w    = desc_col_w - 2 * CARD_PAD
+
+            desc_cells = []
+            for joint_key, joint_title, joint_desc_short in joint_info:
+                full_title, full_desc = long_desc[joint_key]
+                # Inner table: title row + body row, sized to inner content width
+                card_inner = Table(
+                    [[Paragraph(full_title, s_joint_label)],
+                     [Paragraph(full_desc, _ps(f'jd2_{joint_key}',
+                                               fontName=_RALEWAY_FONT, fontSize=11,
+                                               textColor=C_SUBTEXT, leading=14))]],
+                    colWidths=[inner_w])
+                card_inner.setStyle(TableStyle([
+                    ('LEFTPADDING',   (0, 0), (-1, -1), 0),
+                    ('RIGHTPADDING',  (0, 0), (-1, -1), 0),
+                    ('TOPPADDING',    (0, 0), (-1, -1), 0),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+                    ('VALIGN',        (0, 0), (-1, -1), 'TOP'),
+                ]))
+                # Outer card table provides the background + uniform padding
+                card_outer = Table([[card_inner]], colWidths=[desc_col_w])
+                card_outer.setStyle(TableStyle([
+                    ('BACKGROUND',    (0, 0), (-1, -1), C_LIGHT),
+                    ('LEFTPADDING',   (0, 0), (-1, -1), CARD_PAD),
+                    ('RIGHTPADDING',  (0, 0), (-1, -1), CARD_PAD),
+                    ('TOPPADDING',    (0, 0), (-1, -1), CARD_PAD),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), CARD_PAD),
+                    ('VALIGN',        (0, 0), (-1, -1), 'TOP'),
+                ]))
+                desc_cells.append(card_outer)
+
+            desc_row_tbl = Table(
+                [desc_cells],
+                colWidths=[desc_col_w, desc_col_w, desc_col_w],
+                hAlign='LEFT',
+                spaceBefore=0, spaceAfter=0)
+            desc_row_tbl.setStyle(TableStyle([
+                ('LEFTPADDING',  (0, 0), (-1, -1), 0),
+                ('RIGHTPADDING', (0, 0), (0, 0),   CARD_GAP),
+                ('RIGHTPADDING', (1, 0), (1, 0),   CARD_GAP),
+                ('RIGHTPADDING', (2, 0), (2, 0),   0),
+                ('TOPPADDING',   (0, 0), (-1, -1), 0),
+                ('BOTTOMPADDING',(0, 0), (-1, -1), 0),
+                ('VALIGN',       (0, 0), (-1, -1), 'TOP'),
+            ]))
+            story.append(desc_row_tbl)
+            story.append(Spacer(1, 6 * mm))
+
+            # ── Render graphs directly (fixed size, no screenshot) ──
+            graph_image_paths = self._render_pdf_graphs(graph_options, limbs)
+
+            # ── Outcome measures summary on page 1 ──────────────────
+            selected_measures = [k for k, v in measures.items() if v]
+            if selected_measures and len(self.datasets) >= 2:
+                metrics = compute_metrics(self.datasets[0], self.datasets[1])
+                hib     = METRIC_HIB
+
+                story.append(HRFlowable(width=BODY_W, thickness=1,
+                                         color=C_MID, spaceAfter=5))
+                story.append(Paragraph("Outcome Measures  —  % change V1 → V2",
+                                        s_section_head))
+                story.append(HRFlowable(width=BODY_W, thickness=1,
+                                         color=C_MID, spaceAfter=5))
+
+                # Two-column layout for the metrics table to save vertical space
+                half = (len(selected_measures) + 1) // 2
+                left_keys  = selected_measures[:half]
+                right_keys = selected_measures[half:]
+
+                def _metric_row(key):
+                    label = PDFExportDialog.OUTCOME_MEASURES.get(key, key)
+                    value = metrics.get(key, None)
+                    if value is None or not isinstance(value, (int, float)):
+                        val_str, v_style = 'N/A', s_metric_neutral
+                    else:
+                        sign    = '+' if value >= 0 else ''
+                        val_str = f"{sign}{value:.1f}%"
+                        h_b     = hib.get(key, None)
+                        if h_b is None:
+                            v_style = s_metric_neutral
+                        elif (h_b and value > 0) or (not h_b and value < 0):
+                            v_style = s_metric_improve
+                        else:
+                            v_style = s_metric_decline
+                    return (Paragraph(label, _ps(f'ml_{key}', fontName=_RALEWAY_FONT,
+                                                  fontSize=9, textColor=C_SUBTEXT)),
+                            Paragraph(val_str, v_style))
+
+                col_lbl = BODY_W * 0.30
+                col_val = BODY_W * 0.18
+                spacer_col = 6 * mm
+
+                # Build rows — pad shorter column with empty cells
+                max_rows = max(len(left_keys), len(right_keys))
+                tbl_rows = []
+                # header
+                h_style = _ps('MHDR', fontName=_RALEWAY_BOLD, fontSize=9,
+                               textColor=C_WHITE)
+                tbl_rows.append([
+                    Paragraph('Measure', h_style), Paragraph('Change', _ps('MHDR2',
+                        fontName=_RALEWAY_BOLD, fontSize=9, textColor=C_WHITE,
+                        alignment=TA_RIGHT)),
+                    Paragraph('', h_style),
+                    Paragraph('Measure', h_style), Paragraph('Change', _ps('MHDR3',
+                        fontName=_RALEWAY_BOLD, fontSize=9, textColor=C_WHITE,
+                        alignment=TA_RIGHT)),
+                ])
+                for i in range(max_rows):
+                    row = []
+                    if i < len(left_keys):
+                        lbl, val = _metric_row(left_keys[i])
+                        row += [lbl, val]
+                    else:
+                        row += [Paragraph('', s_body), Paragraph('', s_body)]
+                    row.append(Paragraph('', s_body))   # spacer col
+                    if i < len(right_keys):
+                        lbl, val = _metric_row(right_keys[i])
+                        row += [lbl, val]
+                    else:
+                        row += [Paragraph('', s_body), Paragraph('', s_body)]
+                    tbl_rows.append(row)
+
+                m_tbl = Table(tbl_rows,
+                              colWidths=[col_lbl, col_val, spacer_col, col_lbl, col_val],
+                              repeatRows=1)
+                m_row_styles = [
+                    ('BACKGROUND',    (0, 0), (1, 0),   C_PURPLE),
+                    ('BACKGROUND',    (3, 0), (4, 0),   C_PURPLE),
+                    ('BACKGROUND',    (2, 0), (2, 0),   C_WHITE),   # spacer col header
+                    ('BACKGROUND',    (2, 1), (2, -1),  C_WHITE),   # spacer col body
+                    ('ROWBACKGROUNDS',(0, 1), (1, -1),  [C_WHITE, C_LIGHT]),
+                    ('ROWBACKGROUNDS',(3, 1), (4, -1),  [C_WHITE, C_LIGHT]),
+                    ('ALIGN',         (1, 0), (1, -1),  'RIGHT'),
+                    ('ALIGN',         (4, 0), (4, -1),  'RIGHT'),
+                    ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+                    ('TOPPADDING',    (0, 0), (-1, -1), 6),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                    ('LEFTPADDING',   (0, 0), (-1, -1), 8),
+                    ('RIGHTPADDING',  (0, 0), (-1, -1), 8),
+                    ('LINEBELOW',     (0, 0), (1, -1),  0.4, C_MID),
+                    ('LINEBELOW',     (3, 0), (4, -1),  0.4, C_MID),
+                ]
+                m_tbl.setStyle(TableStyle(m_row_styles))
+                story.append(m_tbl)
+                story.append(Spacer(1, 5 * mm))
+
+            # ══════════════════════════════════════════════════════════
+            # PAGE 2  –  All three graphs with descriptions to the right
+            # ══════════════════════════════════════════════════════════
+            story.append(PageBreak())
+
+            # Page 2 header banner — logo image + subheading
+            if os.path.exists(_logo_path):
+                _logo_img2 = RLImage(_logo_path, width=_logo_w, height=_logo_h)
+            else:
+                _logo_img2 = Paragraph("novita", _ps('P2NovitaHead',
+                    fontName=_COINY_FONT, fontSize=22,
+                    textColor=C_WHITE, alignment=TA_LEFT, leading=26))
+
+            _p2_sub = Paragraph("Normalised Gait Cycles", _ps('P2SubHead',
+                fontName=_RALEWAY_BOLD, fontSize=11,
+                textColor=colors.HexColor('#c8a8c8'), alignment=TA_LEFT, leading=14))
+            _logo_stack2 = Table(
+                [[_logo_img2], [_p2_sub]],
+                colWidths=[BODY_W * 0.62])
+            _logo_stack2.setStyle(TableStyle([
+                ('LEFTPADDING',   (0, 0), (-1, -1), 0),
+                ('RIGHTPADDING',  (0, 0), (-1, -1), 0),
+                ('TOPPADDING',    (0, 0), (0, 0),   6),
+                ('TOPPADDING',    (1, 0), (1, 0),   0),
+                ('BOTTOMPADDING', (0, 0), (0, 0),   8),
+                ('BOTTOMPADDING', (1, 0), (1, 0),   0),
+                ('BACKGROUND',    (0, 0), (-1, -1), C_PURPLE),
+                ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+            story.append(_banner(
+                _logo_stack2,
+                "Gait Analysis Report",
+                _ps('P2DateRight', fontName=_RALEWAY_FONT, fontSize=9,
+                    textColor=colors.HexColor('#c8a8c8'), alignment=TA_RIGHT)))
+            story.append(HRFlowable(width=BODY_W, thickness=4,
+                                     color=C_PINK, spaceAfter=0))
+            story.append(Spacer(1, 5 * mm))
+
+            for joint_key, joint_title, joint_desc_short in joint_info:
+                full_title, full_desc = long_desc[joint_key]
+
+                img_path = graph_image_paths.get(joint_key)
+
+                # Graph spans the full body width
+                if img_path:
+                    aspect     = _img_aspect(img_path)
+                    g2_h       = min(GRAPH2_H_MAX, BODY_W / aspect)
+                    g2_w       = g2_h * aspect
+                    graph_cell = RLImage(img_path, width=g2_w, height=g2_h)
+                    temp_images.append(img_path)
+                else:
+                    graph_cell = Paragraph('[graph unavailable]', s_caption)
+
+                # Graph row — full width
+                graph_row_tbl = Table(
+                    [[graph_cell]],
+                    colWidths=[BODY_W])
+                graph_row_tbl.setStyle(TableStyle([
+                    ('LEFTPADDING',   (0, 0), (-1, -1), 0),
+                    ('RIGHTPADDING',  (0, 0), (-1, -1), 0),
+                    ('TOPPADDING',    (0, 0), (-1, -1), 0),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+                    ('ALIGN',         (0, 0), (-1, -1), 'CENTER'),
+                    ('VALIGN',        (0, 0), (-1, -1), 'TOP'),
+                ]))
+                story.append(graph_row_tbl)
+
+                # Description below the graph — title + body, full width
+                desc_tbl = Table(
+                    [[Paragraph(full_title, _ps(f'G2T_{joint_key}',
+                                               fontName=_RALEWAY_BOLD, fontSize=11,
+                                               textColor=C_PURPLE, spaceAfter=2))],
+                     [Paragraph(full_desc,  _ps(f'G2D_{joint_key}',
+                                               fontName=_RALEWAY_FONT, fontSize=11,
+                                               textColor=C_SUBTEXT, leading=14))]],
+                    colWidths=[BODY_W])
+                desc_tbl.setStyle(TableStyle([
+                    ('LEFTPADDING',   (0, 0), (-1, -1), 0),
+                    ('RIGHTPADDING',  (0, 0), (-1, -1), 0),
+                    ('TOPPADDING',    (0, 0), (-1, -1), 3),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+                    ('VALIGN',        (0, 0), (-1, -1), 'TOP'),
+                ]))
+                story.append(desc_tbl)
+                story.append(HRFlowable(width=BODY_W, thickness=0.5,
+                                         color=C_MID, spaceBefore=4, spaceAfter=6))
+
+            # ── Footer note ─────────────────────────────────────────
+            story.append(Spacer(1, 4 * mm))
+            story.append(HRFlowable(width=BODY_W, thickness=1, color=C_MID, spaceAfter=4))
+            story.append(Paragraph(
+                "Gait analysis performed using Novita NovitaTech motion analysis software. "
+                "Results are indicative and should be interpreted by a qualified clinician.",
+                _ps('Footer', fontName=_RALEWAY_FONT, fontSize=7,
+                    textColor=colors.HexColor('#aaaaaa'))))
+
             doc.build(story)
+
         finally:
             for img_path in temp_images:
                 try:
                     if os.path.exists(img_path):
                         time.sleep(0.05)
                         os.unlink(img_path)
-                except Exception as e:
-                    print(f"Warning: Could not delete temp file {img_path}: {e}")
+                except Exception as ex:
+                    print(f"Warning: could not delete temp file {img_path}: {ex}")
+
+    def _render_pdf_graphs(self, graph_options=None, limbs=None):
+        """Render hip, knee and ankle cycle graphs at a fixed resolution directly
+        from the dataset — no screenshots, no dependency on window size.
+        Returns dict: {'hip': path, 'knee': path, 'ankle': path}
+        """
+        import tempfile as _tf
+        import matplotlib
+        matplotlib.use('Agg')   # non-interactive backend for off-screen rendering
+        import matplotlib.pyplot as _plt
+
+        if graph_options is None:
+            graph_options = {'show_versions': 'both', 'include_excluded': True}
+        if limbs is None:
+            limbs = {k: True for k in ('left_hip', 'right_hip', 'left_knee',
+                                        'right_knee', 'left_ankle', 'right_ankle')}
+
+        show_versions = graph_options.get('show_versions', 'both')
+        include_excl  = graph_options.get('include_excluded', True)
+
+        # Fixed output size: 8 × 3.8 inches at 150 dpi → 1200 × 570 px (≈2.1:1 ratio)
+        FIG_W, FIG_H, FIG_DPI = 8.0, 3.8, 150
+
+        # Select which datasets to plot
+        if show_versions == 'v1':
+            plot_datasets = self.datasets[:1]
+        elif show_versions == 'v2':
+            plot_datasets = self.datasets[1:2] if len(self.datasets) >= 2 else []
+        else:
+            plot_datasets = self.datasets[:2]
+
+        # joint_key → (joint_column_names, normative_key, y_axis_label)
+        # Order matches the UI top-to-bottom display: hip, knee, ankle
+        joint_map = [
+            ('hip',   (['left_hip',   'right_hip'],   'hip',   'Hip Angle')),
+            ('knee',  (['left_knee',  'right_knee'],  'knee',  'Knee Angle')),
+            ('ankle', (['left_ankle', 'right_ankle'], 'ankle', 'Ankle Angle')),
+        ]
+        linestyles = ['--', '-']   # V1 dashed, V2 solid (matches live UI)
+
+        results = {}
+        tmp = _tf.gettempdir()
+
+        for joint_key, (joint_cols, norm_key, y_label) in joint_map:
+            try:
+                fig, ax = _plt.subplots(figsize=(FIG_W, FIG_H), dpi=FIG_DPI)
+                fig.patch.set_facecolor(BG_PLOT)
+                ax.set_facecolor(BG_PLOT)
+                ax.grid(False)
+                for spine in ax.spines.values():
+                    spine.set_color(BG2)
+                ax.tick_params(colors=SUBTEXT, labelsize=7, length=0)
+                ax.tick_params(axis='y', labelleft=True, labelsize=7)
+                ax.set_xlabel('Gait Cycle Percentage (%)', fontsize=7, color=SUBTEXT)
+                ax.set_title(y_label, fontsize=8, color=SUBTEXT, pad=4)
+
+                all_y_vals = []
+                max_cycle_length = 101
+
+                for si, ds in enumerate(plot_datasets):
+                    if not ds:
+                        continue
+                    ad       = ds.get('angle_data')
+                    if ad is None or ad.empty:
+                        continue
+                    excluded = ds.get('excluded_regions', []) if not include_excl else []
+                    # filter excluded regions
+                    if excluded:
+                        mask = pd.Series([True] * len(ad), index=ad.index)
+                        for ex_s, ex_e in excluded:
+                            mask &= ~((ad['frame_num'] >= ex_s) & (ad['frame_num'] < ex_e))
+                        ad_f = ad[mask].reset_index(drop=True)
+                    else:
+                        ad_f = ad
+
+                    sf = ds.get('step_frames', [])
+                    ls = linestyles[si % 2]
+
+                    # Build normalised step list — mirrors redraw_graphs _to_fnums exactly
+                    def _pdf_to_fnums(ad_src, step_frames):
+                        if not step_frames:
+                            return []
+                        fn     = ad_src['frame_num'].to_numpy(dtype=int)
+                        fn_set = set(fn.tolist())
+                        vals   = [int(v) for v, _ in step_frames]
+                        if sum(1 for v in vals if v in fn_set) >= max(1, len(vals) // 2):
+                            mapped = [(int(v), s) for v, s in step_frames if int(v) in fn_set]
+                        else:
+                            mapped = [(int(fn[int(v)]), s) for v, s in step_frames
+                                      if 0 <= int(v) < len(fn)]
+                        mapped.sort(key=lambda x: x[0])
+                        return mapped
+
+                    norm_steps = _pdf_to_fnums(ad_f, sf)
+
+                    for joint in joint_cols:
+                        if not limbs.get(joint, True):
+                            continue
+                        if joint not in ad_f.columns:
+                            continue
+                        col = JOINT_COLORS_MPL.get(joint, '#888888')
+
+                        side    = 'left' if joint.startswith('left') else 'right'
+                        strikes = sorted([f for f, s in norm_steps if s == side])
+
+                        # skip if insufficient step data — don't plot continuous as a cycle
+                        if len(strikes) < 2:
+                            continue
+
+                        cycles = []
+                        raw_y  = []   # store (y_raw,) alongside for RMSE filtering
+                        for i in range(len(strikes) - 1):
+                            seg = ad_f[(ad_f['frame_num'] >= strikes[i]) &
+                                       (ad_f['frame_num'] <= strikes[i + 1])]
+                            if seg.empty:
+                                continue
+                            y_seg = seg[joint].values.astype(float)
+                            if len(y_seg) < 3:
+                                continue
+                            raw_y.append(y_seg)
+
+                        if not raw_y:
+                            continue
+
+                        # ── Step 1: median-length filter (mirrors live UI) ──
+                        lengths   = [len(y) for y in raw_y]
+                        med       = np.median(lengths)
+                        length_ok = [0.8 * med <= l <= 1.2 * med for l in lengths]
+
+                        # ── Step 2: preliminary mean from length-ok cycles ──
+                        pre_inliers = []
+                        for y_seg, good in zip(raw_y, length_ok):
+                            if not good:
+                                continue
+                            t = np.linspace(0, 1, len(y_seg))
+                            pre_inliers.append(
+                                interp1d(t, y_seg)(np.linspace(0, 1, max_cycle_length)))
+                        if not pre_inliers:
+                            continue
+                        pre_mean = np.nanmean(np.vstack(pre_inliers), axis=0)
+
+                        # ── Step 3: RMSE filter against pre_mean ──────────
+                        inliers = []
+                        for y_seg, good in zip(raw_y, length_ok):
+                            if not good:
+                                continue
+                            rmse = _compute_cycle_rmse(y_seg, pre_mean, max_cycle_length)
+                            if rmse <= self.rmse_threshold:
+                                t = np.linspace(0, 1, len(y_seg))
+                                inliers.append(
+                                    interp1d(t, y_seg)(
+                                        np.linspace(0, 1, max_cycle_length)))
+
+                        if not inliers:
+                            # fall back to length-ok only if RMSE kills everything
+                            inliers = pre_inliers
+
+                        if not inliers:
+                            continue
+
+                        # Draw mean + SE shading from RMSE-filtered inliers only
+                        x_pct  = np.linspace(0, 100, max_cycle_length)
+                        arr    = np.vstack(inliers)
+                        mean_c = np.nanmean(arr, axis=0)
+                        se_c   = np.nanstd(arr, axis=0) / max(1, np.sqrt(len(inliers)))
+                        ax.fill_between(x_pct, mean_c - se_c, mean_c + se_c,
+                                        color=col, alpha=0.15, zorder=2)
+                        ax.plot(x_pct, mean_c, color=col, lw=2.0, linestyle=ls, zorder=3)
+                        all_y_vals.extend(mean_c[np.isfinite(mean_c)])
+
+                # Draw normative reference band
+                # (excluded from all_y_vals so Y-axis is driven by data only)
+                try:
+                    norm_x = np.linspace(0, 100, len(NORMATIVE_GAIT[norm_key]['mean']))
+                    d      = NORMATIVE_GAIT[norm_key]
+                    nm     = np.asarray(d['mean'])
+                    nl     = np.asarray(d['lower'])
+                    nu     = np.asarray(d['upper'])
+                    ax.fill_between(norm_x, nl, nu, color=C_NORM, alpha=0.18, zorder=1)
+                    ax.plot(norm_x, nm, color=C_NORM, lw=1.4, alpha=0.7, zorder=2)
+                except Exception:
+                    pass
+
+                # Y-axis limits with padding
+                if all_y_vals:
+                    finite = [v for v in all_y_vals if np.isfinite(v)]
+                    if finite:
+                        ymin, ymax = min(finite), max(finite)
+                        pad = max(2.0, 0.12 * (ymax - ymin))
+                        ax.set_ylim(ymin - pad, ymax + pad)
+
+                ax.set_xlim(0, 100)
+                fig.subplots_adjust(left=0.06, right=0.98, top=0.90, bottom=0.14)
+
+                path = os.path.join(tmp, f'gait_pdf_{joint_key}_{int(time.time()*1000)}.png')
+                fig.savefig(path, dpi=FIG_DPI, format='png',
+                            facecolor=fig.get_facecolor())
+                _plt.close(fig)
+                gc.collect()
+
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    results[joint_key] = path
+            except Exception as ex:
+                print(f"_render_pdf_graphs error ({joint_key}): {ex}")
+                try:
+                    _plt.close('all')
+                except Exception:
+                    pass
+
+        return results
+
+    def _capture_all_graph_images(self, graph_options=None, limbs=None):
+        """Capture hip, knee and ankle cycle graphs separately.
+        Returns dict: {'hip': path, 'knee': path, 'ankle': path}
+        """
+        if graph_options is None:
+            graph_options = {'show_versions': 'both', 'include_excluded': True}
+        if limbs is None:
+            limbs = {k: True for k in ('left_hip', 'right_hip', 'left_knee',
+                                        'right_knee', 'left_ankle', 'right_ankle')}
+        results = {}
+        joint_fig_map = {
+            'hip':   self._fig_hip,
+            'knee':  self._fig_knee,
+            'ankle': self._fig_ankle,
+        }
+        orig_mode         = self.show_overlaid_cycles
+        orig_graph_mode   = self.graph_show_mode
+        orig_visibility   = self.joint_visibility.copy()
+        orig_excl         = getattr(self, '_show_excluded_in_pdf', True)
+        try:
+            self.show_overlaid_cycles   = True   # always cycles
+            self.graph_show_mode        = graph_options.get('show_versions', 'both')
+            self.joint_visibility       = limbs.copy()
+            self._show_excluded_in_pdf  = graph_options.get('include_excluded', True)
+            self.redraw_graphs()
+            self.update()
+            import tempfile as _tf
+            tmp = _tf.gettempdir()
+            for joint_key, fig in joint_fig_map.items():
+                path = os.path.join(tmp,
+                    f'gait_{joint_key}_{int(time.time()*1000)}.png')
+                try:
+                    fig.savefig(path, dpi=150, bbox_inches='tight', format='png')
+                    gc.collect()
+                    time.sleep(0.05)
+                    if os.path.exists(path) and os.path.getsize(path) > 0:
+                        results[joint_key] = path
+                except Exception as ex:
+                    print(f"Error capturing {joint_key} graph: {ex}")
+        finally:
+            self.show_overlaid_cycles  = orig_mode
+            self.graph_show_mode       = orig_graph_mode
+            self.joint_visibility      = orig_visibility
+            self._show_excluded_in_pdf = orig_excl
+            self.redraw_graphs()
+        return results
 
     def _capture_graph_image(self, graph_type, graph_options=None, limbs=None):
+        """Legacy single-graph capture — kept for compatibility."""
         if graph_options is None:
             graph_options = {'show_versions': 'both', 'include_excluded': True}
         if limbs is None:
@@ -6344,7 +7396,6 @@ class GaitAnalysisDashboard(tk.Tk):
                 self._show_excluded_in_pdf = graph_options.get('include_excluded', True)
                 self.redraw_graphs()
                 self.update()
-                # capture the first graph figure for pdf (ankle as representative)
                 self._fig_ankle.savefig(temp_path, dpi=150, bbox_inches='tight', format='png')
                 gc.collect()
                 time.sleep(0.1)
