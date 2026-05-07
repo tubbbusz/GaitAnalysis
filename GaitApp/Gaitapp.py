@@ -1210,8 +1210,11 @@ def _apply_dynamic_window_size(window, preferred_width=None, preferred_height=No
     height = req_h if preferred_height is None else max(req_h, int(preferred_height))
     screen_w = window.winfo_screenwidth()
     screen_h = window.winfo_screenheight()
-    width = min(width, screen_w)
-    height = min(height, screen_h)
+    # ensure window uses at least 85% of screen dimensions, but not more than 95%
+    min_width = max(req_w, int(screen_w * 0.85))
+    min_height = max(req_h, int(screen_h * 0.85))
+    width = min(max(width, min_width), int(screen_w * 0.95))
+    height = min(max(height, min_height), int(screen_h * 0.95))
     window.geometry(f"{width}x{height}")
     window.minsize(req_w, req_h)
 
@@ -3229,6 +3232,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._video_refresh_after_id = None
         self._display_cache        = DisplayCache(limit=128)  # pre-rendered PhotoImage cache
         self._canvas_image_ids     = [None, None, None, None]  # persistent canvas image item ids
+        self._cycle_overlay_texts   = ["", "", "", ""]
         self._exclusion_selecting = [False, False, False]
         self._exclusion_start     = [None, None, None]
         self._graph_limb_btns     = {}
@@ -3256,6 +3260,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._build_ui()
         _apply_dynamic_window_size(self, preferred_width=1400, preferred_height=860)
         self._center_on_screen()
+        self.minsize(1000, 680)
         self._bind_keys()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after_idle(self.redraw_graphs)
@@ -3433,19 +3438,20 @@ class GaitAnalysisDashboard(tk.Tk):
         # Video 1 single canvas (continuous mode — spans both columns)
         vid1_outer = tk.Frame(vid1_row, bg=BG2)
         vid1_outer.grid(row=0, column=0, columnspan=2, sticky='nsew')
-        self._vid1_lbl = tk.Label(vid1_outer, text="VIDEO 1",
-                      font=(UI_FONT, 8, "bold"), bg=BG2, fg=ACCENT, anchor='w')
-        self._vid1_lbl.pack(fill='x', padx=4, pady=(2, 0))
+        self._vid1_outer = vid1_outer
         self._vid_canvas1 = tk.Canvas(vid1_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas1.pack(fill='both', expand=True)
-        self._vid1_outer = vid1_outer
+        # floating top-left label overlay
+        self._vid1_lbl = tk.Label(vid1_outer, text="VIDEO 1",
+                      font=(UI_FONT, 8, "bold"), bg='#ffffff', fg='#7c5cbf',
+                      padx=6, pady=2, relief='flat',
+                      highlightthickness=1, highlightbackground='#c4b8e0')
+        self._vid1_lbl.place(x=8, y=8)
 
         # Video 1 Left — cycle mode only (col 0)
         vid1L_outer = tk.Frame(vid1_row, bg=BG2)
         vid1L_outer.grid(row=0, column=0, sticky='nsew')
-        self._vid1L_lbl = tk.Label(vid1L_outer, text="V1  LEFT",
-                      font=(UI_FONT, 8, "bold"), bg=BG2, fg=C_V1, anchor='w')
-        self._vid1L_lbl.pack(fill='x', padx=4, pady=(2, 0))
+        self._vid1L_lbl = None
         self._vid_canvas1L = tk.Canvas(vid1L_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas1L.pack(fill='both', expand=True)
         self._vid1L_outer = vid1L_outer
@@ -3453,9 +3459,7 @@ class GaitAnalysisDashboard(tk.Tk):
         # Video 1 Right — cycle mode only (col 1)
         vid1R_outer = tk.Frame(vid1_row, bg=BG2)
         vid1R_outer.grid(row=0, column=1, sticky='nsew')
-        self._vid1R_lbl = tk.Label(vid1R_outer, text="V1  RIGHT",
-                      font=(UI_FONT, 8, "bold"), bg=BG2, fg=C_V1, anchor='w')
-        self._vid1R_lbl.pack(fill='x', padx=4, pady=(2, 0))
+        self._vid1R_lbl = None
         self._vid_canvas1R = tk.Canvas(vid1R_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas1R.pack(fill='both', expand=True)
         self._vid1R_outer = vid1R_outer
@@ -3468,27 +3472,49 @@ class GaitAnalysisDashboard(tk.Tk):
         vid_ctrl_outer = tk.Frame(videos_frame, bg=BG2)
         vid_ctrl_outer.grid(row=1, column=0, sticky='ew', padx=0, pady=(2, 2))
         vid_ctrl_frame = tk.Frame(vid_ctrl_outer, bg=BG2)
-        vid_ctrl_frame.pack(anchor='center')
-        _ctrl_colors = {'Prev': ACCENT, 'Next': ACCENT, 'Play': '#ed185e'}
-        for txt, cmd in [("Prev", self._prev_frame), ("Play", self._toggle_play), ("Next", self._next_frame)]:
-            _fg = _ctrl_colors[txt]
-            _pbtn_cfg = dict(
-                bg=BG3, fg=_fg, relief='flat',
-                font=(UI_FONT, 9, "bold"), padx=10, pady=1,
-                cursor='hand2', width=5,
-                activebackground=_fg, activeforeground='white',
-                highlightthickness=1, highlightbackground=BG2, highlightcolor=BG2,
-            )
-            b = tk.Button(vid_ctrl_frame, text=txt, command=cmd, **_pbtn_cfg)
-            b.pack(side='left', padx=3)
-            if txt == "Play":
-                self._play_btn = b
-            elif txt == "Prev":
-                self._prev_frame_btn = b
-                b.bind('<ButtonRelease-1>', lambda e: self.after(0, self._flush_graph_redraw))
-            elif txt == "Next":
-                self._next_frame_btn = b
-                b.bind('<ButtonRelease-1>', lambda e: self.after(0, self._flush_graph_redraw))
+        vid_ctrl_frame.pack(anchor='center', pady=4)
+
+        # Segmented button group: Prev | Play | Next with shared border
+        _seg_border = '#cfc6e8'
+        _btn_base = dict(
+            relief='flat', font=(UI_FONT, 9, "bold"), pady=5,
+            cursor='hand2', width=6,
+            highlightthickness=0,
+        )
+
+        self._prev_frame_btn = tk.Button(
+            vid_ctrl_frame, text="‹ Prev",
+            bg='#ffffff', fg='#5c3a9e',
+            activebackground='#ede9f7', activeforeground='#5c3a9e',
+            command=self._prev_frame, **_btn_base)
+        self._prev_frame_btn.pack(side='left')
+        self._prev_frame_btn.bind('<ButtonRelease-1>', lambda e: self.after(0, self._flush_graph_redraw))
+
+        # 1px separator
+        tk.Frame(vid_ctrl_frame, bg=_seg_border, width=1).pack(side='left', fill='y')
+
+        self._play_btn = tk.Button(
+            vid_ctrl_frame, text="▶ Play",
+            bg='#5c3a9e', fg='#ffffff',
+            activebackground='#4a2d85', activeforeground='#ffffff',
+            command=self._toggle_play, **_btn_base)
+        self._play_btn.pack(side='left')
+
+        # 1px separator
+        tk.Frame(vid_ctrl_frame, bg=_seg_border, width=1).pack(side='left', fill='y')
+
+        self._next_frame_btn = tk.Button(
+            vid_ctrl_frame, text="Next ›",
+            bg='#ffffff', fg='#5c3a9e',
+            activebackground='#ede9f7', activeforeground='#5c3a9e',
+            command=self._next_frame, **_btn_base)
+        self._next_frame_btn.pack(side='left')
+        self._next_frame_btn.bind('<ButtonRelease-1>', lambda e: self.after(0, self._flush_graph_redraw))
+
+        # outer border around the whole group
+        vid_ctrl_frame.config(
+            highlightthickness=1, highlightbackground=_seg_border,
+            highlightcolor=_seg_border)
 
         # --- video 2 row: sub-row with two columns for cycle mode ---
         vid2_row = tk.Frame(videos_frame, bg=BG2)
@@ -3501,19 +3527,20 @@ class GaitAnalysisDashboard(tk.Tk):
         # Video 2 single canvas (continuous mode — spans both columns)
         vid2_outer = tk.Frame(vid2_row, bg=BG2)
         vid2_outer.grid(row=0, column=0, columnspan=2, sticky='nsew')
+        self._vid2_outer = vid2_outer
         self._vid_canvas2 = tk.Canvas(vid2_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas2.pack(fill='both', expand=True)
+        # floating top-left label overlay
         self._vid2_lbl = tk.Label(vid2_outer, text="VIDEO 2",
-                      font=(UI_FONT, 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
-        self._vid2_lbl.pack(fill='x', padx=4, pady=(0, 2))
-        self._vid2_outer = vid2_outer
+                      font=(UI_FONT, 8, "bold"), bg='#ffffff', fg='#7c5cbf',
+                      padx=6, pady=2, relief='flat',
+                      highlightthickness=1, highlightbackground='#c4b8e0')
+        self._vid2_lbl.place(x=8, y=8)
 
         # Video 2 Left — cycle mode only (col 0)
         vid2L_outer = tk.Frame(vid2_row, bg=BG2)
         vid2L_outer.grid(row=0, column=0, sticky='nsew')
-        self._vid2L_lbl = tk.Label(vid2L_outer, text="V2  LEFT",
-                      font=(UI_FONT, 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
-        self._vid2L_lbl.pack(fill='x', padx=4, pady=(2, 0))
+        self._vid2L_lbl = None
         self._vid_canvas2L = tk.Canvas(vid2L_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas2L.pack(fill='both', expand=True)
         self._vid2L_outer = vid2L_outer
@@ -3521,9 +3548,7 @@ class GaitAnalysisDashboard(tk.Tk):
         # Video 2 Right — cycle mode only (col 1)
         vid2R_outer = tk.Frame(vid2_row, bg=BG2)
         vid2R_outer.grid(row=0, column=1, sticky='nsew')
-        self._vid2R_lbl = tk.Label(vid2R_outer, text="V2  RIGHT",
-                      font=(UI_FONT, 8, "bold"), bg=BG2, fg=C_V2, anchor='w')
-        self._vid2R_lbl.pack(fill='x', padx=4, pady=(2, 0))
+        self._vid2R_lbl = None
         self._vid_canvas2R = tk.Canvas(vid2R_outer, bg=BG_VID, highlightthickness=0)
         self._vid_canvas2R.pack(fill='both', expand=True)
         self._vid2R_outer = vid2R_outer
@@ -4130,11 +4155,17 @@ class GaitAnalysisDashboard(tk.Tk):
             self._tutorial_gate('videos_loaded')  # tutorial: processing complete
             if self._start_required_markup_flow():
                 return
+            # all cached markup loaded or no markup needed — skip marking phase
+            self._tutorial_gate('all_marking_done')
             self.show_overlaid_cycles = True
             self.resample_cycles = True
             self._enter_cycle_video_layout()
             self._update_display_btn_visuals()
             self.refresh()
+            # if tutorial is open and we skipped marking, update it to match the analysis screen
+            if self._tutorial_overlay is not None and self._tutorial_overlay.winfo_exists():
+                correct_step = self._tutorial_start_step()
+                self._tutorial_overlay._show_step(correct_step)
             if cached_loaded:
                 self._status_msg.set("Loaded cached steps")
             else:
@@ -4247,23 +4278,26 @@ class GaitAnalysisDashboard(tk.Tk):
         cached_loaded = False
         for i, ds in enumerate(self.datasets):
             if not ds: continue
+            # check if steps already exist (from cache or previous session)
+            existing_steps = ds.get('step_frames', [])
+            if existing_steps:
+                # verify we have steps for both left and right sides
+                sides_present = set(side for _, side in existing_steps)
+                if 'left' in sides_present and 'right' in sides_present:
+                    self._markup_required_videos[i] = False
+                    cached_loaded = True
+                continue
+            # check for cached steps
             cached_markup = ds.get('_cached_markup') or {}
             cached_steps = cached_markup.get('step_frames', [])
             if not cached_steps: continue
-            vid_name = self.video_names[i] if i < len(self.video_names) else f"Video {i+1}"
-            answer = messagebox.askyesno("Cached steps found",
-                f"Cached manual steps were found for {vid_name}.\n\n"
-                "Yes = load cached steps\nNo = overwrite and mark again", parent=self)
-            if answer:
-                ds['step_frames'] = list(cached_steps)
-                self._markup_required_videos[i] = False
-                cached_loaded = True
-            else:
-                ds['step_frames'] = []
-                self._markup_required_videos[i] = True
-                cache_key = ds.get('_cache_key')
-                if cache_key:
-                    _clear_cached_markup(cache_key)
+            # verify cached steps have both sides
+            sides_present = set(side for _, side in cached_steps)
+            if 'left' not in sides_present or 'right' not in sides_present:
+                continue
+            ds['step_frames'] = list(cached_steps)
+            self._markup_required_videos[i] = False
+            cached_loaded = True
         return cached_loaded
 
     def _start_required_markup_flow(self):
@@ -4938,6 +4972,20 @@ class GaitAnalysisDashboard(tk.Tk):
                         canvas.itemconfigure(self._canvas_image_ids[slot], image=img)
                         canvas.coords(self._canvas_image_ids[slot], x_off, y_off)
                         canvas._img = img
+                        if slot < len(self._cycle_overlay_texts) and self._cycle_overlay_texts[slot]:
+                            canvas.delete(f'cycle_tag_{slot}')
+                            tag_id = canvas.create_text(
+                                8, 8, anchor='nw', text=self._cycle_overlay_texts[slot],
+                                fill='#7c5cbf', font=(UI_FONT, 8, 'bold'),
+                                tags=(f'cycle_tag_{slot}',))
+                            bbox = canvas.bbox(tag_id)
+                            if bbox:
+                                pad = 4
+                                rect_id = canvas.create_rectangle(
+                                    bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad,
+                                    fill='#ffffff', outline='#c4b8e0', tags=(f'cycle_tag_{slot}',))
+                                canvas.tag_lower(rect_id, tag_id)
+                            canvas.tag_raise(tag_id)
                         continue
                     except Exception:
                         self._canvas_image_ids[slot] = None
@@ -4945,6 +4993,19 @@ class GaitAnalysisDashboard(tk.Tk):
                 item_id = canvas.create_image(x_off, y_off, anchor='nw', image=img)
                 canvas._img = img
                 self._canvas_image_ids[slot] = item_id
+                if slot < len(self._cycle_overlay_texts) and self._cycle_overlay_texts[slot]:
+                    tag_id = canvas.create_text(
+                        8, 8, anchor='nw', text=self._cycle_overlay_texts[slot],
+                        fill='#7c5cbf', font=(UI_FONT, 8, 'bold'),
+                        tags=(f'cycle_tag_{slot}',))
+                    bbox = canvas.bbox(tag_id)
+                    if bbox:
+                        pad = 4
+                        rect_id = canvas.create_rectangle(
+                            bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad,
+                            fill='#ffffff', outline='#c4b8e0', tags=(f'cycle_tag_{slot}',))
+                        canvas.tag_lower(rect_id, tag_id)
+                    canvas.tag_raise(tag_id)
             return
 
         # Continuous mode: render 2 canvases
@@ -5881,15 +5942,12 @@ class GaitAnalysisDashboard(tk.Tk):
         self._vid2L_outer.grid()
         self._vid2R_outer.grid()
         self._canvas_image_ids = [None, None, None, None]
-        
-        # update cycle mode labels with video names
-        if hasattr(self, 'video_names') and len(self.video_names) >= 2:
-            v1_name = self.video_names[0]
-            v2_name = self.video_names[1]
-            self._vid1L_lbl.config(text=f"{v1_name} - Left Cycle")
-            self._vid1R_lbl.config(text=f"{v1_name} - Right Cycle")
-            self._vid2L_lbl.config(text=f"{v2_name} - Left Cycle")
-            self._vid2R_lbl.config(text=f"{v2_name} - Right Cycle")
+        self._cycle_overlay_texts = [
+            "VIDEO 1 - Left Cycle",
+            "VIDEO 1 - Right Cycle",
+            "VIDEO 2 - Left Cycle",
+            "VIDEO 2 - Right Cycle",
+        ]
         self._refresh_video_frames_after_layout()
 
     def _exit_cycle_video_layout(self):
@@ -5901,6 +5959,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._vid1_outer.grid()
         self._vid2_outer.grid()
         self._canvas_image_ids = [None, None, None, None]
+        self._cycle_overlay_texts = ["", "", "", ""]
         
         # restore continuous mode labels
         if hasattr(self, 'video_names') and len(self.video_names) >= 2:
@@ -6913,10 +6972,10 @@ class GaitAnalysisDashboard(tk.Tk):
             story.append(desc_row_tbl)
             story.append(Spacer(1, 6 * mm))
 
-            # ── Render graphs directly (fixed size, no screenshot) ──
+            # render graphs directly (fixed size, no screenshot) 
             graph_image_paths = self._render_pdf_graphs(graph_options, limbs)
 
-            # ── Outcome measures summary on page 1 ──────────────────
+            # outcome measures summary on page 1 
             selected_measures = [k for k, v in measures.items() if v]
             if selected_measures and len(self.datasets) >= 2:
                 metrics = compute_metrics(self.datasets[0], self.datasets[1])
@@ -6929,7 +6988,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 story.append(HRFlowable(width=BODY_W, thickness=1,
                                          color=C_MID, spaceAfter=5))
 
-                # Two-column layout for the metrics table to save vertical space
+                # two-column layout for the metrics table to save vertical space
                 half = (len(selected_measures) + 1) // 2
                 left_keys  = selected_measures[:half]
                 right_keys = selected_measures[half:]
@@ -6957,7 +7016,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 col_val = BODY_W * 0.18
                 spacer_col = 6 * mm
 
-                # Build rows — pad shorter column with empty cells
+                # build rows — pad shorter column with empty cells
                 max_rows = max(len(left_keys), len(right_keys))
                 tbl_rows = []
                 # header
@@ -7011,12 +7070,11 @@ class GaitAnalysisDashboard(tk.Tk):
                 story.append(m_tbl)
                 story.append(Spacer(1, 5 * mm))
 
-            # ══════════════════════════════════════════════════════════
-            # PAGE 2  –  All three graphs with descriptions to the right
-            # ══════════════════════════════════════════════════════════
+            # all three graphs with descriptions to the right
+
             story.append(PageBreak())
 
-            # Page 2 header banner — logo image + subheading
+            # page 2 header banner — logo image + subheading
             if os.path.exists(_logo_path):
                 _logo_img2 = RLImage(_logo_path, width=_logo_w, height=_logo_h)
             else:
@@ -7054,7 +7112,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
                 img_path = graph_image_paths.get(joint_key)
 
-                # Graph spans the full body width
+                # graph spans the full body width
                 if img_path:
                     aspect     = _img_aspect(img_path)
                     g2_h       = min(GRAPH2_H_MAX, BODY_W / aspect)
@@ -7064,7 +7122,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 else:
                     graph_cell = Paragraph('[graph unavailable]', s_caption)
 
-                # Graph row — full width
+                # graph row — full width
                 graph_row_tbl = Table(
                     [[graph_cell]],
                     colWidths=[BODY_W])
@@ -7078,7 +7136,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 ]))
                 story.append(graph_row_tbl)
 
-                # Description below the graph — title + body, full width
+                # description below the graph — title + body, full width
                 desc_tbl = Table(
                     [[Paragraph(full_title, _ps(f'G2T_{joint_key}',
                                                fontName=_RALEWAY_BOLD, fontSize=11,
@@ -7098,7 +7156,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 story.append(HRFlowable(width=BODY_W, thickness=0.5,
                                          color=C_MID, spaceBefore=4, spaceAfter=6))
 
-            # ── Footer note ─────────────────────────────────────────
+            # footer note
             story.append(Spacer(1, 4 * mm))
             story.append(HRFlowable(width=BODY_W, thickness=1, color=C_MID, spaceAfter=4))
             story.append(Paragraph(
@@ -7119,10 +7177,6 @@ class GaitAnalysisDashboard(tk.Tk):
                     print(f"Warning: could not delete temp file {img_path}: {ex}")
 
     def _render_pdf_graphs(self, graph_options=None, limbs=None):
-        """Render hip, knee and ankle cycle graphs at a fixed resolution directly
-        from the dataset — no screenshots, no dependency on window size.
-        Returns dict: {'hip': path, 'knee': path, 'ankle': path}
-        """
         import tempfile as _tf
         import matplotlib
         matplotlib.use('Agg')   # non-interactive backend for off-screen rendering
@@ -7137,10 +7191,10 @@ class GaitAnalysisDashboard(tk.Tk):
         show_versions = graph_options.get('show_versions', 'both')
         include_excl  = graph_options.get('include_excluded', True)
 
-        # Fixed output size: 8 × 3.8 inches at 150 dpi → 1200 × 570 px (≈2.1:1 ratio)
+        # fixed output size: 8 × 3.8 inches at 150 dpi → 1200 × 570 px (≈2.1:1 ratio)
         FIG_W, FIG_H, FIG_DPI = 8.0, 3.8, 150
 
-        # Select which datasets to plot
+        # select which datasets to plot
         if show_versions == 'v1':
             plot_datasets = self.datasets[:1]
         elif show_versions == 'v2':
@@ -7149,7 +7203,7 @@ class GaitAnalysisDashboard(tk.Tk):
             plot_datasets = self.datasets[:2]
 
         # joint_key → (joint_column_names, normative_key, y_axis_label)
-        # Order matches the UI top-to-bottom display: hip, knee, ankle
+        # order matches the UI top-to-bottom display: hip, knee, ankle
         joint_map = [
             ('hip',   (['left_hip',   'right_hip'],   'hip',   'Hip Angle')),
             ('knee',  (['left_knee',  'right_knee'],  'knee',  'Knee Angle')),
@@ -7258,7 +7312,7 @@ class GaitAnalysisDashboard(tk.Tk):
                             continue
                         pre_mean = np.nanmean(np.vstack(pre_inliers), axis=0)
 
-                        # ── Step 3: RMSE filter against pre_mean ──────────
+                        # step 3: RMSE filter against pre_mean 
                         inliers = []
                         for y_seg, good in zip(raw_y, length_ok):
                             if not good:
